@@ -1,0 +1,41 @@
+2025-07-28T20:36:14: Server is running on port 7000
+2025-07-28T20:36:14: Connected to database successfully.
+2025-07-28T20:36:26: Serving React app for: /get-sessions
+2025-07-28T20:36:29: Serving React app for: /api/events/16/
+2025-07-28T20:36:34: Serving React app for: /get-classes/16
+2025-07-28T20:36:34: Serving React app for: /get-categories/16
+2025-07-28T20:36:34: Serving React app for: /get-sections/16
+2025-07-28T20:36:35: Serving React app for: /admission-list
+2025-07-28T20:36:36: Serving React app for: /get-sessions
+2025-07-28T20:36:36: Serving React app for: /get-classes/16
+2025-07-28T20:36:36: Serving React app for: /get-categories/16
+2025-07-28T20:36:36: Serving React app for: /get-sections/16
+2025-07-28T20:37:07: Server is running on port 7000
+2025-07-28T20:37:07: Connected to database successfully.
+2025-07-28T20:37:10: Serving React app for: /admission-list
+2025-07-28T20:37:11: Serving React app for: /get-sessions
+2025-07-28T20:37:11: Serving React app for: /get-classes/16
+2025-07-28T20:37:11: Serving React app for: /get-sections/16
+2025-07-28T20:37:11: Serving React app for: /get-categories/16
+2025-07-28T20:37:19: Serving React app for: /admission-list
+2025-07-28T20:37:20: Serving React app for: /get-sessions
+2025-07-28T20:37:21: Serving React app for: /get-classes/16
+2025-07-28T20:37:21: Serving React app for: /get-categories/16
+2025-07-28T20:37:21: Serving React app for: /get-sections/16
+2025-07-28T20:40:38: Server is running on port 7000
+2025-07-28T20:40:38: Connected to database successfully.
+2025-07-28T20:40:42: Serving React app for: /admission-list
+2025-07-28T20:40:44: Serving React app for: /get-sessions
+2025-07-28T20:40:44: Serving React app for: /get-classes/16
+2025-07-28T20:40:44: Serving React app for: /get-categories/16
+2025-07-28T20:40:44: Serving React app for: /get-sections/16
+2025-07-28T20:40:47: Serving React app for: /admission-list
+2025-07-28T20:40:48: Serving React app for: /get-sessions
+2025-07-28T20:40:48: Serving React app for: /get-classes/16
+2025-07-28T20:40:48: Serving React app for: /get-sections/16
+2025-07-28T20:40:48: Serving React app for: /get-categories/16
+2025-07-28T20:44:38: Serving React app for: /admission-list
+2025-07-28T20:44:39: Serving React app for: /get-sessions
+2025-07-28T20:44:39: Serving React app for: /get-sections/16
+2025-07-28T20:44:39: Serving React app for: /get-categories/16
+2025-07-28T20:44:39: Serving React app for: /get-classes/16

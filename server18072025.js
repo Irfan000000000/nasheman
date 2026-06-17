@@ -1,0 +1,28826 @@
+const express = require("express"); //express package initiated
+const app = express(); // express instance has been created and will be access by app variable
+const cors = require("cors");
+const dotenv = require("dotenv");
+const PDFDocument = require("pdfkit");
+const printer = require("pdf-to-printer");
+// const { Printer, types } = require('node-thermal-printer'); // Uncomment if you need this for testing
+const bodyParser = require("body-parser");
+const ExcelJS = require("exceljs");
+const path = require("path");
+
+const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
+
+const { body, validationResult } = require("express-validator");
+const rateLimit = require("express-rate-limit");
+
+const multer = require("multer");
+const connection = require("./config/db");
+
+dotenv.config();
+app.use(cors());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, "public")));
+
+app.use("/uploads", express.static(path.join(__dirname, "uploads")));
+
+// dotenv.config();
+// app.use(cors());
+// app.use(bodyParser.json());
+// app.use(bodyParser.urlencoded({ extended: true }));
+// app.use(express.static(path.join(__dirname, 'public')));
+
+// Ensure uploads directory exists
+const fs = require("fs");
+const uploadsDir = path.join(__dirname, "uploads");
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir);
+}
+
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, "uploads/"); // Folder to store uploaded files
+  },
+  filename: function (req, file, cb) {
+    cb(null, file.originalname); // Filename for the uploaded file
+  },
+});
+
+// const upload = multer({ storage: storage });
+
+
+const upload = multer({
+  storage: storage,
+  limits: {
+    fileSize: 200 * 1024 // 200KB limit
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedMimeTypes = [
+      // Images
+      'image/jpeg',
+      'image/png',
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    ];
+
+    if (allowedMimeTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only images and DOCX files are allowed!'), false);
+    }
+  }
+});
+
+// const limiter = rateLimit({
+//   windowMs: 15 * 60 * 1000, // 15 minutes
+//   max: 100 // limit each IP to 100 requests per windowMs
+// });
+// app.use(limiter);
+
+
+function debugQuery(sql, params) {
+  let debugSql = sql;
+  params.forEach((param, index) => {
+    debugSql = debugSql.replace('?', typeof param === 'string' ? `'${param}'` : param);
+  });
+  return debugSql;
+}
+
+app.post(
+  "/register",
+  [
+    body("username")
+      .isLength({ min: 4 })
+      .withMessage("Username must be at least 4 characters long"),
+    body("password")
+      .isLength({ min: 6 })
+      .withMessage("Password must be at least 6 characters long"),
+  ],
+  (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { username, password, userType, campus } = req.body;
+    const hashedPassword = bcrypt.hashSync(password, 8);
+
+    connection.getConnection((err, connection) => {
+      if (err) {
+        console.error("Error connecting to the database:", err);
+        res.status(500).json({ error: "Error connecting to the database" });
+        return;
+      }
+
+      const sql =
+        "INSERT INTO users (username, password, user_type, campus_id) VALUES (?, ?, ?, ?)";
+
+      connection.query(
+        sql,
+        [username, hashedPassword, userType, campus],
+        (error, result) => {
+          connection.release(); // Release the connection
+
+          if (error) {
+            console.error("Error executing SQL query:", error);
+            res.status(500).json({ error: "Internal server error" });
+          } else {
+            res.status(201).json({ message: "User registered successfully" });
+          }
+        }
+      );
+    });
+  }
+);
+
+
+
+app.post(
+  "/login",
+  [
+    body("username").notEmpty().withMessage("Username is required"),
+    body("password").notEmpty().withMessage("Password is required"),
+  ],
+  (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { username, password } = req.body;
+
+    connection.getConnection((err, connection) => {
+      if (err) {
+        console.error("Error connecting to the database:", err);
+        res.status(500).json({ error: "Error connecting to the database" });
+        return;
+      }
+
+      const sql =
+        "SELECT users.*, campuses.campus_name, campuses.campus_code FROM users JOIN campuses ON users.campus_id = campuses.id WHERE users.username = ?";
+
+      connection.query(sql, [username], (error, results) => {
+        connection.release(); // Release the connection
+
+        if (error) {
+          console.error("Error executing SQL query:", error);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        if (results.length === 0) {
+          return res.status(404).json({ error: "User not found" });
+        }
+
+        const user = results[0];
+
+        // console.log(user);
+
+        const passwordIsValid = bcrypt.compareSync(password, user.password);
+        if (!passwordIsValid) {
+          return res.status(401).json({ error: "Invalid password" });
+        }
+        const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, {
+          expiresIn: 120,
+        }); // 24 hours
+        res.status(200).json({
+          auth: true,
+          token,
+          user: {
+            username: user.username,
+            student_unique_id: user.user_id,
+            user_type: user.user_type,
+            user_id: user.id,
+            campus_id: user.campus_id,
+            campus_name: user.campus_name,
+            campus_code: user.campus_code
+          },
+        });
+      });
+    });
+  }
+);
+
+// Middleware to verify token
+const verifyToken = (req, res, next) => {
+  const token = req.headers["x-access-token"];
+  if (!token) return res.status(403).send("No token provided");
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) return res.status(500).send("Failed to authenticate token");
+    req.userId = decoded.id;
+    next();
+  });
+};
+
+const generateExcelReport = async (res, sqlQuery) => {
+  try {
+    // Execute the SQL query
+    connection.query(sqlQuery, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      // Create a new Excel workbook
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet("Report");
+
+      // Extract columns dynamically from the first result object
+      const columns = Object.keys(results[0]).map((key) => ({
+        header: key.toUpperCase(),
+        key: key,
+        width: 15, // Adjust width as needed
+      }));
+
+      // Set worksheet columns based on the dynamically extracted columns
+      worksheet.columns = columns;
+
+      // Add rows to the worksheet
+      results.forEach((result) => {
+        worksheet.addRow(result);
+      });
+
+      // Set response headers for Excel file download
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      res.setHeader("Content-Disposition", "attachment; filename=report.xlsx");
+
+      // Write Excel file to response
+      workbook.xlsx.write(res).then(() => {
+        res.end();
+      });
+    });
+  } catch (error) {
+    console.error("Error generating Excel report:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+
+
+
+// Route to fetch sections list
+app.get("/sections-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  try {
+    let sql = `SELECT sections.id, sections.section_name
+               FROM sections
+               WHERE sections.status = 'On' AND sections.campus_id = ?`;
+    let countSql = `SELECT COUNT(*) AS total FROM sections
+                    WHERE sections.status = 'On' AND sections.campus_id = ?`;
+
+    const params = [campus_id];
+
+    if (search_data) {
+      sql += ` AND sections.section_name LIKE ?`;
+      countSql += ` AND sections.section_name LIKE ?`;
+      params.push(`%${search_data}%`);
+    }
+
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(
+          countSql,
+          params.slice(0, params.length - 2),
+          (err, results) => {
+            if (err) reject(err);
+            else resolve(results);
+          }
+        );
+      }),
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching sections:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+// Route to fetch student activities list
+app.get("/student-activities-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const student_id = req.query.student_id;
+  const activity_type = req.query.activity_type;
+  const campus_id = req.query.campus_id;
+   const session_id = req.query.session_id;
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  try {
+    let sql = `
+      SELECT 
+        sa.id,
+        sa.student_id,
+        s.full_name AS student_name,
+        sa.name,
+        sa.activity_type,
+        sa.remarks,
+         sa.position,
+       DATE_FORMAT(sa.activity_date, '%d-%m-%Y') AS activity_date
+      FROM student_activities sa
+      JOIN students s ON sa.student_id = s.id
+      WHERE sa.campus_id = ? AND sa.session_id = ?
+    `;
+    
+    let countSql = `
+      SELECT COUNT(*) AS total 
+      FROM student_activities sa
+      JOIN students s ON sa.student_id = s.id
+      WHERE sa.campus_id = ? AND sa.session_id = ?
+    `;
+
+    const params = [campus_id, session_id];
+    const countParams = [campus_id, session_id];
+
+    // console.log("Full query:", debugQuery(sql, params));
+
+    // Add filters
+    if (student_id) {
+      sql += ` AND sa.student_id = ?`;
+      countSql += ` AND sa.student_id = ?`;
+      params.push(student_id);
+      countParams.push(student_id);
+    }
+
+    if (activity_type) {
+      sql += ` AND sa.activity_type = ?`;
+      countSql += ` AND sa.activity_type = ?`;
+      params.push(activity_type);
+      countParams.push(activity_type);
+    }
+
+    if (search_data) {
+      sql += ` AND (sa.name LIKE ? OR s.full_name LIKE ? OR sa.remarks LIKE ? OR sa.activity_type LIKE ?)`;
+      countSql += ` AND (sa.name LIKE ? OR s.full_name LIKE ? OR sa.remarks LIKE ? OR sa.activity_type LIKE ?)`;
+      const searchTerm = `%${search_data}%`;
+      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+      countParams.push(searchTerm, searchTerm, searchTerm, searchTerm);
+    }
+
+    // Add sorting (newest first by default)
+    sql += ` ORDER BY sa.id DESC`;
+    
+    // Add pagination
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(countSql, countParams, (err, results) => {
+          if (err) reject(err);
+          else resolve(results[0].total);
+        });
+      }),
+    ]);
+
+    const total = countResult;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching student activities:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+// Route to fetch student discipline records list
+app.get("/student-discipline-list", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      return res.status(500).json({ error: "Database connection error" });
+    }
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+    const search_data = req.query.search;
+    const student_id = req.query.student_id;
+    const type_of_incident = req.query.type_of_incident;
+    const campus_id = req.query.campus_id;
+    const session_id = req.query.session_id;
+
+    if (!campus_id) {
+      connection.release(); // Release before returning
+      return res.status(400).json({ error: "Campus ID is required" });
+    }
+
+    let sql = `
+      SELECT 
+        sd.id,
+        sd.student_id,
+        s.full_name AS student_name,
+        sd.type_of_incident,
+        sd.action_taken,
+        sd.description,
+        sd.reporting_teacher,
+        DATE_FORMAT(sd.date_of_incident, '%d-%m-%Y') AS date_of_incident
+      FROM student_discipline sd
+      JOIN students s ON sd.student_id = s.id
+      WHERE sd.campus_id = ? AND sd.session_id = ?
+    `;
+    
+    let countSql = `
+      SELECT COUNT(*) AS total 
+      FROM student_discipline sd
+      JOIN students s ON sd.student_id = s.id
+      WHERE sd.campus_id = ? AND sd.session_id = ?
+    `;
+
+    const params = [campus_id, session_id];
+    const countParams = [campus_id, session_id];
+
+    // Add filters
+    if (student_id) {
+      sql += ` AND sd.student_id = ?`;
+      countSql += ` AND sd.student_id = ?`;
+      params.push(student_id);
+      countParams.push(student_id);
+    }
+
+    if (type_of_incident) {
+      sql += ` AND sd.type_of_incident = ?`;
+      countSql += ` AND sd.type_of_incident = ?`;
+      params.push(type_of_incident);
+      countParams.push(type_of_incident);
+    }
+
+    if (search_data) {
+      sql += ` AND (
+        sd.type_of_incident LIKE ? OR 
+        s.full_name LIKE ? OR 
+        sd.description LIKE ? OR 
+        sd.action_taken LIKE ? OR
+        sd.reporting_teacher LIKE ?
+      )`;
+      countSql += ` AND (
+        sd.type_of_incident LIKE ? OR 
+        s.full_name LIKE ? OR 
+        sd.description LIKE ? OR 
+        sd.action_taken LIKE ? OR
+        sd.reporting_teacher LIKE ?
+      )`;
+      const searchTerm = `%${search_data}%`;
+      params.push(
+        searchTerm, 
+        searchTerm, 
+        searchTerm, 
+        searchTerm,
+        searchTerm
+      );
+      countParams.push(
+        searchTerm, 
+        searchTerm, 
+        searchTerm, 
+        searchTerm,
+        searchTerm
+      );
+    }
+
+    // Add sorting (newest first by default)
+    sql += ` ORDER BY sd.id DESC`;
+    
+    // Add pagination
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    // Execute both queries
+    connection.query(sql, params, (err, dataResults) => {
+      if (err) {
+        connection.release();
+        console.error("Error fetching discipline records:", err);
+        return res.status(500).json({ error: "Error fetching data" });
+      }
+
+      connection.query(countSql, countParams, (err, countResults) => {
+        connection.release(); // Release connection here
+
+        if (err) {
+          console.error("Error counting discipline records:", err);
+          return res.status(500).json({ error: "Error counting records" });
+        }
+
+        const total = countResults[0].total;
+        const totalPages = Math.ceil(total / limit);
+
+        res.json({
+          total,
+          currentPage: page,
+          totalPages,
+          results: dataResults,
+        });
+      });
+    });
+  });
+});
+
+
+
+
+
+// Route to fetch student discipline records list
+app.get("/employee-discipline-list", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      return res.status(500).json({ error: "Database connection error" });
+    }
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const offset = (page - 1) * limit;
+    const search_data = req.query.search;
+    const student_id = req.query.student_id;
+    const type_of_incident = req.query.type_of_incident;
+    const campus_id = req.query.campus_id;
+
+    if (!campus_id) {
+      connection.release(); // Release before returning
+      return res.status(400).json({ error: "Campus ID is required" });
+    }
+
+    let sql = `
+      SELECT 
+        sd.id,
+        sd.employee_id,
+        s.full_name AS student_name,
+        sd.type_of_incident,
+        sd.action_taken,
+        sd.description,
+        DATE_FORMAT(sd.date_of_incident, '%d-%m-%Y') AS date_of_incident
+      FROM employee_discipline sd
+      JOIN school_employees s ON sd.employee_id = s.id
+      WHERE sd.campus_id = ?
+    `;
+    
+    let countSql = `
+      SELECT COUNT(*) AS total 
+      FROM employee_discipline sd
+      JOIN school_employees s ON sd.employee_id = s.id
+      WHERE sd.campus_id = ?
+    `;
+
+    const params = [campus_id];
+    const countParams = [campus_id];
+
+    // Add filters
+    if (student_id) {
+      sql += ` AND sd.student_id = ?`;
+      countSql += ` AND sd.student_id = ?`;
+      params.push(student_id);
+      countParams.push(student_id);
+    }
+
+    if (type_of_incident) {
+      sql += ` AND sd.type_of_incident = ?`;
+      countSql += ` AND sd.type_of_incident = ?`;
+      params.push(type_of_incident);
+      countParams.push(type_of_incident);
+    }
+
+    if (search_data) {
+      sql += ` AND (
+        sd.type_of_incident LIKE ? OR 
+        s.full_name LIKE ? OR 
+        sd.description LIKE ? OR 
+        sd.action_taken LIKE ?
+      )`;
+      countSql += ` AND (
+        sd.type_of_incident LIKE ? OR 
+        s.full_name LIKE ? OR 
+        sd.description LIKE ? OR 
+        sd.action_taken LIKE ?
+      )`;
+      const searchTerm = `%${search_data}%`;
+      params.push(
+        searchTerm, 
+        searchTerm, 
+        searchTerm, 
+        searchTerm
+      );
+      countParams.push(
+        searchTerm, 
+        searchTerm, 
+        searchTerm, 
+        searchTerm
+      );
+    }
+
+    // Add sorting (newest first by default)
+    sql += ` ORDER BY sd.id DESC`;
+    
+    // Add pagination
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    // Execute both queries
+    connection.query(sql, params, (err, dataResults) => {
+      if (err) {
+        connection.release();
+        console.error("Error fetching discipline records:", err);
+        return res.status(500).json({ error: "Error fetching data" });
+      }
+
+      connection.query(countSql, countParams, (err, countResults) => {
+        connection.release(); // Release connection here
+
+        if (err) {
+          console.error("Error counting discipline records:", err);
+          return res.status(500).json({ error: "Error counting records" });
+        }
+
+        const total = countResults[0].total;
+        const totalPages = Math.ceil(total / limit);
+
+        res.json({
+          total,
+          currentPage: page,
+          totalPages,
+          results: dataResults,
+        });
+      });
+    });
+  });
+});
+
+
+// Route to fetch logs list
+app.get("/logs-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id; // Added session_id which was in the SQL but not declared
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  try {
+    let sql = `SELECT logs.id, logs.action, logs.table_name, logs.remarks, logs.timestamp, logs.description, users.username, campuses.campus_name
+               FROM logs 
+               LEFT JOIN users ON users.id = logs.user_id 
+               LEFT JOIN campuses ON campuses.id = logs.campus_id
+               WHERE logs.campus_id = ? AND logs.session_id = ?`;
+    let countSql = `SELECT COUNT(*) AS total FROM logs
+                    WHERE logs.campus_id = ? AND logs.session_id = ?`;
+
+    const params = [campus_id, session_id];
+    const countParams = [campus_id, session_id];
+
+    if (search_data) {
+      sql += ` AND (logs.action LIKE ? OR logs.table_name LIKE ? OR logs.remarks LIKE ?)`;
+      countSql += ` AND (logs.action LIKE ? OR logs.table_name LIKE ? OR logs.remarks LIKE ?)`;
+      const searchParam = `%${search_data}%`;
+      params.push(searchParam, searchParam, searchParam);
+      countParams.push(searchParam, searchParam, searchParam);
+    }
+
+    sql += ` ORDER BY logs.timestamp DESC LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(countSql, countParams, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching logs:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+// Route to fetch dashboard data
+// app.get('/get-dashboard-data/:campus_id/:session_id', async (req, res) => {
+//   const campus_id = req.params.campus_id;
+//   const session_id = req.params.session_id;
+
+//   if (!campus_id || !session_id) {
+//     return res.status(400).json({ error: 'Campus ID and Session ID are required' });
+//   }
+
+//   try {
+//     // Query to fetch voucher counts and income from paid vouchers
+//     const voucherCountsQuery = `
+//       SELECT
+//         (SELECT SUM(total_amount_data + first_advance_payment) FROM fee_vouchers WHERE campus_id = ? AND session_id = ?) AS total_vouchers_amount,
+//         (SELECT SUM(recieved_payment) FROM fee_vouchers WHERE status = 'paid' AND campus_id = ? AND session_id = ?) AS total_recieved_amount
+//     `;
+
+//     // Query to fetch total students count
+//     const studentsCountQuery = `
+//       SELECT COUNT(*) AS total_students FROM students WHERE campus_id = ? AND session_id = ? AND status IN ("New Admission", "Promoted")
+//     `;
+
+//     const voucherParams = [campus_id, session_id, campus_id, session_id, campus_id, session_id, campus_id, session_id, campus_id, session_id];
+//     const studentParams = [campus_id, session_id];
+
+//     const [voucherCountsResult, studentsCountResult] = await Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(voucherCountsQuery, voucherParams, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(studentsCountQuery, studentParams, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       })
+//     ]);
+
+//     res.json({
+//       total_vouchers_amount: voucherCountsResult[0].total_vouchers_amount,
+//       total_recieved_amount: voucherCountsResult[0].total_recieved_amount,
+//       total_students: studentsCountResult[0].total_students
+//     });
+//   } catch (error) {
+//     console.error('Error fetching dashboard data:', error);
+//     res.status(500).json({ error: 'Internal server error' });
+//   }
+// });
+
+// app.get('/get-dashboard-data/:campus_id/:session_id', async (req, res) => {
+//   const campus_id = req.params.campus_id;
+//   const session_id = req.params.session_id;
+
+//   if (!campus_id || !session_id) {
+//     return res.status(400).json({ error: 'Campus ID and Session ID are required' });
+//   }
+
+//   try {
+//     // Query to fetch voucher counts and income from paid vouchers
+//     const voucherCountsQuery = `
+//       SELECT
+//         (SELECT SUM(total_amount_data + first_advance_payment) FROM fee_vouchers WHERE campus_id = ? AND session_id = ?) AS total_vouchers_amount,
+//         (SELECT SUM(recieved_payment) FROM fee_vouchers WHERE status = 'paid' AND campus_id = ? AND session_id = ?) AS total_recieved_amount
+//     `;
+
+//     // Query to fetch total students count
+//     const studentsCountQuery = `
+//       SELECT COUNT(*) AS total_students FROM students WHERE campus_id = ? AND session_id = ? AND status IN ("New Admission", "Promoted")
+//     `;
+
+//     // Query to fetch grand total of payable amount after due date
+//     const getLastEntrySQL = `
+//       SELECT for_the_month
+//       FROM fee_vouchers
+//       WHERE voucher_created_form = 'Multiple' AND campus_id = ? AND session_id = ?
+//       ORDER BY id DESC
+//       LIMIT 1
+//     `;
+
+//     const paramsGetLastEntry = [campus_id, session_id];
+
+//     const getLastEntryPromise = new Promise((resolve, reject) => {
+//       connection.query(getLastEntrySQL, paramsGetLastEntry, (err, results) => {
+//         if (err) reject(err);
+//         else resolve(results);
+//       });
+//     });
+
+//     const lastEntryResult = await getLastEntryPromise;
+
+//     if (lastEntryResult.length === 0) {
+//       return res.status(404).json({ error: 'No entries found for voucher_created_form = "Multiple"' });
+//     }
+
+//     const lastForTheMonth = lastEntryResult[0].for_the_month;
+
+//     const grandTotalQuery = `
+//       SELECT
+//         SUM(CASE WHEN fee_vouchers.for_the_month = ? THEN fee_vouchers.total_amount_data + first_advance_payment ELSE fee_vouchers.after_due_date_amount + first_advance_payment END) as grand_total_payable
+//       FROM
+//         fee_vouchers
+//       WHERE
+//         fee_vouchers.campus_id = ? AND fee_vouchers.session_id = ? AND fee_vouchers.status = 'unpaid'
+//     `;
+
+//     const paramsGrandTotal = [lastForTheMonth, campus_id, session_id];
+
+//     const grandTotalPromise = new Promise((resolve, reject) => {
+//       connection.query(grandTotalQuery, paramsGrandTotal, (err, results) => {
+//         if (err) reject(err);
+//         else resolve(results);
+//       });
+//     });
+
+//     const [voucherCountsResult, studentsCountResult, grandTotalResult] = await Promise.all([
+//       new Promise((resolve, reject) => {
+//         const voucherParams = [campus_id, session_id, campus_id, session_id];
+//         connection.query(voucherCountsQuery, voucherParams, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         const studentParams = [campus_id, session_id];
+//         connection.query(studentsCountQuery, studentParams, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       grandTotalPromise
+//     ]);
+
+//     res.json({
+//       total_vouchers_amount: voucherCountsResult[0].total_vouchers_amount,
+//       total_recieved_amount: voucherCountsResult[0].total_recieved_amount,
+//       total_students: studentsCountResult[0].total_students,
+//       grand_total_payable: grandTotalResult[0].grand_total_payable || 0
+//     });
+//   } catch (error) {
+//     console.error('Error fetching dashboard data:', error);
+//     res.status(500).json({ error: 'Internal server error' });
+//   }
+// });
+
+// // Protected route example
+// app.get('/me', verifyToken, (req, res) => {
+//   db.query('SELECT * FROM users WHERE id = ?', [req.userId], (err, results) => {
+//     if (err) return res.status(500).send('Server error');
+//     res.status(200).send(results[0]);
+//   });
+// });
+
+// app.get('/get-dashboard-data/:campus_id/:session_id', async (req, res) => {
+//   const campus_id = req.params.campus_id;
+//   const session_id = req.params.session_id;
+
+//   if (!campus_id || !session_id) {
+//     return res.status(400).json({ error: 'Campus ID and Session ID are required' });
+//   }
+
+//   try {
+//     // Query to fetch voucher counts and income from paid vouchers
+//     const voucherCountsQuery = `
+//       SELECT
+//         (SELECT SUM(total_amount_data + first_advance_payment) FROM fee_vouchers WHERE campus_id = ? AND session_id = ?) AS total_vouchers_amount,
+//         (SELECT SUM(recieved_payment) FROM fee_vouchers WHERE status = 'paid' AND campus_id = ? AND session_id = ?) AS total_recieved_amount
+//     `;
+
+//     // Query to fetch total students count
+//     const studentsCountQuery = `
+//       SELECT COUNT(*) AS total_students FROM students WHERE campus_id = ? AND session_id = ? AND status IN ("New Admission", "Promoted")
+//     `;
+
+//     // Query to fetch grand total of payable amount after due date
+//     const getLastEntrySQL = `
+//       SELECT for_the_month
+//       FROM fee_vouchers
+//       WHERE voucher_created_form = 'Multiple' AND campus_id = ? AND session_id = ?
+//       ORDER BY id DESC
+//       LIMIT 1
+//     `;
+
+//     const paramsGetLastEntry = [campus_id, session_id];
+
+//     const getLastEntryPromise = new Promise((resolve, reject) => {
+//       connection.query(getLastEntrySQL, paramsGetLastEntry, (err, results) => {
+//         if (err) reject(err);
+//         else resolve(results);
+//       });
+//     });
+
+//     const lastEntryResult = await getLastEntryPromise;
+
+//     let grandTotalQuery;
+//     let paramsGrandTotal;
+
+//     if (lastEntryResult.length === 0) {
+
+//       grandTotalQuery = `
+//         SELECT
+//           SUM(fee_vouchers.total_amount_data + first_advance_payment) as grand_total_payable
+//         FROM
+//           fee_vouchers
+//         WHERE
+//           fee_vouchers.campus_id = ? AND fee_vouchers.session_id = ? AND fee_vouchers.status = 'unpaid'
+//       `;
+//       paramsGrandTotal = [campus_id, session_id];
+
+//     } else {
+
+//       const lastForTheMonth = lastEntryResult[0].for_the_month;
+//       grandTotalQuery = `
+//         SELECT
+//           SUM(CASE WHEN fee_vouchers.for_the_month = ? THEN fee_vouchers.total_amount_data + first_advance_payment  + arrears ELSE fee_vouchers.after_due_date_amount + first_advance_payment END) as grand_total_payable
+//         FROM
+//           fee_vouchers
+//         WHERE
+//           fee_vouchers.campus_id = ? AND fee_vouchers.session_id = ?
+//       `;
+//       paramsGrandTotal = [lastForTheMonth, campus_id, session_id];
+
+//     }
+
+//     const grandTotalPromise = new Promise((resolve, reject) => {
+//       connection.query(grandTotalQuery, paramsGrandTotal, (err, results) => {
+//         if (err) reject(err);
+//         else resolve(results);
+//       });
+//     });
+
+//     const [voucherCountsResult, studentsCountResult, grandTotalResult] = await Promise.all([
+//       new Promise((resolve, reject) => {
+//         const voucherParams = [campus_id, session_id, campus_id, session_id];
+//         connection.query(voucherCountsQuery, voucherParams, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         const studentParams = [campus_id, session_id];
+//         connection.query(studentsCountQuery, studentParams, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       grandTotalPromise
+//     ]);
+
+//     res.json({
+//       total_vouchers_amount: voucherCountsResult[0].total_vouchers_amount,
+//       total_recieved_amount: voucherCountsResult[0].total_recieved_amount,
+//       total_students: studentsCountResult[0].total_students,
+//       grand_total_payable: grandTotalResult[0].grand_total_payable || 0
+//     });
+//   } catch (error) {
+//     console.error('Error fetching dashboard data:', error);
+//     res.status(500).json({ error: 'Internal server error' });
+//   }
+// });
+
+// app.get('/get-dashboard-data/:campus_id/:session_id', async (req, res) => {
+//   const campus_id = req.params.campus_id;
+//   const session_id = req.params.session_id;
+
+//   if (!campus_id || !session_id) {
+//     return res.status(400).json({ error: 'Campus ID and Session ID are required' });
+//   }
+
+//   try {
+//     // Query to fetch total students count
+//     const studentsCountQuery = `
+//       SELECT COUNT(*) AS total_students
+//       FROM students
+//       WHERE campus_id = ?
+//         AND session_id = ?
+//         AND status IN ("New Admission", "Promoted")
+//     `;
+
+//     // Query to fetch total payable and received amounts
+//     const totalAmountsQuery = `
+//     SELECT
+//     (
+//         SELECT SUM(
+//             CASE
+//                 WHEN fv1.for_the_month <= (
+//                     SELECT MAX(fv2.for_the_month)
+//                     FROM fee_vouchers fv2
+//                     WHERE fv2.campus_id = ?
+//                       AND fv2.voucher_created_form != 'Single'
+//                       AND fv2.session_id = ?
+//                 )
+//                 THEN
+//                     CASE
+//                         WHEN (fv1.status = 'unpaid' AND fv1.is_arrear = 'arrears') OR fv1.payment_date > fv1.due_date
+//                         THEN fv1.total_amount_data + COALESCE(fv1.fine, 0)  -- Add fine if status is 'unpaid' and other conditions
+//                         ELSE fv1.total_amount_data
+//                     END
+//                     + fv1.first_advance_payment
+//                 ELSE 0
+//             END
+//             + CASE
+//                 WHEN fv1.first_arrear = 'yes'
+//                 THEN fv1.arrears
+//                 ELSE 0
+//             END
+//         )
+//         FROM fee_vouchers fv1
+//         WHERE fv1.campus_id = ?
+//           AND fv1.session_id = ?
+//     ) AS total_payable_amount,
+
+//     (
+//         SELECT SUM(fv3.recieved_payment)
+//         FROM fee_vouchers fv3
+//         WHERE fv3.status = 'paid'
+//           AND fv3.campus_id = ?
+//           AND fv3.session_id = ?
+//           AND fv3.for_the_month <= (
+//               SELECT MAX(fv4.for_the_month)
+//               FROM fee_vouchers fv4
+//               WHERE fv4.campus_id = ?
+//                 AND fv4.voucher_created_form != 'Single'
+//                 AND fv4.session_id = ?
+//           )
+//     ) AS total_received_amount`;
+
+//     const paramsStudentsCount = [campus_id, session_id];
+//     const paramsTotalAmounts = [campus_id, session_id, campus_id, session_id, campus_id, session_id, campus_id, session_id];
+
+//     const [studentsCountResult, totalAmountsResult] = await Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(studentsCountQuery, paramsStudentsCount, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(totalAmountsQuery, paramsTotalAmounts, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       })
+//     ]);
+
+//     res.json({
+//       total_students: studentsCountResult[0].total_students || 0,
+//       total_payable_amount: totalAmountsResult[0].total_payable_amount || 0,
+//       total_received_amount: totalAmountsResult[0].total_received_amount || 0
+//     });
+//   } catch (error) {
+//     console.error('Error fetching dashboard data:', error);
+//     res.status(500).json({ error: 'Internal server error' });
+//   }
+// });
+
+
+//this is accurate old query
+// app.get("/get-dashboard-data/:campus_id/:session_id", async (req, res) => {
+//   const { campus_id, session_id } = req.params;
+
+//   if (!campus_id || !session_id) {
+//     return res
+//       .status(400)
+//       .json({ error: "Campus ID and Session ID are required" });
+//   }
+
+//   try {
+//     // Query to fetch total students count
+//     const studentsCountQuery = `
+//       SELECT COUNT(*) AS total_students 
+//       FROM students 
+//       WHERE campus_id = ? 
+//         AND session_id = ? 
+//         AND status IN ("New Admission", "Promoted")
+//     `;
+
+//     // Query to fetch total payable and received amounts
+//     const totalAmountsQuery = `
+//     SELECT 
+//   (
+//     SELECT SUM(
+//       CASE 
+//         WHEN fv1.for_the_month <= (
+//           SELECT MAX(fv2.for_the_month) 
+//           FROM fee_vouchers fv2 
+//           WHERE fv2.campus_id = ? 
+//             AND fv2.voucher_created_form != 'Single' 
+//             AND fv2.session_id = ?
+//         ) 
+//         THEN 
+//           CASE 
+//             WHEN fv1.for_the_month = (
+//               SELECT MAX(fv3.for_the_month) 
+//               FROM fee_vouchers fv3 
+//               WHERE fv3.campus_id = ? 
+//                 AND fv3.voucher_created_form != 'Single' 
+//                 AND fv3.session_id = ?
+//             )
+//             THEN fv1.total_amount_data + fv1.first_advance_payment + COALESCE(
+//                 CASE 
+//                   WHEN fv1.payment_date > fv1.due_date
+//                   THEN fv1.fine
+//                   ELSE 0 
+//                 END, 
+//                 0
+//               ) 
+//             ELSE 
+//               fv1.total_amount_data + 
+//               COALESCE(
+//                 CASE 
+//                   WHEN fv1.status = 'unpaid' OR fv1.status = 'partially_paid'  OR fv1.is_arrear = 'arrears' OR fv1.payment_date > fv1.due_date
+//                   THEN fv1.fine
+//                   ELSE 0 
+//                 END, 
+//                 0
+//               ) + fv1.first_advance_payment
+//           END
+//         ELSE 0
+//       END
+//       + CASE 
+//         WHEN fv1.first_arrear = 'yes' 
+//         THEN fv1.arrears
+//         ELSE 0
+//       END
+//     )
+//     FROM fee_vouchers fv1
+//     WHERE fv1.campus_id = ? 
+//       AND fv1.session_id = ?
+//   ) AS total_payable_amount,
+
+//   (
+//     SELECT SUM(fv4.recieved_payment) 
+//     FROM fee_vouchers fv4
+//     WHERE fv4.status = 'paid' 
+//       AND fv4.campus_id = ? 
+//       AND fv4.session_id = ?
+//       AND fv4.for_the_month <= (
+//         SELECT MAX(fv5.for_the_month) 
+//         FROM fee_vouchers fv5 
+//         WHERE fv5.campus_id = ? 
+//           AND fv5.voucher_created_form != 'Single' 
+//           AND fv5.session_id = ?
+//       )
+//   ) AS total_received_amount
+// `;
+
+//     const paramsStudentsCount = [campus_id, session_id];
+//     const paramsTotalAmounts = [
+//       campus_id,
+//       session_id,
+//       campus_id,
+//       session_id,
+//       campus_id,
+//       session_id,
+//       campus_id,
+//       session_id,
+//       campus_id,
+//       session_id,
+//     ];
+
+//     // Execute both queries concurrently
+//     const [studentsCountResult, totalAmountsResult] = await Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(
+//           studentsCountQuery,
+//           paramsStudentsCount,
+//           (err, results) => {
+//             if (err) reject(err);
+//             else resolve(results);
+//           }
+//         );
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(
+//           totalAmountsQuery,
+//           paramsTotalAmounts,
+//           (err, results) => {
+//             if (err) reject(err);
+//             else resolve(results);
+//           }
+//         );
+//       }),
+//     ]);
+
+//     res.json({
+//       total_students: studentsCountResult[0].total_students || 0,
+//       total_payable_amount: totalAmountsResult[0].total_payable_amount || 0,
+//       total_received_amount: totalAmountsResult[0].total_received_amount || 0,
+//     });
+//   } catch (error) {
+//     console.error("Error fetching dashboard data:", error);
+//     res.status(500).json({ error: "Internal server error" });
+//   }
+// });
+
+
+
+//this is latest and 100% accurate
+// app.get("/get-dashboard-data/:campus_id/:session_id", async (req, res) => {
+//   const { campus_id, session_id } = req.params;
+
+//   // Check if campus_id or session_id are missing
+//   if (!campus_id || !session_id) {
+//     return res
+//       .status(400)
+//       .json({ error: "Campus ID and Session ID are required" });
+//   }
+
+//   try {
+//     // Query to fetch total students count
+//     const studentsCountQuery = `
+//       SELECT COUNT(*) AS total_students 
+//       FROM students 
+//       WHERE campus_id = ? 
+//         AND session_id = ? 
+//         AND status IN ("New Admission", "Promoted")
+//     `;
+
+//     // Query to fetch total payable and received amounts
+//     const totalAmountsQuery = `SELECT ( SELECT SUM( 
+//         CASE
+//             -- Condition to check if payment_date is greater than due_date or if it is arrear
+//             WHEN (payment_date > due_date OR is_arrear = 'arrears') THEN after_due_date_amount + first_advance_payment 
+//             -- Default case to use actual amount if not overdue or arrear
+//             ELSE total_amount_data + first_advance_payment 
+//         END
+//         + CASE 
+//             -- Second condition for first_arrear
+//             WHEN fv.first_arrear = 'yes' THEN fv.arrears
+//             ELSE 0
+//           END
+//         ) FROM fee_vouchers fv
+//         WHERE fv.campus_id = ? 
+//         AND fv.session_id = ?
+//         ) AS total_payable_amount,
+//         (SELECT SUM(fv.recieved_payment) 
+//         FROM fee_vouchers fv
+//         WHERE fv.status = 'paid'
+//         AND fv.campus_id = ? 
+//         AND fv.session_id = ?
+//     ) AS total_received_amount`;
+
+
+//     // Parameters for queries
+//     const paramsStudentsCount = [campus_id, session_id];
+//     const paramsTotalAmounts = [campus_id, session_id, campus_id, session_id];
+
+//     // Execute both queries concurrently
+//     const [studentsCountResult, totalAmountsResult] = await Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(studentsCountQuery, paramsStudentsCount, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(totalAmountsQuery, paramsTotalAmounts, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//     ]);
+
+//     // Send back the result in JSON format
+//     res.json({
+//       total_students: studentsCountResult[0]?.total_students || 0,
+//       total_payable_amount: totalAmountsResult[0]?.total_payable_amount || 0,
+//       total_received_amount: totalAmountsResult[0]?.total_received_amount || 0,
+//     });
+//   } catch (error) {
+//     console.error("Error fetching dashboard data:", error);
+//     res.status(500).json({ error: "Internal server error" });
+//   }
+// });
+
+
+
+
+// app.get("/get-dashboard-data/:campus_id/:session_id", async (req, res) => {
+//   const { campus_id, session_id } = req.params;
+
+//   // Check if campus_id or session_id are missing
+//   if (!campus_id || !session_id) {
+//     return res
+//       .status(400)
+//       .json({ error: "Campus ID and Session ID are required" });
+//   }
+
+//   try {
+//     // Query to fetch total students count
+//     const studentsCountQuery = `SELECT COUNT(*) AS total_students 
+//       FROM students 
+//       WHERE campus_id = ? 
+//         AND session_id = ? 
+//         AND status IN ("New Admission", "Promoted")`;
+
+//     // Query to fetch total payable and received amounts
+//     const totalAmountsQuery = `
+//       SELECT 
+//         (SELECT SUM(
+//           CASE
+//             WHEN (payment_date > due_date OR is_arrear = 'arrears') THEN after_due_date_amount + first_advance_payment 
+//             ELSE total_amount_data + first_advance_payment 
+//           END
+//           + CASE 
+//               WHEN fv.first_arrear = 'yes' THEN fv.arrears
+//               ELSE 0
+//             END
+//           ) 
+//          FROM fee_vouchers fv
+//          WHERE fv.campus_id = ? 
+//            AND fv.session_id = ?
+//         ) AS total_payable_amount,
+//         (SELECT SUM(fv.recieved_payment) 
+//          FROM fee_vouchers fv
+//          WHERE fv.status = 'paid'
+//            AND fv.campus_id = ? 
+//            AND fv.session_id = ?
+//         ) AS total_received_amount
+//     `;
+
+//     // Query to get unpaid vouchers where `is_arrear = ''` and `is_arrear IS NULL` for months before the last month
+//     const unpaidVouchersQuery = `
+//       SELECT SUM(arrears + total_amount_data + first_advance_payment) AS unpaid_vouchers
+//       FROM fee_vouchers
+//       WHERE campus_id = ?
+//         AND session_id = ?
+//         AND status = 'unpaid'
+//         AND (is_arrear = '' OR is_arrear IS NULL)
+//         AND for_the_month < (
+//           SELECT MAX(for_the_month) 
+//           FROM fee_vouchers 
+//           WHERE campus_id = ? 
+//             AND session_id = ?
+//             AND voucher_created_form != 'Single'
+//         )
+//     `;
+
+//     // Parameters for queries
+//     const paramsStudentsCount = [campus_id, session_id];
+//     const paramsTotalAmounts = [campus_id, session_id, campus_id, session_id];
+//     const paramsUnpaidVouchers = [campus_id, session_id, campus_id, session_id];
+
+//     // Execute all queries concurrently
+//     const [studentsCountResult, totalAmountsResult, unpaidVouchersResult] = await Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(studentsCountQuery, paramsStudentsCount, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(totalAmountsQuery, paramsTotalAmounts, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(unpaidVouchersQuery, paramsUnpaidVouchers, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       })
+//     ]);
+
+//     // Send back the result in JSON format
+//     res.json({
+//       total_students: studentsCountResult[0]?.total_students || 0,
+//       total_payable_amount: totalAmountsResult[0]?.total_payable_amount || 0,
+//       total_received_amount: totalAmountsResult[0]?.total_received_amount || 0,
+//       unpaid_vouchers: unpaidVouchersResult[0]?.unpaid_vouchers || 0, // New field for unpaid vouchers count
+//     });
+//   } catch (error) {
+//     console.error("Error fetching dashboard data:", error);
+//     res.status(500).json({ error: "Internal server error" });
+//   }
+// });
+
+
+
+
+
+
+app.get("/get-dashboard-data/:campus_id/:session_id", async (req, res) => {
+  const { campus_id, session_id } = req.params;
+
+  // Check if campus_id or session_id are missing
+  if (!campus_id || !session_id) {
+    return res
+      .status(400)
+      .json({ error: "Campus ID and Session ID are required" });
+  }
+
+  try {
+    // Existing queries
+    const studentsCountQuery = `SELECT COUNT(*) AS total_students 
+      FROM students 
+      WHERE campus_id = ? 
+      AND session_id = ? 
+      AND status IN ("New Admission", "Promoted") AND status_on_off !='Off'`;
+
+    const totalAmountsQuery = `
+      SELECT 
+        (SELECT SUM(
+          CASE
+            WHEN (payment_date > due_date OR is_arrear = 'arrears') THEN total_amount_data + fine + first_advance_payment 
+            ELSE total_amount_data + first_advance_payment 
+          END
+          + CASE 
+              WHEN fv.first_arrear = 'yes' THEN fv.arrears
+              ELSE 0
+            END
+          ) 
+         FROM fee_vouchers fv
+         WHERE fv.campus_id = ? 
+           AND fv.session_id = ?
+        ) AS total_payable_amount,
+        (SELECT SUM(fv.recieved_payment) FROM fee_vouchers fv
+         WHERE fv.status = 'paid'
+           AND fv.campus_id = ? 
+           AND fv.session_id = ?
+        ) AS total_received_amount,
+        (SELECT SUM(fv.total_amount_data + fv.first_advance_payment + fv.fine + fv.arrears) FROM fee_vouchers fv
+         WHERE fv.status = 'paid' and session_end = 'yes'
+           AND fv.campus_id = ? 
+           AND fv.session_id = ?
+        ) AS total_received_amount_last_month_of_session
+        `;
+
+
+    // New query for students with "Struck Off" or "SLC" status
+    const struckOffSLCQuery = `
+      SELECT 
+      SUM(
+          CASE
+            WHEN (payment_date > due_date OR is_arrear = 'arrears') THEN total_amount_data + fine + first_advance_payment 
+            ELSE total_amount_data + first_advance_payment 
+          END
+          + CASE 
+              WHEN fv.first_arrear = 'yes' THEN fv.arrears
+              ELSE 0
+            END
+      )  AS struck_off_slc_unpaid
+      FROM fee_vouchers fv
+      INNER JOIN students s ON fv.student_id = s.id
+      WHERE s.status IN ("Struck Off", "SLC")
+        AND fv.status = 'unpaid'
+        AND fv.campus_id = ? 
+        AND fv.session_id = ?`;
+
+    const studentAttendance = `
+    SELECT 
+    COUNT(CASE WHEN status = 'absent' THEN 1 END) AS absent_count,
+    COUNT(CASE WHEN status = 'leave' THEN 1 END) AS leave_count,
+    COUNT(CASE WHEN status = 'present' THEN 1 END) AS present_count,
+    COUNT(*) AS total_count
+    FROM school_student_attendance
+    WHERE date = CURDATE() 
+    AND campus_id = ?
+    AND session_id = ?`;
+
+    const employeeCountQuery = `SELECT COUNT(*) AS total_employee
+    FROM school_employees 
+    WHERE campus_id = ?
+    AND status = 'On'`;
+
+    const employeeAttendance = `
+    SELECT 
+    COUNT(CASE WHEN status = 'absent' THEN 1 END) AS absent_count,
+    COUNT(CASE WHEN status IN ('ex_pakistan_leave', 'maternity_leave', 'casual_leave', 'earned_leave', 'lwp') THEN 1 END) AS leave_count,
+    COUNT(CASE WHEN status = 'present' THEN 1 END) AS present_count,
+    COUNT(*) AS total_count
+    FROM school_employee_attendance
+    WHERE date = CURDATE() 
+      AND campus_id = ?
+      AND session_id = ?`;
+     
+
+    // Parameters for queries
+    const paramsStudentsCount = [campus_id, session_id];
+    const paramsTotalAmounts = [campus_id, session_id, campus_id, session_id, campus_id, session_id];
+    // const paramsUnpaidVouchers = [campus_id, session_id, campus_id, session_id];
+    const paramsStruckOffSLC = [campus_id, session_id]; // No campus/session filtering in this query
+
+    const paramsStudentsAttendance = [campus_id, session_id];
+
+    const paramsTotalEmployee = [campus_id, session_id];
+
+    const paramsTotalEmployeeAttendance = [campus_id, session_id];
+
+    // Execute all queries concurrently
+    const [studentsCountResult, totalAmountsResult, struckOffSLCResult, attendanceResult, totalEmployeeResult, totalEmployeeAttendance] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(studentsCountQuery, paramsStudentsCount, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(totalAmountsQuery, paramsTotalAmounts, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      
+      new Promise((resolve, reject) => {
+        connection.query(struckOffSLCQuery, paramsStruckOffSLC, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(studentAttendance, paramsStudentsAttendance, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(employeeCountQuery, paramsTotalEmployee, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(employeeAttendance, paramsTotalEmployeeAttendance, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      })
+    ]);
+    
+
+    // Send back the result in JSON format
+    res.json({
+      total_students: studentsCountResult[0]?.total_students || 0,
+      total_payable_amount: totalAmountsResult[0]?.total_payable_amount || 0,
+      total_received_amount: totalAmountsResult[0]?.total_received_amount || 0,
+      total_received_amount_last_month_of_session : totalAmountsResult[0]?.total_received_amount_last_month_of_session || 0,
+      // unpaid_vouchers: unpaidVouchersResult[0]?.unpaid_vouchers || 0,
+      struck_off_slc_unpaid: struckOffSLCResult[0]?.struck_off_slc_unpaid || 0, // New field for "Struck Off" and "SLC" unpaid amount
+      attendance: attendanceResult || '',
+      total_employees: totalEmployeeResult[0]?.total_employee || 0,
+      total_employee_attendance:  totalEmployeeAttendance || ''
+      
+    });
+  } catch (error) {
+    console.error("Error fetching dashboard data:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+// const logAction = (action, tableName, recordId, userId, campus_id, session_id) => {
+//   connection.query(
+//     'INSERT INTO logs (user_id, action, table_name, record_id, campus_id, session_id, class_id, section_id, shift) VALUES (?, ?, ?, ?, ?, ?)',
+//     [userId, action, tableName, recordId, campus_id, session_id]
+//   );
+// };
+
+
+const logAction = (action, tableName, remarks, recordId, userId, campus_id, session_id,  extraFields = {}) => {
+  // Define all possible columns
+  const columns = [
+    'user_id',
+    'action',
+    'table_name',
+     'remarks',
+    'record_id',
+    'campus_id',
+    'session_id'
+    // ...Object.keys(extraFields).filter(key => extraFields[key] !== undefined)
+    
+  ];
+
+  // Create placeholders and values array
+  const placeholders = columns.map(() => '?').join(', ');
+  const values = [
+    userId,
+    action,
+    tableName,
+    remarks,
+    recordId,
+    campus_id,
+    session_id
+    // ...Object.keys(extraFields)
+    //   .filter(key => extraFields[key] !== undefined)
+    //   .map(key => extraFields[key]),
+    //    remarks,
+  ];
+
+  const query = `
+    INSERT INTO logs 
+    (${columns.join(', ')}) 
+    VALUES (${placeholders})
+  `;
+
+  return new Promise((resolve, reject) => {
+    connection.query(query, values, (err, result) => {
+      if (err) {
+        console.error('Error logging action:', err);
+        reject(err);
+      } else {
+        resolve(result);
+      }
+    });
+  });
+};
+
+
+
+
+app.get("/get-sessions", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching sessions" });
+      return;
+    }
+
+    const sql = "SELECT * FROM sessions";
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching sessions" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+app.get("/view-fee-head-details-get/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Database connection error:", err);
+      return res.status(500).json({ error: "Database connection error" });
+    }
+
+    const sql = `
+      SELECT * 
+      FROM fee_head_details 
+      INNER JOIN heads ON fee_head_details.fee_head_id = heads.id 
+      INNER JOIN school_categories ON fee_head_details.category_id = school_categories.id 
+      INNER JOIN fee_groups ON fee_head_details.fee_group_id = fee_groups.id 
+      WHERE fee_head_details.campus_id = ?`;
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Database query error:", error);
+        return res.status(500).json({ error: "Error fetching fee head details" });
+      }
+
+      console.log("Fee head details fetched successfully");
+      res.status(200).json({ data: results }); // Changed 'results' to 'data' for better semantics
+    });
+  });
+});
+
+
+
+
+// app.get("/get-student-profile/:session_id/:campus_id/:student_unique_id", (req, res) => {
+//   const student_unique_id = parseInt(req.params.student_unique_id);
+//   const campus_id = parseInt(req.params.campus_id);
+//   const session_id = parseInt(req.params.session_id);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error getting students" });
+//       return;
+//     }
+
+//     const sql = `SELECT 
+//       students.*,
+//       classes.class AS class_name,
+//       sections.section_name,
+//       school_categories.category AS category_name,
+//       sessions.session_name,
+//       campuses.campus_name,
+//       fee_vouchers.id as voucher_id,
+//       fee_vouchers.for_the_month,
+//       fee_vouchers.arrears,
+//       fee_vouchers.first_advance_payment,
+//       fee_vouchers.recieved_payment,
+//       fee_vouchers.status as fee_status,
+//       fee_vouchers.due_date,
+//       fee_vouchers.payment_date,
+//         house.house_or_club_name as house_name,
+//       club.house_or_club_name as club_name,
+//       CASE 
+//         WHEN fee_vouchers.payment_date > fee_vouchers.due_date 
+//         THEN fee_vouchers.total_amount_data + COALESCE(fee_vouchers.fine, 0)
+//         ELSE fee_vouchers.total_amount_data
+//       END AS total_amount
+//     FROM 
+//       students  -- Fully qualify the table once here
+//     INNER JOIN 
+//       classes ON students.class_id = classes.id
+//       INNER JOIN 
+//       sections ON students.section_id = sections.id
+//       INNER JOIN 
+//       school_categories ON students.category_id = school_categories.id
+//       INNER JOIN  
+//       sessions ON students.session_id = sessions.id
+//       INNER JOIN 
+//       campuses ON students.campus_id = campuses.id
+//       INNER JOIN 
+//       house_or_club as house ON students.house_id = house.id
+//       INNER JOIN 
+//       house_or_club as club ON students.club_id = club.id
+//     INNER JOIN 
+//       fee_vouchers ON fee_vouchers.student_id = students.id
+//     WHERE 
+//       students.student_unique_id = ? 
+//       AND students.campus_id = ?  -- Ensure this is the correct fixed campus ID
+//       AND students.session_id = ?  -- Ensure this is the correct fixed session ID
+//     ORDER BY 
+//       fee_vouchers.for_the_month DESC;
+//     `;
+
+//     const values = [student_unique_id, campus_id, session_id];
+
+//     connection.query(sql, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error("Error getting students:", error);
+//         res.status(500).json({ error: "Error getting students" });
+//       } else {
+//         res.status(200).json({ results });
+//       }
+//     });
+//   });
+// });
+
+
+
+// app.get("/get-student-profile/:session_id/:campus_id/:student_unique_id", (req, res) => {
+//   const student_unique_id = parseInt(req.params.student_unique_id);
+//   const campus_id = parseInt(req.params.campus_id);
+//   const session_id = parseInt(req.params.session_id);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error getting connection" });
+//       return;
+//     }
+
+//     // First query: Get student profile details
+//     const profileSql = `SELECT 
+//       students.*,
+//       classes.class AS class_name,
+//       sections.section_name,
+//       school_categories.category AS category_name,
+//       sessions.session_name,
+//       campuses.campus_name,
+//       fee_vouchers.id as voucher_id,
+//       fee_vouchers.for_the_month,
+//       fee_vouchers.arrears,
+//       fee_vouchers.first_advance_payment,
+//       fee_vouchers.recieved_payment,
+//       fee_vouchers.status as fee_status,
+//       fee_vouchers.due_date,
+//       fee_vouchers.payment_date,
+//       house.house_or_club_name as house_name,
+//       club.house_or_club_name as club_name,
+//       CASE 
+//         WHEN fee_vouchers.payment_date > fee_vouchers.due_date 
+//         THEN fee_vouchers.total_amount_data + COALESCE(fee_vouchers.fine, 0)
+//         ELSE fee_vouchers.total_amount_data
+//       END AS total_amount
+//     FROM 
+//       students
+//     INNER JOIN 
+//       classes ON students.class_id = classes.id
+//     INNER JOIN 
+//       sections ON students.section_id = sections.id
+//     INNER JOIN 
+//       school_categories ON students.category_id = school_categories.id
+//     INNER JOIN  
+//       sessions ON students.session_id = sessions.id
+//     INNER JOIN 
+//       campuses ON students.campus_id = campuses.id
+//     INNER JOIN 
+//       house_or_club as house ON students.house_id = house.id
+//     INNER JOIN 
+//       house_or_club as club ON students.club_id = club.id
+//     INNER JOIN 
+//       fee_vouchers ON fee_vouchers.student_id = students.id
+//     WHERE 
+//       students.student_unique_id = ? 
+//       AND students.campus_id = ?
+//       AND students.session_id = ?
+//     ORDER BY 
+//       fee_vouchers.for_the_month ASC;
+//     `;
+
+//     // Second query: Get student activities
+//     const activitiesSql = `SELECT 
+//       *
+//     FROM 
+//       student_activities
+//     WHERE 
+//       student_activities.student_id = (
+//         SELECT id FROM students 
+//         WHERE student_unique_id = ? 
+//         AND campus_id = ? 
+//         AND session_id = ?
+//       )
+//     ORDER BY 
+//       student_activities.activity_date DESC;
+//     `;
+
+//     const values = [student_unique_id, campus_id, session_id];
+
+//     // Execute both queries in parallel
+//     Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(profileSql, values, (error, results) => {
+//           if (error) reject(error);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(activitiesSql, values, (error, results) => {
+//           if (error) reject(error);
+//           else resolve(results);
+//         });
+//       })
+//     ])
+//     .then(([profileResults, activityResults]) => {
+//       connection.release();
+//       res.status(200).json({ 
+//         results: profileResults || null,
+//         activities: activityResults 
+//       });
+//     })
+//     .catch((error) => {
+//       connection.release();
+//       console.error("Error executing queries:", error);
+//       res.status(500).json({ error: "Internal server error" });
+//     });
+//   });
+// });
+
+
+
+
+
+app.get("/get-student-profile/:session_id/:campus_id/:student_unique_id", (req, res) => {
+  const student_unique_id = parseInt(req.params.student_unique_id);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error getting connection" });
+      return;
+    }
+
+    // First query: Get student profile details
+    const profileSql = `SELECT 
+      students.*,
+      classes.class AS class_name,
+      sections.section_name,
+      school_categories.category AS category_name,
+      sessions.session_name,
+      campuses.campus_name,
+      fee_vouchers.id as voucher_id,
+      fee_vouchers.for_the_month,
+      fee_vouchers.arrears,
+      fee_vouchers.first_advance_payment,
+      fee_vouchers.recieved_payment,
+      fee_vouchers.status as fee_status,
+      fee_vouchers.due_date,
+      fee_vouchers.payment_date,
+      house.house_or_club_name as house_name,
+      club.house_or_club_name as club_name,
+      CASE 
+        WHEN fee_vouchers.payment_date > fee_vouchers.due_date 
+        THEN fee_vouchers.total_amount_data + COALESCE(fee_vouchers.fine, 0) + COALESCE(fee_vouchers.first_advance_payment, 0) + 
+             CASE 
+               WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears
+               ELSE 0
+             END
+        ELSE fee_vouchers.total_amount_data + COALESCE(fee_vouchers.first_advance_payment, 0) + 
+             CASE 
+               WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears
+               ELSE 0
+             END
+      END AS total_amount
+    FROM 
+      students
+    LEFT JOIN 
+      classes ON students.class_id = classes.id
+    LEFT JOIN 
+      sections ON students.section_id = sections.id
+    LEFT JOIN 
+      school_categories ON students.category_id = school_categories.id
+    LEFT JOIN 
+      sessions ON students.session_id = sessions.id
+    LEFT JOIN 
+      campuses ON students.campus_id = campuses.id
+    LEFT JOIN 
+      house_or_club as house ON students.house_id = house.id
+    LEFT JOIN 
+      house_or_club as club ON students.club_id = club.id
+    LEFT JOIN 
+      fee_vouchers ON fee_vouchers.student_id = students.id
+    WHERE 
+      students.student_unique_id = ? 
+      AND students.campus_id = ?
+      AND students.session_id = ?
+    ORDER BY 
+      fee_vouchers.for_the_month ASC;
+    `;
+
+    // Second query: Get student activities
+    const activitiesSql = `SELECT 
+      *
+    FROM 
+      student_activities
+    WHERE 
+      student_activities.student_id = (
+        SELECT id FROM students 
+        WHERE student_unique_id = ? 
+        AND campus_id = ? 
+        AND session_id = ?
+      )
+    ORDER BY 
+      student_activities.activity_date DESC;
+    `;
+
+    // Third query: Get student discipline records
+    const disciplineSql = `SELECT 
+      *
+    FROM 
+      student_discipline
+    WHERE 
+      student_discipline.student_id = (
+        SELECT id FROM students 
+        WHERE student_unique_id = ? 
+        AND campus_id = ? 
+        AND session_id = ?
+      )
+    ORDER BY 
+      student_discipline.date_of_incident DESC;
+    `;
+
+
+
+    const eventSql = `SELECT 
+  *
+FROM 
+  events
+WHERE 
+  FIND_IN_SET(
+    (SELECT class_id FROM students 
+     WHERE student_unique_id = ? 
+     AND campus_id = ? 
+     AND session_id = ?),
+    REPLACE(REPLACE(events.class_id, '[', ''), ']', '')
+  ) > 0
+AND isPublished = 1
+ORDER BY 
+  events.id DESC;
+    `;
+
+
+    const values = [student_unique_id, campus_id, session_id];
+
+    // Execute all queries in parallel
+    Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(profileSql, values, (error, results) => {
+          if (error) reject(error);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(activitiesSql, values, (error, results) => {
+          if (error) reject(error);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(disciplineSql, values, (error, results) => {
+          if (error) reject(error);
+          else resolve(results);
+        });
+      }),
+       new Promise((resolve, reject) => {
+        connection.query(eventSql, values, (error, results) => {
+          if (error) reject(error);
+          else resolve(results);
+        });
+      })
+    ])
+    .then(([profileResults, activityResults, disciplineResults, eventResults]) => {
+      connection.release(); // Release connection after all queries complete
+      res.status(200).json({
+        results: profileResults || null,
+        activities: activityResults || null,
+        discipline: disciplineResults || null,
+        events: eventResults || null,
+      });
+    })
+    .catch((error) => {
+      if (connection) connection.release(); // Ensure connection is released on error
+      console.error("Error executing queries:", error);
+      res.status(500).json({ error: "Internal server error" });
+    });
+  });
+});
+
+
+
+app.get("/get-teacher-assign-classes/:session_id/:campus_id/:user_id", (req, res) => {
+  const user_id = parseInt(req.params.user_id);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error getting students" });
+      return;
+    }
+
+    const sql = `SELECT assing_subjects_class_teacher.id, assing_subjects_class_teacher.shift, classes.class as class_name, sections.section_name,assing_subjects_class.class_id, assing_subjects_class.section_id, subjects.subjects   FROM assing_subjects_class_teacher 
+    INNER JOIN assing_subjects_class ON assing_subjects_class_teacher.assign_subject_class_id = assing_subjects_class.id
+    INNER JOIN classes ON assing_subjects_class.class_id = classes.id
+    INNER JOIN sections ON assing_subjects_class.section_id = sections.id
+     INNER JOIN subjects ON assing_subjects_class.subject_id = subjects.id
+    WHERE assing_subjects_class_teacher.teacher_id = ? AND assing_subjects_class_teacher.campus_id = ? AND assing_subjects_class_teacher.session_id = ?
+    `;
+
+    const values = [user_id, campus_id, session_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error getting students:", error);
+        res.status(500).json({ error: "Error getting students" });
+      } else {
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.get("/get-student-lms-classes/:student_unique_id", (req, res) => {
+  const student_unique_id = req.params.student_unique_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error acquiring connection:", err);
+      return res.status(500).json({ error: "Error fetching connection" });
+    }
+
+    const sql = "SELECT sessions.id, sessions.session_name, sessions.status FROM students INNER JOIN sessions ON students.session_id = sessions.id WHERE students.student_unique_id = ? ORDER BY sessions.id";
+
+    connection.query(sql, [student_unique_id], (error, results) => {
+      connection.release(); // Ensure connection is released after query
+
+      if (error) {
+        console.error("Query Error:", error);
+        return res.status(500).json({ error: "Error fetching sessions" });
+      }
+
+      if (results.length === 0) {
+        return res.status(404).json({ error: "No student found with the provided ID" });
+      }
+
+      console.log("Fetch Successful");
+      res.status(200).json({ results });
+    });
+  });
+});
+
+
+
+
+
+
+
+
+app.get("/employee-roles", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching employee_roles" });
+      return;
+    }
+
+    const sql = 'SELECT * FROM employee_roles WHERE status = "On"';
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching employee roles" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+app.get("/employee-post", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching employee post" });
+      return;
+    }
+
+    const sql = 'SELECT * FROM employee_posts WHERE status = "On"';
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching employee post" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+// app.post('/promote-students', async (req, res) => {
+
+//   try {
+//     const { promoted_student_id, promoted_class_id, promoted_section_id, promoted_session_id, campus_id, session_id } = req.body;
+
+//     const result = await connection.query(
+//       `SELECT * FROM students WHERE id IN (?) AND status IN ('New Admission', 'Promoted') AND status_on_off = 'On' AND session_id = ? AND campus_id = ?`,
+//       [promoted_student_id, session_id, campus_id]
+//   );
+
+//     let students = Array.isArray(result[0]) ? result[0] : result;
+
+//     // Convert a single object result to an array
+//     if (!Array.isArray(students)) {
+//         students = [students];
+//     }
+
+//     console.log('Students:', students);
+
+//     // Proceed with mapping and insertion logic
+//     const newStudentData = students.map(student => [
+//         student.register_no,
+//         student.old_register_no,
+//         student.shift,
+//         new Date(), // created_at (set to current date)
+//         student.full_name,
+//         student.gender,
+//         promoted_class_id,
+//         promoted_section_id,
+//         student.dob,
+//         student.religion,
+//         student.cast,
+//         student.blood_group,
+//         student.mother_tongue,
+//         student.current_address,
+//         student.permanent_address,
+//         student.mobile_no,
+//         student.student_cnic,
+//         student.category_id,
+//         student.house_id,
+//         student.club_id,
+//         student.guardian_name,
+//         student.relation,
+//         student.occupation,
+//         student.guardian_mobile_no,
+//         student.guardian_address,
+//         student.guardian_cnic,
+//         student.pl_no,
+//         student.designation,
+//         student.department,
+//         student.student_image,
+//         new Date(), // created_at (set to current date)
+//         new Date(), // updated_at (set to current date)
+//         promoted_session_id,
+//         student.campus_id,
+//         student.user_id,
+//         student.status,
+//         student.father_cnic,
+//         student.father_mobile_no,
+//         student.father_name,
+//         student.status_date,
+//         student.slc_invoice_no,
+//         student.status_on_off,
+//         student.bus_fee,
+//         student.bus_status,
+//         student.status_for_pendings
+//     ]);
+
+//     const bulkInsertQuery = `
+//         INSERT INTO students (
+//             register_no, old_register_no, shift, admission_date, full_name, gender, class_id, section_id, dob, religion, cast, blood_group, mother_tongue, current_address, permanent_address, mobile_no, student_cnic, category_id, house_id, club_id, guardian_name, relation, occupation, guardian_mobile_no, guardian_address, guardian_cnic, pl_no, designation, department, student_image, created_at, updated_at, session_id, campus_id, user_id, status, father_cnic, father_mobile_no, father_name, status_date, slc_invoice_no, status_on_off, bus_fee, bus_status, status_for_pendings
+//         ) VALUES ?;
+//     `;
+
+//     await connection.query(bulkInsertQuery, [newStudentData]);
+
+//     res.status(200).json({ message: 'Students promoted successfully' });
+// } catch (error) {
+//     console.error('Error promoting students:', error);
+//     res.status(500).json({ message: 'Server error' });
+// }
+
+// });
+
+
+
+
+// app.post("/promote-students", async (req, res) => {
+//   try {
+//     const {
+//       promoted_student_id,
+//       promoted_class_id,
+//       promoted_section_id,
+//       promoted_session_id,
+//       campus_id,
+//       session_id,
+//       user_id,
+//     } = req.body;
+
+   
+
+
+//     const result = await connection.query(
+//       `SELECT s.*, v.id as fee_voucher_id, v.after_due_date_amount, v.first_advance_payment,  v.arrears_not_cleared, v.arrears, v.fine, v.arrears_fine, v.status as fee_status
+//       FROM students s
+//       LEFT JOIN (
+//           SELECT student_id, MAX(id) AS last_voucher_id
+//           FROM fee_vouchers
+//            where fee_vouchers.status = "unpaid"
+//           GROUP BY student_id
+//       ) lv ON s.id = lv.student_id
+//       LEFT JOIN fee_vouchers v ON lv.last_voucher_id = v.id
+//       WHERE s.id IN (?) 
+//         AND s.status IN ('New Admission', 'Promoted') 
+//         AND s.status_on_off = 'On' 
+//         AND s.session_id = ? 
+//         AND s.campus_id = ?`,
+//       [promoted_student_id, session_id, campus_id]
+//     );
+
+
+//     let students = Array.isArray(result[0]) ? result[0] : result;
+
+//     // console.log(students);
+
+//     // return false;
+
+//     // Convert a single object result to an array
+//     if (!Array.isArray(students)) {
+//       students = [students];
+//     }
+
+//     // console.log("Students:", students);
+
+
+//     // const unpaidFeeVoucherIds = students
+//     // .filter((student) => student.fee_status == "unpaid" )
+//     // .map((student) => student.fee_voucher_id);
+
+//       // Update `is_arrears` for the collected fee_voucher_ids
+//       // if (unpaidFeeVoucherIds.length > 0) {
+//       //   await connection.query(
+//       //     `UPDATE fee_vouchers 
+//       //     SET is_arrear = "arrears" 
+//       //     WHERE id IN (?)`,
+//       //     [unpaidFeeVoucherIds]
+//       //   );
+//       //   // console.log("Updated is_arrears for fee_vouchers:", unpaidFeeVoucherIds);
+//       // }
+      
+
+//       const unpaidFeeVoucherIds = students
+//     .filter((student) => student.fee_status == "unpaid" )
+//     .map((student) => student.fee_voucher_id);
+
+//       // Update `is_arrears` for the collected fee_voucher_ids
+//       if (unpaidFeeVoucherIds.length > 0) {
+//         await connection.query(
+//           `UPDATE fee_vouchers 
+//           SET session_end = "yes" 
+//           WHERE id IN (?)`,
+//           [unpaidFeeVoucherIds]
+//         );
+//         // console.log("Updated is_arrears for fee_vouchers:", unpaidFeeVoucherIds);
+//       }
+
+//     // Proceed with mapping and insertion logic
+//     const newStudentData = students.map((student) => {
+//       // lastRegisterNo += 1;
+//       // const newRegisterNo = `REG-${lastRegisterNo}`;
+
+//       const updatedArrearsNotCleared = JSON.stringify(
+//         student.fee_status === "unpaid"
+//           ? [...(JSON.parse(student.arrears_not_cleared || "[]")), student.fee_voucher_id]
+//           : JSON.parse(student.arrears_not_cleared || "[]")
+//       );
+
+//       return [
+//         student.student_unique_id,
+//         student.register_no, // Incremented register_no
+//         student.old_register_no,
+//         student.shift,
+//         new Date(), // created_at (set to current date)
+//         student.full_name,
+//         student.gender,
+//         promoted_class_id,
+//         promoted_section_id,
+//         student.dob,
+//         student.religion,
+//         student.cast,
+//         student.blood_group,
+//         student.mother_tongue,
+//         student.current_address,
+//         student.permanent_address,
+//         student.mobile_no,
+//         student.student_cnic,
+//         student.category_id,
+//         student.house_id,
+//         student.club_id,
+//         student.guardian_name,
+//         student.relation,
+//         student.occupation,
+//         student.guardian_mobile_no,
+//         student.guardian_address,
+//         student.guardian_cnic,
+//         student.pl_no,
+//         student.designation,
+//         student.department,
+//         student.student_image,
+//         new Date(), // created_at (set to current date)
+//         new Date(), // updated_at (set to current date)
+//         promoted_session_id,
+//         student.campus_id,
+//         student.user_id,
+//         "Promoted",
+//         student.father_cnic,
+//         student.father_mobile_no,
+//         student.father_name,
+//         student.status_date,
+//         student.slc_invoice_no,
+//         student.status_on_off,
+//         student.bus_fee,
+//         student.bus_status,
+//         student.status_for_pendings,
+//         // Append fee_voucher_id to arrears_not_cleared if fee_status is unpaid
+//         updatedArrearsNotCleared,
+//         student.fee_status === "unpaid" ? parseInt(student.arrears) + parseInt(student.after_due_date_amount) + parseInt(student.first_advance_payment) : 0,
+//         student.fee_status === "unpaid" ? student.fine +  student.arrears_fine : 0,
+//         student.fee_status === "unpaid" ? "not generated" : "generated"
+//       ];
+
+//     });
+
+//     const bulkInsertQuery = `
+//           INSERT INTO students (
+//               student_unique_id, register_no, old_register_no, shift, admission_date, full_name, gender, class_id, section_id, dob, religion, cast, blood_group, mother_tongue, current_address, permanent_address, mobile_no, student_cnic, category_id, house_id, club_id, guardian_name, relation, occupation, guardian_mobile_no, guardian_address, guardian_cnic, pl_no, designation, department, student_image, created_at, updated_at, session_id, campus_id, user_id, status, father_cnic, father_mobile_no, father_name, status_date, slc_invoice_no, status_on_off, bus_fee, bus_status, status_for_pendings,
+//               old_arrear_ids, old_arrears_amount, old_arrears_fine, arrears_generated
+//           ) VALUES ?;
+//       `;
+
+//     await connection.query(bulkInsertQuery, [newStudentData]);
+
+//     res.status(200).json({ message: "Students promoted successfully" });
+
+//      logAction('CREATE', 'students', 'Promoted Students' , 0, user_id, campus_id, session_id);
+//   } catch (error) {
+//     console.error("Error promoting students:", error);
+//     res.status(500).json({ message: "Server error" });
+//   }
+// });
+
+
+
+app.post("/promote-students", async (req, res) => {
+  try {
+    const {
+      promoted_student_id,
+      promoted_class_id,
+      promoted_section_id,
+      promoted_session_id,
+      campus_id,
+      session_id,
+      user_id,
+    } = req.body;
+
+    const result = await connection.query(
+      `SELECT s.*, v.id as fee_voucher_id, v.after_due_date_amount, v.first_advance_payment, v.arrears_not_cleared, v.arrears, v.fine, v.arrears_fine, v.status as fee_status
+      FROM students s
+      LEFT JOIN (
+          SELECT student_id, MAX(id) AS last_voucher_id
+          FROM fee_vouchers
+          WHERE fee_vouchers.status = "unpaid"
+          GROUP BY student_id
+      ) lv ON s.id = lv.student_id
+      LEFT JOIN fee_vouchers v ON lv.last_voucher_id = v.id
+      WHERE s.id IN (?) 
+        AND s.status IN ('New Admission', 'Promoted') 
+        AND s.status_on_off = 'On' 
+        AND s.session_id = ? 
+        AND s.campus_id = ?`,
+      [promoted_student_id, session_id, campus_id]
+    );
+
+    let students = Array.isArray(result[0]) ? result[0] : result;
+
+    // Convert a single object result to an array
+    if (!Array.isArray(students)) {
+      students = [students];
+    }
+
+    // Collect all voucher IDs from arrears_not_cleared and the latest fee_voucher_id
+    const allUnpaidFeeVoucherIds = students
+      .flatMap((student) => {
+        // Parse arrears_not_cleared (e.g., '[40773,40774,40775]' or null)
+        const arrearsNotCleared = student.arrears_not_cleared
+          ? JSON.parse(student.arrears_not_cleared)
+          : [];
+        // Include the latest fee_voucher_id from the query if it exists
+        const voucherIds = student.fee_voucher_id
+          ? [...arrearsNotCleared, student.fee_voucher_id]
+          : arrearsNotCleared;
+        return voucherIds.filter(Boolean); // Remove null/undefined
+      })
+      .filter((id, index, self) => self.indexOf(id) === index); // Remove duplicates
+
+    // Update session_end = 'yes' for all collected voucher IDs
+    if (allUnpaidFeeVoucherIds.length > 0) {
+      await connection.query(
+        `UPDATE fee_vouchers 
+         SET session_end = 'yes' 
+         WHERE id IN (?)`,
+        [allUnpaidFeeVoucherIds]
+      );
+      // console.log('Updated session_end for fee_vouchers:', allUnpaidFeeVoucherIds);
+    }
+
+    // Proceed with mapping and insertion logic
+    const newStudentData = students.map((student) => {
+      // Parse arrears_not_cleared
+      const arrearsNotCleared = student.arrears_not_cleared
+        ? JSON.parse(student.arrears_not_cleared)
+        : [];
+
+      // Combine existing arrears_not_cleared with the latest fee_voucher_id
+      const updatedArrearsNotCleared = JSON.stringify(
+        student.fee_voucher_id
+          ? [...arrearsNotCleared, student.fee_voucher_id].filter(
+              (id, index, self) => self.indexOf(id) === index
+            )
+          : arrearsNotCleared
+      );
+
+      return [
+        student.student_unique_id,
+        student.register_no,
+        student.old_register_no,
+        student.shift,
+        new Date(),
+        student.full_name,
+        student.gender,
+        promoted_class_id,
+        promoted_section_id,
+        student.dob,
+        student.religion,
+        student.cast,
+        student.blood_group,
+        student.mother_tongue,
+        student.current_address,
+        student.permanent_address,
+        student.mobile_no,
+        student.student_cnic,
+        student.category_id,
+        student.house_id,
+        student.club_id,
+        student.guardian_name,
+        student.relation,
+        student.occupation,
+        student.guardian_mobile_no,
+        student.guardian_address,
+        student.guardian_cnic,
+        student.pl_no,
+        student.designation,
+        student.department,
+        student.student_image,
+        new Date(),
+        new Date(),
+        promoted_session_id,
+        student.campus_id,
+        student.user_id,
+        'Promoted',
+        student.father_cnic,
+        student.father_mobile_no,
+        student.father_name,
+        student.status_date,
+        student.slc_invoice_no,
+        student.status_on_off,
+        student.bus_fee,
+        student.bus_status,
+        student.status_for_pendings,
+        updatedArrearsNotCleared,
+        student.fee_status === 'unpaid' || arrearsNotCleared.length > 0
+          ? parseInt(student.arrears || 0) +
+            parseInt(student.after_due_date_amount || 0) +
+            parseInt(student.first_advance_payment || 0)
+          : 0,
+        student.fee_status === 'unpaid' || arrearsNotCleared.length > 0
+          ? (student.fine || 0) + (student.arrears_fine || 0)
+          : 0,
+        student.fee_status === 'unpaid' || arrearsNotCleared.length > 0
+          ? 'not generated'
+          : 'generated',
+      ];
+    });
+
+    const bulkInsertQuery = `
+      INSERT INTO students (
+        student_unique_id, register_no, old_register_no, shift, admission_date, full_name, gender, class_id, section_id, dob, religion, cast, blood_group, mother_tongue, current_address, permanent_address, mobile_no, student_cnic, category_id, house_id, club_id, guardian_name, relation, occupation, guardian_mobile_no, guardian_address, guardian_cnic, pl_no, designation, department, student_image, created_at, updated_at, session_id, campus_id, user_id, status, father_cnic, father_mobile_no, father_name, status_date, slc_invoice_no, status_on_off, bus_fee, bus_status, status_for_pendings,
+        old_arrear_ids, old_arrears_amount, old_arrears_fine, arrears_generated
+      ) VALUES ?;
+    `;
+
+    await connection.query(bulkInsertQuery, [newStudentData]);
+
+    res.status(200).json({ message: 'Students promoted successfully' });
+
+    logAction('CREATE', 'students', 'Promoted Students', 0, user_id, campus_id, session_id);
+  } catch (error) {
+    console.error('Error promoting students:', error);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+
+
+app.post('/insert-create-voucher-finance', async (req, res) => {
+  try {
+    const {
+      entries,
+      voucherInvoiceNumber,
+      voucherNumber,
+      oldVoucherType,
+      newVoucherType,
+      campus_id
+    } = req.body;
+
+    // Separate entries for update vs insert
+    const updateEntries = entries.filter(e => e.id);
+    const insertEntries = entries.filter(e => !e.id);
+
+    // Helper: get the prefix based on voucher type
+    const getPrefix = (type) => {
+      switch (type) {
+        case 'Journal Voucher': return 'JV';
+        case 'Bank Payment Voucher': return 'BPV';
+        case 'Bank Receipt Voucher': return 'BRV';
+        default: return '';
+      }
+    };
+
+    // Wrap the MySQL query in a Promise
+    const queryAsync = (sql, values) => {
+      return new Promise((resolve, reject) => {
+        connection.query(sql, values, (err, results) => {
+          if (err) return reject(err);
+          resolve(results);
+        });
+      });
+    };
+
+//    const queryAsync = (sql, params = []) => {
+//    return new Promise((resolve, reject) => {
+//     // Get a connection from the pool
+//     connection.getConnection((err, connection) => {
+//       if (err) {
+//         return reject(err);
+//       }
+
+//       // Execute the query
+//       connection.query(sql, params, (queryErr, results) => {
+//         // Always release the connection back to the pool
+//         connection.release();
+
+//         if (queryErr) {
+//           return reject(queryErr);
+//         }
+//         resolve(results);
+//       });
+//     });
+//   });
+// }
+
+
+    // Get the last invoice number
+    const getLastInvoiceNo = async () => {
+      const results = await queryAsync(
+        `SELECT MAX(voucher_invoice_no) AS last_invoice_no FROM create_voucher_finanace WHERE campus_id = ?`, [campus_id]
+      );
+      const last = parseInt(results[0]?.last_invoice_no || 1000, 10);
+      return last;
+    };
+
+    // Get the last voucher number for a given prefix + campus code
+    const getLastVoucherNumber = async (prefix, campusCode) => {
+      const likePattern = `${prefix}-${campusCode}-%`;
+      const results = await queryAsync(
+        `SELECT MAX(voucher_number) AS last_voucher_number
+         FROM create_voucher_finanace
+         WHERE voucher_number LIKE ? AND campus_id = ?`,
+        [likePattern, campus_id]
+      );
+      const lastVoucher = results[0]?.last_voucher_number || `${prefix}-${campusCode}-1000`;
+      const lastNumber = parseInt(lastVoucher.split('-')[2], 10);
+      return lastNumber;
+    };
+
+    // ------------------------------------------------------------------------
+    // 1) Determine the "final" voucher_number and voucher_invoice_no to use
+    // ------------------------------------------------------------------------
+
+    // We'll assume all entries share the same campus/session for this request.
+    // If you have multiple campuses or sessions in "entries," adjust logic accordingly.
+    let finalVoucherNumber = null;
+    let finalInvoiceNumber = null;
+
+    if (updateEntries.length === 0 && insertEntries.length === 0) {
+      // Nothing to do
+      return res.status(400).json({ error: 'No entries provided for update or insert' });
+    }
+
+    // We'll base prefix & campusCode on the first entry in the entire set
+    // (You could also take it from updateEntries[0] or insertEntries[0], if consistent.)
+    const referenceEntry = entries[0];
+    const prefix = getPrefix(referenceEntry.voucher_type);
+    const campusCode = `C${referenceEntry.campus_id}`;
+
+    // CASE A: The voucher type changed
+    if (oldVoucherType !== newVoucherType) {
+      // 1) Generate a brand new voucher_number
+      const lastNumber = await getLastVoucherNumber(prefix, campusCode);
+      finalVoucherNumber = `${prefix}-${campusCode}-${lastNumber + 1}`;
+
+      // 2) For voucher_invoice_no:
+      //    - If the user provided an invoice no in the request, we can ignore or use it.
+      //      Typically if voucher type changes, you might want a new invoice no too, but
+      //      that depends on your business rules. Here we’ll always generate a new one.
+      const lastInvoice = await getLastInvoiceNo();
+      finalInvoiceNumber = lastInvoice + 1;
+    } 
+    // CASE B: The voucher type did NOT change
+    else {
+      // For finalVoucherNumber:
+      //   - If a voucherNumber is provided in the request, we reuse it.
+      //   - Otherwise, generate it from the DB.
+      if (voucherNumber) {
+        finalVoucherNumber = voucherNumber;
+      } else {
+        const lastNumber = await getLastVoucherNumber(prefix, campusCode);
+        finalVoucherNumber = `${prefix}-${campusCode}-${lastNumber + 1}`;
+      }
+
+      // For finalInvoiceNumber:
+      //   - If a voucherInvoiceNumber is provided, reuse it.
+      //   - Otherwise, generate a new one.
+      if (voucherInvoiceNumber) {
+        finalInvoiceNumber = voucherInvoiceNumber;
+      } else {
+        const lastInvoice = await getLastInvoiceNo();
+        finalInvoiceNumber = lastInvoice + 1;
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // 2) Update existing entries
+    // ------------------------------------------------------------------------
+    if (updateEntries.length > 0) {
+      // Apply the new or existing finalVoucherNumber to ALL update entries
+      updateEntries.forEach(entry => {
+        entry.voucher_number = finalVoucherNumber;
+        // If you also want to unify invoice_no on updates, do that here:
+        // entry.voucher_invoice_no = finalInvoiceNumber;
+      });
+
+      // Prepare the bulk update using CASE
+      const columns = [
+        'voucher_subject', 'cheque_no', 'description', 'voucher_type', 'voucher_number',
+        'main_head_id', 'sub_head_id', 'debit', 'credit', 'voucher_date',
+        'campus_id', 'session_id'
+      ];
+
+      let updateQuery = 'UPDATE create_voucher_finanace SET ';
+      const cases = [];
+      const updateValues = [];
+
+      columns.forEach(column => {
+        let caseStmt = `${column} = CASE id `;
+        updateEntries.forEach(entry => {
+          caseStmt += 'WHEN ? THEN ? ';
+          updateValues.push(entry.id, entry[column]);
+        });
+        caseStmt += `ELSE ${column} END`;
+        cases.push(caseStmt);
+      });
+
+      updateQuery += cases.join(', ');
+      updateQuery += ' WHERE id IN (' + updateEntries.map(() => '?').join(', ') + ')';
+      updateValues.push(...updateEntries.map(entry => entry.id));
+
+      await queryAsync(updateQuery, updateValues);
+    }
+
+    // ------------------------------------------------------------------------
+    // 3) Insert new entries
+    // ------------------------------------------------------------------------
+    if (insertEntries.length > 0) {
+      // Assign finalVoucherNumber and finalInvoiceNumber to each new entry
+      const entriesWithNumbers = insertEntries.map(entry => ({
+        ...entry,
+        voucher_number: finalVoucherNumber,
+        voucher_invoice_no: finalInvoiceNumber
+      }));
+
+      // Prepare the insert
+      const insertQuery = `
+        INSERT INTO create_voucher_finanace (
+          voucher_invoice_no,
+          voucher_number,
+          main_head_id,
+          sub_head_id,
+          debit,
+          credit,
+          voucher_date,
+          cheque_no,
+          voucher_type,
+          description,
+          voucher_subject,
+          campus_id,
+          session_id
+        ) VALUES ${entriesWithNumbers
+          .map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+          .join(', ')}
+      `;
+
+      const insertValues = entriesWithNumbers.flatMap(entry => [
+        entry.voucher_invoice_no,
+        entry.voucher_number,
+        entry.main_head_id,
+        entry.sub_head_id,
+        entry.debit,
+        entry.credit,
+        entry.voucher_date,
+        entry.cheque_no,
+        entry.voucher_type,
+        entry.description,
+        entry.voucher_subject,
+        entry.campus_id,
+        entry.session_id
+      ]);
+
+      await queryAsync(insertQuery, insertValues);
+    }
+
+    // ------------------------------------------------------------------------
+    // Done - send response
+    // ------------------------------------------------------------------------
+    res.status(200).json({ 
+      message: 'Data processed successfully',
+      finalVoucherNumber,
+      finalInvoiceNumber
+    });
+
+  } catch (error) {
+    console.error('Error processing voucher data:', error);
+    res.status(500).json({ error: 'Failed to process data' });
+  }
+});
+
+
+
+
+
+
+
+
+app.delete("/delete-finance-voucher-sub-head/:id", (req, res) => {
+  const id_get = parseInt(req.params.id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    // Start the transaction
+    connection.beginTransaction((transactionError) => {
+      if (transactionError) {
+        console.error("Error starting transaction:", transactionError);
+        res.status(500).json({ error: "Error deleting" });
+        connection.release();
+        return;
+      }
+
+      const deleteServiceBookSql = "DELETE FROM create_voucher_finanace WHERE id = ?";
+
+      connection.query(
+        deleteServiceBookSql,
+        [id_get],
+        (serviceBookError, serviceBookResults) => {
+          if (serviceBookError) {
+            console.error("Error deleting finance voucher sub head:", serviceBookError);
+            return connection.rollback(() => {
+              res
+                .status(500)
+                .json({ error: "Error deleting from finance voucher" });
+              connection.release(); // Release the connection on error
+            });
+          }
+
+          // If the delete from `service_book` succeeds, commit the transaction
+          connection.commit((commitError) => {
+            if (commitError) {
+              console.error("Error committing transaction:", commitError);
+              return connection.rollback(() => {
+                res.status(500).json({ error: "Error deleting" });
+                connection.release();
+              });
+            }
+            // Success response after successful commit
+            console.log("Item deleted successfully from finance voucher");
+            res.status(200).json({ message: "Deleted successfully" });
+            connection.release(); // Release the connection
+          });
+        }
+      );
+    });
+  });
+});
+
+
+
+
+// app.get("/get-finance-voucher-list", async (req, res) => {
+//   // const page = parseInt(req.query.page) || 1;
+//   // const limit = parseInt(req.query.limit) || 5;
+//   // const offset = (page - 1) * limit;
+//   const search_data = req.query.search;
+//   const campus_id = 3;
+
+//   if (!campus_id) {
+//     return res.status(400).json({ error: "Campus ID is required" });
+//   }
+
+//   try {
+
+
+//     let sql = `SELECT * FROM create_voucher_finanace WHERE campus_id = ?`;
+               
+//     let countSql = `SELECT COUNT(*) AS total FROM create_voucher_finanace WHERE campus_id = ?`;
+
+//     const params = [campus_id];
+
+//     // if (search_data) {
+//     //   sql += ` AND sections.section_name LIKE ?`;
+//     //   countSql += ` AND sections.section_name LIKE ?`;
+//     //   params.push(`%${search_data}%`);
+//     // }
+
+//     // sql += ` LIMIT ? OFFSET ?`;
+//     // params.push(limit, offset);
+
+//     const [dataResults, countResult] = await Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(sql, params, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(countSql, params, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//     ]);
+    
+
+//     // const total = countResult[0].total;
+//     // const totalPages = Math.ceil(total / limit);
+
+//     res.json({
+//       // total,
+//       // currentPage: page,
+//       // totalPages,
+//       results: dataResults,
+//     });
+//   } catch (error) {
+//     console.error("Error fetching sections:", error);
+//     res.status(500).json({ error: "Internal server error" });
+//   }
+// });
+
+
+
+
+
+app.get("/get-finance-fee-voucher", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+ 
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query
+    let sql1 = `
+      SELECT 
+        cvf.voucher_invoice_no,
+        cvf.voucher_number,
+        cvf.description,
+        cvf.voucher_type,
+        cvf.voucher_date,
+        cvf.campus_id,
+        cvf.session_id
+      FROM 
+        create_voucher_finanace cvf
+      WHERE 
+        cvf.campus_id = ?
+        AND cvf.session_id = ?`;
+
+    const params = [campus_id, session_id];
+
+    // Check if both from_date and to_date are provided
+    // if (from_date && to_date) {
+    //   sql1 += ` AND fv.created_at BETWEEN ? AND ?`;
+    //   params.push(from_date, to_date);
+    // }
+    // // If only from_date is provided, use it as the filter
+    // else if (from_date) {
+    //   sql1 += ` AND fv.created_at = ?`;
+    //   params.push(from_date);
+    // }
+
+    // Continue with the grouping and ordering
+    sql1 += `
+      GROUP BY 
+         cvf.voucher_invoice_no
+      ORDER BY 
+         cvf.voucher_invoice_no ASC`;
+
+    const mainQueryPromise = new Promise((resolve, reject) => {
+      connection.query(sql1, params, (error, results) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve(results);
+        }
+      });
+    });
+
+    mainQueryPromise
+      .then((mainResults) => {
+        const totalRecords = mainResults.length; // Get the total number of records
+        const totalPages = 1; // Since no pagination is used, set totalPages to 1
+
+        res.json({
+          feeVouchers: mainResults,
+          totalPages: totalPages,
+          currentPage: 1, // Since pagination is removed, set currentPage to 1
+          totalRecords: totalRecords,
+        });
+      })
+      .catch((error) => {
+        console.error("Error executing SQL queries: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      })
+      .finally(() => {
+        connection.release();
+      });
+  });
+});
+
+
+
+
+
+
+
+app.get("/view-student/:student_id", (req, res) => {
+  const admission_id = parseInt(req.params.admission_id);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error getting employee" });
+      return;
+    }
+
+    const sql = "SELECT * FROM employees WHERE id = ?";
+    const values = [employee_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error getting employee:", error);
+        res.status(500).json({ error: "Error getting employee" });
+      } else {
+        console.log("Item deleted successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+app.get("/get-total-students-class-wise/:campus_id/:session_id", (req, res) => {
+
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error getting employee" });
+      return;
+    }
+
+    const sql = `
+    SELECT 
+        s.class_id, 
+        c.class AS class_name,
+        par.parent_class,
+        COUNT(*) AS student_count
+    FROM 
+        students s
+    JOIN 
+        classes c ON s.class_id = c.id
+    JOIN 
+        parent_classes par ON c.parent_class_id = par.id
+    WHERE 
+        s.campus_id = ? 
+        AND s.session_id = ?
+        AND s.status IN ("New Admission", "Promoted")
+        AND s.status_on_off = 'On'
+    GROUP BY 
+        par.id
+    ORDER BY 
+        par.id DESC`;
+
+const values = [campus_id, session_id];
+
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error getting employee:", error);
+        res.status(500).json({ error: "Error getting employee" });
+      } else {
+        console.log("Item deleted successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+
+
+
+app.get("/get-student-attendance-wise-data/:campus_id/:session_id", (req, res) => {
+
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error getting employee" });
+      return;
+    }
+
+    const sql = `
+    SELECT 
+    status,
+    date,
+    COUNT(*) AS count 
+    FROM 
+    school_student_attendance
+    WHERE 
+        campus_id = ? 
+        AND session_id = ?
+    GROUP BY 
+         status,
+         date`;
+
+    const values = [campus_id, session_id];
+
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error getting employee:", error);
+        res.status(500).json({ error: "Error getting employee" });
+      } else {
+        console.log("Item deleted successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+app.post("/insert-admission", upload.single("student_image"), (req, res) => {
+  const {
+    hidden_id,
+    old_register_no,
+    shift,
+    admission_date,
+    full_name,
+    gender,
+    class_id,
+    section_id,
+    dob,
+    religion,
+    cast,
+    blood_group,
+    mother_tongue,
+    current_address,
+    permanent_address,
+    mobile_no,
+    student_cnic,
+    category_id,
+    house_id,
+    club_id,
+    guardian_name,
+    relation,
+    occupation,
+    guardian_mobile_no,
+    guardian_address,
+    guardian_cnic,
+    pl_no,
+    designation,
+    department,
+    session_id,
+    campus_id,
+    campus_code,
+    user_id,
+    status,
+    father_name,
+    father_cnic,
+    father_mobile_no,
+    bus_status,
+    bus_fee,
+    class_name,
+    section_name,
+  } = req.body;
+
+const processedHouseId = house_id === '' ? 0 : house_id;
+const processedClubId = club_id === '' ? 0 : club_id;
+
+  let student_image = req.file ? req.file.filename : "";
+
+  if (hidden_id !== "") {
+    connection.query(
+      "SELECT status FROM students WHERE id = ?",
+      [hidden_id],
+      (err, result) => {
+        if (err) {
+          console.error("Error fetching current status:", err);
+          return res
+            .status(500)
+            .json({ error: "Error fetching current status" });
+        }
+
+        const currentStatus = result[0].status;
+        // if (currentStatus === "Struck Off") {
+        //   return res.status(200).json({
+        //     error: `Cannot update. The student is already ${currentStatus}.`,
+        //   });
+        // }
+
+        let updateQuery = `
+        UPDATE students
+        SET
+          old_register_no = ?, shift = ?, admission_date = ?, full_name = ?, gender = ?,
+          class_id = ?, section_id = ?, dob = ?, religion = ?, cast = ?, blood_group = ?, mother_tongue = ?,
+          current_address = ?, permanent_address = ?, mobile_no = ?, student_cnic = ?, category_id = ?,
+          house_id = ?, club_id = ?, guardian_name = ?, relation = ?, occupation = ?, guardian_mobile_no = ?,
+          guardian_address = ?, guardian_cnic = ?, pl_no = ?, designation = ?, department = ?, session_id = ?, campus_id = ?, user_id = ?, status = ?, father_name = ?, father_cnic = ?, father_mobile_no = ?, bus_status = ?, bus_fee = ?`;
+
+        const updateValues = [
+          old_register_no,
+          shift,
+          admission_date,
+          full_name,
+          gender,
+          class_id,
+          section_id,
+          dob,
+          religion,
+          cast,
+          blood_group,
+          mother_tongue,
+          current_address,
+          permanent_address,
+          mobile_no,
+          student_cnic,
+          category_id,
+          processedHouseId,
+          processedClubId,
+          guardian_name,
+          relation,
+          occupation,
+          guardian_mobile_no,
+          guardian_address,
+          guardian_cnic,
+          pl_no,
+          designation,
+          department,
+          session_id,
+          campus_id,
+          user_id,
+          status,
+          father_name,
+          father_cnic,
+          father_mobile_no,
+          bus_status,
+          bus_fee == "" ? 0 : bus_fee
+        ];
+
+        if (student_image) {
+          updateQuery += `, student_image = ?`;
+          updateValues.push(student_image);
+        }
+
+        if (status === "SLC") {
+          updateQuery += `, status_date = CURDATE()`; 
+          connection.query(
+            "SELECT MAX(slc_invoice_no) AS max_slc_invoice_no FROM students WHERE campus_id = ? AND session_id = ?",
+            [campus_id, session_id],
+            (err, result) => {
+              if (err) {
+                console.error("Error fetching SLC invoice number:", err);
+                return res
+                  .status(500)
+                  .json({ error: "Error fetching SLC invoice number" });
+              }
+
+              let newSlcInvoiceNo = 1000;
+              if (
+                result[0].max_slc_invoice_no !== null &&
+                result[0].max_slc_invoice_no !== ""
+              ) {
+                newSlcInvoiceNo = parseInt(result[0].max_slc_invoice_no) + 1;
+              }
+
+              updateQuery += `, slc_invoice_no = ? WHERE id = ?`;
+              updateValues.push(newSlcInvoiceNo, hidden_id);
+
+              connection.query(updateQuery, updateValues, (err, result) => {
+                if (err) {
+                  console.error("Error updating data:", err);
+                  return res.status(500).json({ error: "Error updating data" });
+                }
+                return res.json({ message: "Data updated successfully!" });
+              });
+            }
+          );
+        } else if (status === "Struck Off") {
+          updateQuery += `, status_date = NOW() WHERE id = ?`;
+          updateValues.push(hidden_id);
+
+          connection.query(updateQuery, updateValues, (err, result) => {
+            if (err) {
+              console.error("Error updating data:", err);
+              return res.status(500).json({ error: "Error updating data" });
+            }
+            return res.json({ message: "Data updated successfully!" });
+          });
+        } else {
+          if (status === "New Admission" || status === "Promoted") {
+            updateQuery += `, status_date = NULL`;
+            updateQuery += `, slc_invoice_no = NULL`;
+          }
+          updateQuery += ` WHERE id = ?`;
+          updateValues.push(hidden_id);
+
+          connection.query(updateQuery, updateValues, (err, result) => {
+            if (err) {
+              console.error("Error updating data:", err);
+              return res.status(500).json({ error: "Error updating data" });
+            }
+            return res.json({ message: "Data updated successfully!" });
+          });
+        }
+      }
+    );
+
+    let descriptions = {
+        full_name:full_name,
+        class:class_name,
+        section:section_name,
+        father:father_name
+    }
+
+      logAction('UPDATE', 'students',  "Update Student Record", hidden_id, user_id, campus_id, session_id);
+  } else {
+    connection.query(
+      "SELECT MAX(register_no) AS max_register_no FROM students WHERE campus_id = ? AND session_id = ?",
+      [campus_id, session_id],
+      (err, result) => {
+        if (err) {
+          console.error("Error fetching last register number:", err);
+          return res
+            .status(500)
+            .json({ error: "Error fetching last register number" });
+        }
+
+        let newRegisterNo = 1; // Default starting register number
+
+        // console.log(result[0].max_register_no);
+
+        
+        if (
+          result[0].max_register_no !== null &&
+          result[0].max_register_no !== ""
+        ) {
+          const lastRegisterNo = result[0].max_register_no.split("-")[1];
+          newRegisterNo = parseInt(lastRegisterNo) + 1;
+       
+        }
+
+        // console.log(newRegisterNo);
+        // return false;
+        const formattedRegisterNo = `SSS${campus_code}-${newRegisterNo
+          .toString()
+          .padStart(4, "0")}`;
+
+        const insertQuery = `
+        INSERT INTO students (
+          register_no, old_register_no, shift, admission_date, full_name, gender,
+          class_id, section_id, dob, religion, cast, blood_group, mother_tongue,
+          current_address, permanent_address, mobile_no, student_cnic, category_id,
+          house_id, club_id, guardian_name, relation, occupation, guardian_mobile_no,
+          guardian_address, guardian_cnic, pl_no, designation, department, session_id, campus_id, user_id, status, father_name, father_cnic, father_mobile_no, bus_status, bus_fee, student_image
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `;
+
+        const insertValues = [
+          formattedRegisterNo,
+          old_register_no,
+          shift,
+          admission_date,
+          full_name,
+          gender,
+          class_id,
+          section_id,
+          dob,
+          religion,
+          cast,
+          blood_group,
+          mother_tongue,
+          current_address,
+          permanent_address,
+          mobile_no,
+          student_cnic,
+          category_id,
+          processedHouseId,
+          processedClubId,
+          guardian_name,
+          relation,
+          occupation,
+          guardian_mobile_no,
+          guardian_address,
+          guardian_cnic,
+          pl_no,
+          designation,
+          department,
+          session_id,
+          campus_id,
+          user_id,
+          status,
+          father_name,
+          father_cnic,
+          father_mobile_no,
+          bus_status,
+          bus_fee == "" ? 0 : bus_fee,
+          student_image,
+        ];
+
+        connection.query(insertQuery, insertValues, (err, result) => {
+          if (err) {
+            console.error("Error inserting data:", err);
+            res.status(500).json({ error: "Error inserting data" });
+          } else {
+
+            const insertedId = result.insertId;
+
+            // Update the student_unique_id with the insertedId
+            connection.query(
+              "UPDATE students SET student_unique_id = ? WHERE id = ?",
+              [insertedId, insertedId],
+              (updateErr, updateResult) => {
+                if (updateErr) {
+                  console.error("Error updating student_unique_id:", updateErr);
+                  res.status(500).json({ error: "Error updating student_unique_id" });
+                } else {
+                  res.json({ message: "Data saved successfully!" });
+                }
+              }
+            );
+
+            let descriptions = {
+              full_name:full_name,
+              class:class_name,
+              section:section_name,
+              father:father_name
+          }
+
+
+             logAction('CREATE',  'students',  'Inserted New Student', result.insertId, user_id, campus_id, session_id);
+           
+          }
+        });
+      }
+    );
+  }
+});
+
+
+
+
+app.post("/insert-bank-details", (req, res) => {
+  const { bank_id, account_title, account_no, campus_id, hidden_id } = req.body;
+
+  if (hidden_id) {
+    // Update existing admission
+    let updateQuery = `
+      UPDATE bank_details
+      SET
+        bank_id = ?, account_title = ?, account_no = ?
+       `;
+
+    const updateValues = [bank_id, account_title, account_no];
+
+    updateQuery += ` WHERE id = ?`;
+    updateValues.push(hidden_id);
+
+    connection.query(updateQuery, updateValues, (err, result) => {
+      if (err) {
+        console.error("Error updating data:", err);
+        res.status(500).json({ error: "Error updating data" });
+      } else {
+        res.json({ message: "Data updated successfully!" });
+      }
+    });
+  } else {
+    console.log(req.body);
+    // Insert new admission
+    const insertQuery = `
+      INSERT INTO bank_details (
+        bank_id, account_title, account_no, campus_id 
+      ) VALUES (?, ?, ?, ?)
+    `;
+
+    const insertValues = [bank_id, account_title, account_no, campus_id];
+
+    connection.query(insertQuery, insertValues, (err, result) => {
+      if (err) {
+        console.error("Error inserting data:", err);
+        res.status(500).json({ error: "Error inserting data" });
+      } else {
+        res.json({ message: "Data saved successfully!" });
+      }
+    });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+app.get('/api/events/:campus_id/:session_id', (req, res) => {
+  const { campus_id, session_id } = req.params;
+  
+  // Using parameterized query to prevent SQL injection
+  connection.query(
+    'SELECT * FROM events WHERE campus_id = ? AND session_id = ?', 
+    [campus_id, session_id], 
+    (err, results) => {
+      if (err) return res.status(500).send(err);
+      // if (results.length === 0) {
+      //   return res.status(404).send('No events found for the specified campus and session');
+      // }
+      res.json(results);
+    }
+  );
+});
+
+// Create new event
+app.post('/api/events', (req, res) => {
+  const { title, description, start, end, allDay, isPublished, campus_id, class_id, session_id } = req.body;
+  
+  // Convert class_id array to JSON string
+  const class_id_json = JSON.stringify(class_id);
+
+  // console.log(class_id_json);
+  
+  connection.query(
+    'INSERT INTO events (title, description, start, end, allDay, isPublished, campus_id, class_id, session_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    [title, description, start, end, allDay, isPublished, campus_id, class_id_json, session_id],
+    (err, result) => {
+      if (err) return res.status(500).send(err);
+      res.status(201).json({ id: result.insertId, ...req.body });
+    }
+  );
+});
+
+// Update event
+app.put('/api/events/:id', (req, res) => {
+  const { title, description, start, end, allDay, isPublished, class_id } = req.body;
+
+   const class_id_json = JSON.stringify(class_id);
+
+  connection.query(
+    'UPDATE events SET title = ?, description = ?, start = ?, end = ?, allDay = ?, isPublished = ?,  class_id = ? WHERE id = ?',
+    [title, description, start, end, allDay, isPublished, class_id_json,  req.params.id],
+    (err) => {
+      if (err) return res.status(500).send(err);
+      res.status(200).json({ message: 'Event updated successfully' });
+    }
+  );
+});
+
+// Delete event
+app.delete('/api/events/:id', (req, res) => {
+  connection.query('DELETE FROM events WHERE id = ?', [req.params.id], (err) => {
+    if (err) return res.status(500).send(err);
+    res.status(200).json({ message: 'Event deleted successfully' });
+  });
+});
+
+
+app.get('/student-activities-delete/:id/:campus_id/:session_id', (req, res) => {
+  connection.query('DELETE FROM student_activities WHERE id = ? AND campus_id = ? AND session_id = ?', [req.params.id, req.params.campus_id, req.params.session_id], (err) => {
+    if (err) return res.status(500).send(err);
+    res.status(200).json({ message: 'Event deleted successfully' });
+  });
+});
+
+
+
+app.get('/student-discipline-delete/:id/:campus_id/:session_id', (req, res) => {
+  connection.query('DELETE FROM student_discipline WHERE id = ? AND campus_id = ? AND session_id = ?', [req.params.id, req.params.campus_id, req.params.session_id], (err) => {
+    if (err) return res.status(500).send(err);
+    res.status(200).json({ message: 'Discipline deleted successfully' });
+  });
+});
+
+
+app.get('/employee-discipline-delete/:id/:campus_id', (req, res) => {
+  connection.query('DELETE FROM employee_discipline WHERE id = ? AND campus_id = ?', [req.params.id, req.params.campus_id], (err) => {
+    if (err) return res.status(500).send(err);
+    res.status(200).json({ message: 'Discipline deleted successfully' });
+  });
+});
+
+// app.post("/insert-charts-of-account-head", (req, res) => {
+//   const { main_head_id, level, name } = req.body;
+
+//   const insertQuery = `
+//     INSERT INTO sub_head_coa (
+//       main_head_id, level, name 
+//     ) VALUES (?, ?, ?)
+//   `;
+
+//   const insertValues = [main_head_id, level, name];
+
+//   connection.query(insertQuery, insertValues, (err, result) => {
+//     if (err) {
+//       console.error("Error inserting data:", err);
+//       res.status(500).json({ error: "Error inserting data" });
+//     } else {
+//       res.json({ message: "Data saved successfully!" });
+//     }
+//   });
+// });
+
+
+
+
+
+
+
+
+app.post("/insert-overtime", (req, res) => {
+  const {
+    overtime_date,
+    employee_id,
+    overtime_hours,
+    campus_id,
+    session_id,
+    hidden_id,
+  } = req.body;
+
+  if (hidden_id) {
+    // Update existing admission
+    let updateQuery = `
+      UPDATE overtime
+      SET
+        overtime_date = ?, employee_id = ?, overtime_hours = ?, campus_id = ?, session_id = ?
+       `;
+
+    const updateValues = [
+      overtime_date,
+      employee_id,
+      overtime_hours,
+      campus_id,
+      session_id,
+    ];
+
+    updateQuery += ` WHERE id = ?`;
+    updateValues.push(hidden_id);
+
+    connection.query(updateQuery, updateValues, (err, result) => {
+      if (err) {
+        console.error("Error updating data:", err);
+        res.status(500).json({ error: "Error updating data" });
+      } else {
+        res.json({ message: "Data updated successfully!" });
+      }
+    });
+  } else {
+    console.log(req.body);
+    // Insert new admission
+    const insertQuery = `
+      INSERT INTO overtime (
+        overtime_date, employee_id, overtime_hours, campus_id, session_id 
+      ) VALUES (?, ?, ?, ?, ?)
+    `;
+
+    const insertValues = [
+      overtime_date,
+      employee_id,
+      overtime_hours,
+      campus_id,
+      session_id,
+    ];
+
+    connection.query(insertQuery, insertValues, (err, result) => {
+      if (err) {
+        console.error("Error inserting data:", err);
+        res.status(500).json({ error: "Error inserting data" });
+      } else {
+        res.json({ message: "Data saved successfully!" });
+      }
+    });
+  }
+});
+
+
+
+
+
+app.post("/insert-pay_scale_wise_basic_salary", (req, res) => {
+  const {
+    pay_scale_id,
+    basic_salary,
+    house_rent,
+    annual_increment,
+    user_id,
+    hidden_id,
+  } = req.body;
+
+  if (hidden_id) {
+    // Update existing admission
+    let updateQuery = `
+      UPDATE pay_scale_wise_basic_salary
+      SET
+        pay_scale_id = ?, basic_salary = ?,  house_rent = ?, annual_increment = ?,  user_id = ?
+       `;
+
+    const updateValues = [
+      pay_scale_id,
+      basic_salary,
+      house_rent,
+      annual_increment,
+      user_id,
+    ];
+
+    updateQuery += ` WHERE id = ?`;
+    updateValues.push(hidden_id);
+
+    connection.query(updateQuery, updateValues, (err, result) => {
+      if (err) {
+        console.error("Error updating data:", err);
+        res.status(500).json({ error: "Error updating data" });
+      } else {
+        res.json({ message: "Data updated successfully!" });
+      }
+    });
+  } else {
+    console.log(req.body);
+    // Insert new admission
+    const insertQuery = `
+      INSERT INTO pay_scale_wise_basic_salary (
+        pay_scale_id, basic_salary, house_rent, annual_increment, user_id
+      ) VALUES (?, ?, ?, ?, ?)
+    `;
+
+    const insertValues = [
+      pay_scale_id,
+      basic_salary,
+      house_rent,
+      annual_increment,
+      user_id,
+    ];
+
+    connection.query(insertQuery, insertValues, (err, result) => {
+      if (err) {
+        console.error("Error inserting data:", err);
+        res.status(500).json({ error: "Error inserting data" });
+      } else {
+        res.json({ message: "Data saved successfully!" });
+      }
+    });
+  }
+});
+
+//dont remove this code (this code is 100 percent correct)
+// app.post('/employee-salary-records', (req, res) => {
+//   const employees = req.body.employees;
+//   const currentMonth = req.body.employees[0].for_the_month; // YYYY-MM format (e.g., '2024-09')
+
+//   if (!employees || employees.length === 0) {
+//     return res.status(400).json({ error: 'No employee data provided' });
+//   }
+
+//   connection.getConnection((err, conn) => {
+//     if (err) {
+//       console.error('Error getting database connection:', err);
+//       return res.status(500).json({ error: 'Database connection error' });
+//     }
+
+//     // Start a transaction
+//     conn.beginTransaction(err => {
+//       if (err) {
+//         console.error('Error starting transaction:', err);
+//         return res.status(500).json({ error: 'Database transaction error' });
+//       }
+
+//       // Separate employees into those needing insert vs. update
+//       const employeesToInsert = employees.filter(employee => !employee.salary_update_id);
+//       const employeesToUpdate = employees.filter(employee => employee.salary_update_id);
+
+//       if (employeesToInsert.length === 0 && employeesToUpdate.length === 0) {
+//         return res.status(400).json({ error: 'No records to insert or update' });
+//       }
+
+//       // Insert new records if any
+//       if (employeesToInsert.length > 0) {
+//         const invoiceQuery = `SELECT MAX(invoice_no) AS max_invoice_no FROM employee_salary_records`;
+
+//         conn.query(invoiceQuery, (err, result) => {
+//           if (err) {
+//             return conn.rollback(() => {
+//               console.error('Error fetching max invoice_no:', err);
+//               return res.status(500).json({ error: 'Database error during fetching max invoice_no' });
+//             });
+//           }
+
+//           let nextInvoiceNo = (result[0].max_invoice_no ? result[0].max_invoice_no : 999) + 1;
+//           let invoiceNoCounter = Number(nextInvoiceNo);
+
+//           const insertValues = employeesToInsert.map(employee => {
+//             const currentInvoiceNo = invoiceNoCounter;
+//             invoiceNoCounter += 1;
+
+//             return [
+//               employee.employee_id, employee.service_book_id, employee.employee_post_id, employee.employee_role_id,
+//               employee.pay_scale_id, employee.previous_adhoc, employee.current_adhoc, employee.previous_increments,
+//               employee.current_increment, employee.house_rent, employee.net_salary, employee.security_deduction,
+//               employee.security_deduction + employee.total_security_deduct_from_salary, employee.dow, employee.graduity,
+//               employee.others_allownce, employee.remaining, employee.remarks, currentInvoiceNo, currentMonth
+//             ];
+//           });
+
+//           const insertQuery = `
+//             INSERT INTO employee_salary_records (
+//               employee_id, service_book_id, employee_post_id, employee_role_id, pay_scale_id, previous_adhoc,
+//               current_adhoc, previous_increments, current_increment, house_rent, net_salary, security_deduct,
+//               total_security_deduct, dow, graduity, others_allownce, remaining, remarks, invoice_no, for_the_month
+//             ) VALUES ?`;
+
+//           conn.query(insertQuery, [insertValues], (err, result) => {
+//             if (err) {
+//               return conn.rollback(() => {
+//                 console.error('Error inserting data:', err);
+//                 return res.status(500).json({ error: 'Database error during insertion' });
+//               });
+//             }
+
+//             handleUpdate(conn, employeesToUpdate, employeesToInsert, res);
+//           });
+//         });
+//       } else {
+//         handleUpdate(conn, employeesToUpdate, [], res);
+//       }
+//     });
+//   });
+// });
+
+// function handleUpdate(conn, employeesToUpdate, newEmployees, res) {
+//   if (employeesToUpdate.length > 0) {
+//     const updateQuery = `
+//       UPDATE employee_salary_records
+//       SET
+//         service_book_id = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.service_book_id)}`).join(' ')}
+//         END,
+//         employee_post_id = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.employee_post_id)}`).join(' ')}
+//         END,
+//         employee_role_id = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.employee_role_id)}`).join(' ')}
+//         END,
+//         pay_scale_id = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.pay_scale_id)}`).join(' ')}
+//         END,
+//         previous_adhoc = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.previous_adhoc)}`).join(' ')}
+//         END,
+//         current_adhoc = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.current_adhoc)}`).join(' ')}
+//         END,
+//         previous_increments = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.previous_increments)}`).join(' ')}
+//         END,
+//         current_increment = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.current_increment)}`).join(' ')}
+//         END,
+//         house_rent = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.house_rent)}`).join(' ')}
+//         END,
+//         net_salary = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.net_salary)}`).join(' ')}
+//         END,
+//         security_deduct = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.security_deduction)}`).join(' ')}
+//         END,
+//         total_security_deduct = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.security_deduction + employee.total_security_deduct_from_salary)}`).join(' ')}
+//         END,
+//         dow = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.dow)}`).join(' ')}
+//         END,
+//         graduity = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.graduity)}`).join(' ')}
+//         END,
+//         others_allownce = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.others_allownce)}`).join(' ')}
+//         END,
+//         remaining = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.remaining)}`).join(' ')}
+//         END,
+//         remarks = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.remarks)}`).join(' ')}
+//         END,
+//         for_the_month = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.for_the_month)}`).join(' ')}
+//         END
+//       WHERE id IN (${employeesToUpdate.map(employee => conn.escape(employee.salary_update_id)).join(', ')});
+//     `;
+
+//     conn.query(updateQuery, (err, result) => {
+//       if (err) {
+//         return conn.rollback(() => {
+//           console.error('Error updating records:', err);
+//           return res.status(500).json({ error: 'Database error during update' });
+//         });
+//       }
+
+//       handleSecurityDeduction(conn, newEmployees, res);
+//     });
+//   } else {
+//     handleSecurityDeduction(conn, newEmployees, res);
+//   }
+// }
+
+// // Function to handle bulk update for security deduction
+// function handleSecurityDeduction(conn, newEmployees, res) {
+//   // Step 3: Handle security deduction updates
+//   const employeesWithDeduction = newEmployees.filter(employee => employee.security_deduction > 0);
+
+//   if (employeesWithDeduction.length > 0) {
+//     const updateQuery = `
+//       UPDATE school_employees se
+//       JOIN (
+//         ${employeesWithDeduction.map(employee => `
+//           SELECT ${conn.escape(employee.employee_id)} AS employee_id,
+//                  ${conn.escape(employee.security_deduction + employee.total_security_deduct_from_salary)} AS total_security_deduct_from_salary
+//         `).join(' UNION ALL ')}
+//       ) AS updates
+//       ON se.id = updates.employee_id
+//       SET se.total_security_deduct_from_salary = updates.total_security_deduct_from_salary`;
+
+//     // Execute the bulk update query
+//     conn.query(updateQuery, (err, result) => {
+//       if (err) {
+//         return conn.rollback(() => {
+//           console.error('Error updating security deductions:', err);
+//           return res.status(500).json({ error: 'Database error during security deduction update' });
+//         });
+//       }
+
+//       // Commit the transaction
+//       conn.commit(err => {
+//         if (err) {
+//           return conn.rollback(() => {
+//             console.error('Error committing transaction:', err);
+//             return res.status(500).json({ error: 'Transaction commit error' });
+//           });
+//         }
+//         res.json({ message: 'Records inserted and updated successfully', affectedRows: result.affectedRows });
+//       });
+//     });
+//   } else {
+//     // If no security deductions need to be updated, commit the transaction
+//     conn.commit(err => {
+//       if (err) {
+//         return conn.rollback(() => {
+//           console.error('Error committing transaction:', err);
+//           return res.status(500).json({ error: 'Transaction commit error' });
+//         });
+//       }
+//       res.json({ message: 'Records inserted successfully. No updates required for security deductions.' });
+//     });
+//   }
+// }
+
+// app.post('/insert-employee-increment-record', (req, res) => {
+//   const employees = req.body.employees;
+//   const currentMonth = employees[0].increment_date; // YYYY-MM format (e.g., '2024-09')
+
+//   if (!employees || employees.length === 0) {
+//     return res.status(400).json({ error: 'No employee data provided' });
+//   }
+
+//   connection.getConnection((err, conn) => {
+//     if (err) {
+//       console.error('Error getting database connection:', err);
+//       return res.status(500).json({ error: 'Database connection error' });
+//     }
+
+//     // Separate employees into those needing insert vs. update
+//     const employeesToInsert = employees.filter(employee => !employee.salary_update_id);
+//     const employeesToUpdate = employees.filter(employee => employee.salary_update_id);
+
+//     if (employeesToInsert.length === 0 && employeesToUpdate.length === 0) {
+//       return res.status(400).json({ error: 'No records to insert or update' });
+//     }
+
+//     // Insert new records if any
+//     if (employeesToInsert.length > 0) {
+//       const existingEmployeesQuery = `
+//         SELECT employee_id
+//         FROM service_book
+//         WHERE increment_date = ${conn.escape(currentMonth)}
+//           AND employee_id IN (${employeesToInsert.map(employee => conn.escape(employee.employee_id)).join(', ')})
+//       `;
+
+//       conn.query(existingEmployeesQuery, (err, existingEmployees) => {
+//         if (err) {
+//           console.error('Error checking existing employees:', err);
+//           return res.status(500).json({ error: 'Database error during employee existence check' });
+//         }
+
+//         const existingEmployeeIds = existingEmployees.map(e => e.employee_id);
+//         const filteredEmployeesToInsert = employeesToInsert.filter(employee => !existingEmployeeIds.includes(employee.employee_id));
+
+//         if (filteredEmployeesToInsert.length === 0) {
+//           // If no new records to insert, handle updates
+//           return handleUpdateServiceBook(conn, employeesToUpdate, res);
+//         }
+
+//         const insertValues = filteredEmployeesToInsert.map(employee => {
+//           const incrementType = employee.increment_type;
+
+//           const adhocIncrementStatus = incrementType === "adhoc" ? "adhoc_increment" : "-";
+//           const annualIncrementStatus = incrementType === "annual_increment" ? "annual_increment" : "-";
+
+//           return [
+//             employee.employee_id, employee.employee_post_id, employee.employee_role_id,
+//             employee.pay_scale_id, employee.basic_salary, employee.house_rent, employee.additional_increment,
+//             employee.pessi, employee.eobi,
+//             incrementType === "adhoc" ? employee.previous_total_adhoc_new : employee.old_adhoc,
+//             incrementType === "adhoc" ? employee.new_increment : employee.current_adhoc,
+//             incrementType === "adhoc" ? employee.previous_total_adhoc_new + employee.new_increment : employee.total_adhoc,
+//             employee.increment_date,
+//             incrementType === "annual_increment" ? employee.previous_total_increments_new : employee.previous_total_increments,
+//             incrementType === "annual_increment" ? employee.new_increment : employee.current_increment,
+//             incrementType === "annual_increment" ? employee.previous_total_increments_new + employee.new_increment : employee.total_increment,
+//             employee.new_net_salary,
+//             employee.campus_id,
+//             employee.user_id,
+//             employee.job_type,
+//             employee.remarks,
+//             employee.second_shift_honorarium,
+//             adhocIncrementStatus,
+//             annualIncrementStatus,
+//             other_increment_amount,
+//             'increment_form'
+//           ];
+//         });
+
+//         const insertQuery = `
+//           INSERT INTO service_book (
+//             employee_id, employee_post_id, employee_role_id, pay_scale_id, basic_salary,
+//             house_rent, additional_increment, pessi, eobi, old_adhoc, current_adhoc, total_adhoc, increment_date,
+//             previous_total_increments, current_increment, total_increment, total_net_salary,
+//             campus_id, user_id, job_type, remarks, second_shift_honorarium,
+//             adhoc_increment_status, annual_increment_status, adhoc_percentage, entry_form
+//           ) VALUES ?
+//         `;
+
+//         conn.query(insertQuery, [insertValues], (err, result) => {
+//           if (err) {
+//             console.error('Error inserting data:', err);
+//             return res.status(500).json({ error: 'Database error during insertion' });
+//           }
+//           // Call handleUpdate if necessary
+//           handleUpdateServiceBook(conn, employeesToUpdate, res);
+
+//         });
+//       });
+//     } else {
+//       // No inserts, handle updates
+//       handleUpdateServiceBook(conn, employeesToUpdate, res);
+
+//     }
+//   });
+// });
+
+// // Function to handle updates
+// function handleUpdateServiceBook(conn, employeesToUpdate, res) {
+//   if (employeesToUpdate.length > 0) {
+//     // Implement logic to update employee records here
+//     // Use conn.query with UPDATE SQL for each employee record
+//     const updatePromises = employeesToUpdate.map(employee => {
+//       const updateQuery = `
+//         UPDATE service_book
+//         SET basic_salary = ?, house_rent = ?, additional_increment = ?, pessi = ?, eobi = ?,
+//             current_adhoc = ?, total_adhoc = ?, current_increment = ?, total_increment = ?, total_net_salary = ?,
+//             adhoc_increment_status = ?, annual_increment_status = ?, remarks = ?, second_shift_honorarium = ?
+//         WHERE salary_update_id = ?
+//       `;
+
+//       return new Promise((resolve, reject) => {
+//         conn.query(updateQuery, [
+//           employee.basic_salary, employee.house_rent, employee.additional_increment, employee.pessi, employee.eobi,
+//           employee.current_adhoc, employee.total_adhoc, employee.current_increment, employee.total_increment, employee.new_net_salary,
+//           employee.adhoc_increment_status, employee.annual_increment_status, employee.remarks, employee.second_shift_honorarium, employee.salary_update_id
+//         ], (err, result) => {
+//           if (err) {
+//             reject(err);
+//           } else {
+//             resolve(result);
+//           }
+//         });
+//       });
+//     });
+
+//     // Execute all updates and handle the response
+//     Promise.all(updatePromises)
+//       .then(() => res.status(200).json({ message: 'Records inserted/updated successfully' }))
+//       .catch(err => {
+//         console.error('Error updating data:', err);
+//         res.status(500).json({ error: 'Database error during update' });
+//       });
+//   } else {
+//     // If no updates, just return success for the insert part
+//     res.status(200).json({ message: 'Records inserted successfully' });
+//   }
+// }
+
+app.post("/insert-employee-increment-record", (req, res) => {
+  const employees = req.body.employees;
+  const currentMonth = employees[0].increment_date; // YYYY-MM format (e.g., '2024-09')
+
+  if (!employees || employees.length === 0) {
+    return res.status(400).json({ error: "No employee data provided" });
+  }
+
+  connection.getConnection((err, conn) => {
+    if (err) {
+      console.error("Error getting database connection:", err);
+      return res.status(500).json({ error: "Database connection error" });
+    }
+
+    // Only handle new records (no updates)
+    const employeesToInsert = employees.filter(
+      (employee) => !employee.salary_update_id
+    );
+
+    if (employeesToInsert.length === 0) {
+      return res.status(400).json({ error: "No new records to insert" });
+    }
+
+    // console.log(employeesToInsert);
+
+    // Check if any of the employees already exist for the given increment date
+    const existingEmployeesQuery = `
+      SELECT employee_id 
+      FROM service_book 
+      WHERE increment_date = ${conn.escape(currentMonth)} 
+        AND employee_id IN (${employeesToInsert
+          .map((employee) => conn.escape(employee.employee_id))
+          .join(", ")})
+    `;
+
+    conn.query(existingEmployeesQuery, (err, existingEmployees) => {
+      if (err) {
+        console.error("Error checking existing employees:", err);
+        return res
+          .status(500)
+          .json({ error: "Database error during employee existence check" });
+      }
+
+      const existingEmployeeIds = existingEmployees.map((e) => e.employee_id);
+      const filteredEmployeesToInsert = employeesToInsert.filter(
+        (employee) => !existingEmployeeIds.includes(employee.employee_id)
+      );
+
+      if (filteredEmployeesToInsert.length === 0) {
+        return res.status(200).json({
+          message:
+            "No new records to insert, all employees already exist for this increment date.",
+        });
+      }
+
+      // Insert new employee records
+      const insertValues = filteredEmployeesToInsert.map((employee) => {
+        const incrementType = employee.increment_type;
+
+        const adhocIncrementStatus =
+          incrementType === "adhoc" ? "adhoc_increment" : "-";
+        const annualIncrementStatus =
+          incrementType === "annual_increment" ? "annual_increment" : "-";
+
+        return [
+          employee.employee_id,
+          employee.employee_post_id,
+          employee.employee_role_id,
+          employee.pay_scale_id,
+          employee.basic_salary,
+          employee.house_rent,
+          employee.additional_increment,
+          employee.pessi,
+          employee.eobi,
+          employee.cpf,
+          incrementType === "adhoc"
+            ? employee.previous_total_adhoc_new
+            : employee.old_adhoc,
+          incrementType === "adhoc"
+            ? employee.new_increment
+            : employee.current_adhoc,
+          incrementType === "adhoc"
+            ? employee.previous_total_adhoc_new + employee.new_increment
+            : employee.total_adhoc,
+          employee.increment_date,
+          incrementType === "annual_increment"
+            ? employee.previous_total_increments_new
+            : employee.previous_total_increments,
+          incrementType === "annual_increment"
+            ? employee.new_increment
+            : employee.current_increment,
+          incrementType === "annual_increment"
+            ? employee.previous_total_increments_new + employee.new_increment
+            : employee.total_increment,
+          employee.new_net_salary,
+          employee.campus_id,
+          employee.user_id,
+          employee.job_type,
+          employee.remarks,
+          employee.second_shift_honorarium,
+          adhocIncrementStatus,
+          annualIncrementStatus,
+          employee.other_increment_amount,
+          "increment_form",
+          employee.medical_allownce,
+          employee.special_allownce,
+          employee.principal_allownce,
+        ];
+      });
+
+      const insertQuery = `
+        INSERT INTO service_book (
+          employee_id, employee_post_id, employee_role_id, pay_scale_id, basic_salary,
+          house_rent, additional_increment, pessi, eobi, cpf, old_adhoc, current_adhoc, total_adhoc, increment_date,
+          previous_total_increments, current_increment, total_increment, total_net_salary,
+          campus_id, user_id, job_type, remarks, second_shift_honorarium,
+          adhoc_increment_status, annual_increment_status, adhoc_percentage, entry_form, medical_allownce, special_allownce, principal_allownce
+        ) VALUES ?
+      `;
+
+      conn.query(insertQuery, [insertValues], (err, result) => {
+        if (err) {
+          console.error("Error inserting data:", err);
+          return res
+            .status(500)
+            .json({ error: "Database error during insertion" });
+        }
+
+        // console.log(filteredEmployeesToInsert[0]?.user_id, filteredEmployeesToInsert[0]?.campus_id);
+
+         logAction('CREATE', 'service_book' ,'Created Employee Increment', 0, filteredEmployeesToInsert[0]?.user_id, filteredEmployeesToInsert[0]?.campus_id, 0);
+
+        res.status(200).json({ message: "Records inserted successfully" });
+      });
+    });
+  });
+});
+
+// app.post('/employee-salary-records', (req, res) => {
+//   const employees = req.body.employees;
+//   const currentMonth = req.body.employees[0].for_the_month; // YYYY-MM format (e.g., '2024-09')
+
+//   if (!employees || employees.length === 0) {
+//     return res.status(400).json({ error: 'No employee data provided' });
+//   }
+
+//   connection.getConnection((err, conn) => {
+//     if (err) {
+//       console.error('Error getting database connection:', err);
+//       return res.status(500).json({ error: 'Database connection error' });
+//     }
+
+//     // Start a transaction
+//     conn.beginTransaction(err => {
+//       if (err) {
+//         console.error('Error starting transaction:', err);
+//         return res.status(500).json({ error: 'Database transaction error' });
+//       }
+
+//       // Separate employees into those needing insert vs. update
+//       const employeesToInsert = employees.filter(employee => !employee.salary_update_id);
+//       const employeesToUpdate = employees.filter(employee => employee.salary_update_id);
+
+//       if (employeesToInsert.length === 0 && employeesToUpdate.length === 0) {
+//         return res.status(400).json({ error: 'No records to insert or update' });
+//       }
+
+//       // Insert new records if any
+//       if (employeesToInsert.length > 0) {
+//         // Query to find existing records for the current month
+//         const existingEmployeesQuery = `
+//           SELECT employee_id
+//           FROM employee_salary_records
+//           WHERE for_the_month = ${conn.escape(currentMonth)}
+//             AND employee_id IN (${employeesToInsert.map(employee => conn.escape(employee.employee_id)).join(', ')})
+//         `;
+
+//         conn.query(existingEmployeesQuery, (err, existingEmployees) => {
+//           if (err) {
+//             return conn.rollback(() => {
+//               console.error('Error checking existing employees:', err);
+//               return res.status(500).json({ error: 'Database error during employee existence check' });
+//             });
+//           }
+
+//           // Filter out employees who already have a record for the current month
+//           const existingEmployeeIds = existingEmployees.map(e => e.employee_id);
+//           const filteredEmployeesToInsert = employeesToInsert.filter(employee => !existingEmployeeIds.includes(employee.employee_id));
+
+//           if (filteredEmployeesToInsert.length === 0) {
+//             // If no new records to insert, handle updates
+//             return handleUpdate(conn, employeesToUpdate, [], res);
+//           }
+
+//           const invoiceQuery = `SELECT MAX(invoice_no) AS max_invoice_no FROM employee_salary_records`;
+
+//           conn.query(invoiceQuery, (err, result) => {
+//             if (err) {
+//               return conn.rollback(() => {
+//                 console.error('Error fetching max invoice_no:', err);
+//                 return res.status(500).json({ error: 'Database error during fetching max invoice_no' });
+//               });
+//             }
+
+//             let nextInvoiceNo = (result[0].max_invoice_no ? result[0].max_invoice_no : 999) + 1;
+//             let invoiceNoCounter = Number(nextInvoiceNo);
+
+//             const insertValues = filteredEmployeesToInsert.map(employee => {
+//               const currentInvoiceNo = invoiceNoCounter;
+//               invoiceNoCounter += 1;
+
+//               return [
+//                 employee.employee_id, employee.service_book_id, employee.employee_post_id, employee.employee_role_id,
+//                 employee.pay_scale_id, employee.previous_adhoc, employee.current_adhoc, employee.previous_increments,
+//                 employee.current_increment, employee.house_rent, employee.net_salary, employee.security_deduction,
+//                 employee.security_deduction + employee.total_security_deduct_from_salary, employee.dow, employee.graduity,
+//                 employee.others_allownce, employee.remaining, employee.remarks, employee.basic_salary, employee.additional_increments, employee.pessi, employee.eobi, employee.campus_id, employee.user_id, currentInvoiceNo, currentMonth
+//               ];
+//             });
+
+//             const insertQuery = `
+//               INSERT INTO employee_salary_records (
+//                 employee_id, service_book_id, employee_post_id, employee_role_id, pay_scale_id, previous_adhoc,
+//                 current_adhoc, previous_increments, current_increment, house_rent, net_salary, security_deduct,
+//                 total_security_deduct, dow, graduity, others_allownce, remaining, remarks, basic_salary,additional_increments,  pessi, eobi, campus_id, user_id, invoice_no, for_the_month
+//               ) VALUES ?`;
+
+//             conn.query(insertQuery, [insertValues], (err, result) => {
+//               if (err) {
+//                 return conn.rollback(() => {
+//                   console.error('Error inserting data:', err);
+//                   return res.status(500).json({ error: 'Database error during insertion' });
+//                 });
+//               }
+
+//               handleUpdate(conn, employeesToUpdate, filteredEmployeesToInsert, res);
+//             });
+//           });
+//         });
+//       } else {
+//         handleUpdate(conn, employeesToUpdate, [], res);
+//       }
+//     });
+//   });
+// });
+
+// function handleUpdate(conn, employeesToUpdate, newEmployees, res) {
+//   if (employeesToUpdate.length > 0) {
+//     const updateQuery = `
+//       UPDATE employee_salary_records
+//       SET
+//         service_book_id = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.service_book_id)}`).join(' ')}
+//         END,
+//         employee_post_id = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.employee_post_id)}`).join(' ')}
+//         END,
+//         employee_role_id = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.employee_role_id)}`).join(' ')}
+//         END,
+//         pay_scale_id = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.pay_scale_id)}`).join(' ')}
+//         END,
+//         previous_adhoc = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.previous_adhoc)}`).join(' ')}
+//         END,
+//         current_adhoc = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.current_adhoc)}`).join(' ')}
+//         END,
+//         previous_increments = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.previous_increments)}`).join(' ')}
+//         END,
+//         current_increment = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.current_increment)}`).join(' ')}
+//         END,
+//         house_rent = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.house_rent)}`).join(' ')}
+//         END,
+//         basic_salary = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.basic_salary)}`).join(' ')}
+//         END,
+//         pessi = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.pessi)}`).join(' ')}
+//         END,
+//         eobi = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.eobi)}`).join(' ')}
+//         END,
+//         net_salary = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.net_salary)}`).join(' ')}
+//         END,
+//         additional_increments = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.additional_increments)}`).join(' ')}
+//         END,
+//         security_deduct = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.security_deduction)}`).join(' ')}
+//         END,
+//         total_security_deduct = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.security_deduction + employee.total_security_deduct_from_salary)}`).join(' ')}
+//         END,
+//         dow = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.dow)}`).join(' ')}
+//         END,
+//         graduity = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.graduity)}`).join(' ')}
+//         END,
+//         others_allownce = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.others_allownce)}`).join(' ')}
+//         END,
+//         remaining = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.remaining)}`).join(' ')}
+//         END,
+//         remarks = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.remarks)}`).join(' ')}
+//         END,
+//         for_the_month = CASE id
+//           ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.for_the_month)}`).join(' ')}
+//         END
+//       WHERE id IN (${employeesToUpdate.map(employee => conn.escape(employee.salary_update_id)).join(', ')});
+//     `;
+
+//     conn.query(updateQuery, (err, result) => {
+//       if (err) {
+//         return conn.rollback(() => {
+//           console.error('Error updating records:', err);
+//           return res.status(500).json({ error: 'Database error during update' });
+//         });
+//       }
+
+//       handleSecurityDeduction(conn, newEmployees, res);
+//     });
+//   } else {
+//     handleSecurityDeduction(conn, newEmployees, res);
+//   }
+// }
+
+// // Function to handle bulk update for security deduction
+// function handleSecurityDeduction(conn, newEmployees, res) {
+//   // Step 3: Handle security deduction updates
+//   const employeesWithDeduction = newEmployees.filter(employee => employee.security_deduction > 0);
+
+//   if (employeesWithDeduction.length > 0) {
+//     const updateQuery = `
+//       UPDATE school_employees se
+//       JOIN (
+//         ${employeesWithDeduction.map(employee => `
+//           SELECT ${conn.escape(employee.employee_id)} AS employee_id,
+//                  ${conn.escape(employee.security_deduction + employee.total_security_deduct_from_salary)} AS total_security_deduct_from_salary
+//         `).join(' UNION ALL ')}
+//       ) AS updates
+//       ON se.id = updates.employee_id
+//       SET se.total_security_deduct_from_salary = updates.total_security_deduct_from_salary`;
+
+//     // Execute the bulk update query
+//     conn.query(updateQuery, (err, result) => {
+//       if (err) {
+//         return conn.rollback(() => {
+//           console.error('Error updating security deductions:', err);
+//           return res.status(500).json({ error: 'Database error during security deduction update' });
+//         });
+//       }
+
+//       // Commit the transaction
+//       conn.commit(err => {
+//         if (err) {
+//           return conn.rollback(() => {
+//             console.error('Error committing transaction:', err);
+//             return res.status(500).json({ error: 'Transaction commit error' });
+//           });
+//         }
+//         res.json({ message: 'Records inserted and updated successfully', affectedRows: result.affectedRows });
+//       });
+//     });
+//   } else {
+//     // If no security deductions need to be updated, commit the transaction
+//     conn.commit(err => {
+//       if (err) {
+//         return conn.rollback(() => {
+//           console.error('Error committing transaction:', err);
+//           return res.status(500).json({ error: 'Transaction commit error' });
+//         });
+//       }
+//       res.json({ message: 'Records inserted successfully. No updates required for security deductions.' });
+//     });
+//   }
+// }
+
+
+
+app.post("/employee-salary-records", (req, res) => {
+  const employees = req.body.employees;
+  const currentMonth = req.body.employees[0].for_the_month; // YYYY-MM format (e.g., '2024-09')
+
+  if (!employees || employees.length === 0) {
+    return res.status(400).json({ error: "No employee data provided" });
+  }
+
+  connection.getConnection((err, conn) => {
+    if (err) {
+      console.error("Error getting database connection:", err);
+      return res.status(500).json({ error: "Database connection error" });
+    }
+
+    // Start a transaction
+    conn.beginTransaction((err) => {
+      if (err) {
+        console.error("Error starting transaction:", err);
+        return res.status(500).json({ error: "Database transaction error" });
+      }
+
+      // Separate employees into those needing insert vs. update
+      const employeesToInsert = employees.filter(
+        (employee) => !employee.salary_update_id
+      );
+      const employeesToUpdate = employees.filter(
+        (employee) => employee.salary_update_id
+      );
+
+      if (employeesToInsert.length === 0 && employeesToUpdate.length === 0) {
+        return res
+          .status(400)
+          .json({ error: "No records to insert or update" });
+      }
+
+      // Insert new records if any
+      if (employeesToInsert.length > 0) {
+        // Query to find existing records for the current month
+        const existingEmployeesQuery = `
+          SELECT employee_id 
+          FROM employee_salary_records 
+          WHERE for_the_month = ${conn.escape(currentMonth)} 
+            AND employee_id IN (${employeesToInsert
+              .map((employee) => conn.escape(employee.employee_id))
+              .join(", ")})
+        `;
+
+        conn.query(existingEmployeesQuery, (err, existingEmployees) => {
+          if (err) {
+            return conn.rollback(() => {
+              console.error("Error checking existing employees:", err);
+              return res.status(500).json({
+                error: "Database error during employee existence check",
+              });
+            });
+          }
+
+          // Filter out employees who already have a record for the current month
+          const existingEmployeeIds = existingEmployees.map(
+            (e) => e.employee_id
+          );
+          const filteredEmployeesToInsert = employeesToInsert.filter(
+            (employee) => !existingEmployeeIds.includes(employee.employee_id)
+          );
+
+          if (filteredEmployeesToInsert.length === 0) {
+            // If no new records to insert, handle updates
+            return handleUpdate(conn, employeesToUpdate, [], res);
+          }
+
+          const invoiceQuery = `SELECT MAX(invoice_no) AS max_invoice_no FROM employee_salary_records`;
+
+          conn.query(invoiceQuery, (err, result) => {
+            if (err) {
+              return conn.rollback(() => {
+                console.error("Error fetching max invoice_no:", err);
+                return res.status(500).json({
+                  error: "Database error during fetching max invoice_no",
+                });
+              });
+            }
+
+            let nextInvoiceNo =
+              (result[0].max_invoice_no ? result[0].max_invoice_no : 999) + 1;
+            let invoiceNoCounter = Number(nextInvoiceNo);
+
+            const insertValues = filteredEmployeesToInsert.map((employee) => {
+              const currentInvoiceNo = invoiceNoCounter;
+              invoiceNoCounter += 1;
+
+              return [
+                employee.employee_id,
+                employee.service_book_id,
+                employee.employee_post_id,
+                employee.employee_role_id,
+                employee.pay_scale_id,
+                employee.previous_adhoc,
+                employee.current_adhoc,
+                employee.previous_increments,
+                employee.current_increment,
+                employee.house_rent,
+                employee.second_shift_honorarium,
+                employee.net_salary,
+                employee.security_deduction,
+                employee.security_deduction +
+                  employee.total_security_deduct_from_salary,
+                employee.loan_deduction,
+                employee.loan_deduction +
+                  employee.total_loan_deduct_from_salary,
+                employee.dow,
+                employee.graduity,
+                employee.others_allownce,
+                employee.other_deduction,
+                employee.remaining,
+                employee.remarks,
+                employee.basic_salary,
+                employee.additional_increments,
+                employee.pessi,
+                employee.eobi,
+                employee.cpf,
+                employee.bus_charges,
+                employee.campus_id,
+                employee.user_id,
+                employee.income_tax,
+                employee.rebate,
+                employee.session_id,
+                employee.principal_allownce,
+                employee.medical_allownce,
+                employee.special_allownce,
+                employee.overtime,
+                employee.overtime_amount,
+                employee.paid_through_id,
+                employee.account_no,
+                currentInvoiceNo,
+                currentMonth,
+              ];
+            });
+
+            const insertQuery = `
+              INSERT INTO employee_salary_records (
+                employee_id, service_book_id, employee_post_id, employee_role_id, pay_scale_id, previous_adhoc,
+                current_adhoc, previous_increments, current_increment, house_rent, second_shift_honorarium, net_salary, security_deduct, 
+                total_security_deduct, loan_deduct, total_loan_deduct, dow, graduity, others_allownce, other_deduction, remaining, remarks, basic_salary,
+                additional_increments, pessi, eobi, cpf, bus_charges, campus_id, user_id, income_tax, rebate, session_id, principal_allownce, medical_allownce, special_allownce, overtime, overtime_amount, paid_through_id, account_no, invoice_no, for_the_month
+              ) VALUES ?`;
+
+            conn.query(insertQuery, [insertValues], (err, result) => {
+              if (err) {
+                return conn.rollback(() => {
+                  console.error("Error inserting data:", err);
+                  return res
+                    .status(500)
+                    .json({ error: "Database error during insertion" });
+                });
+              }
+              handleUpdate(
+                conn,
+                employeesToUpdate,
+                filteredEmployeesToInsert,
+                res
+              );
+            });
+          });
+        });
+      } else {
+        handleUpdate(conn, employeesToUpdate, [], res);
+      }
+    });
+  });
+});
+
+// const updateQuery = `
+// UPDATE employee_salary_records
+// SET
+//   service_book_id = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.service_book_id)}`).join(' ')}
+//   END,
+//   employee_post_id = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.employee_post_id)}`).join(' ')}
+//   END,
+//   employee_role_id = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.employee_role_id)}`).join(' ')}
+//   END,
+//   pay_scale_id = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.pay_scale_id)}`).join(' ')}
+//   END,
+//   previous_adhoc = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.previous_adhoc)}`).join(' ')}
+//   END,
+//   current_adhoc = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.current_adhoc)}`).join(' ')}
+//   END,
+//   previous_increments = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.previous_increments)}`).join(' ')}
+//   END,
+//   current_increment = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.current_increment)}`).join(' ')}
+//   END,
+//   house_rent = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.house_rent)}`).join(' ')}
+//   END,
+//    second_shift_honorarium = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.second_shift_honorarium)}`).join(' ')}
+//   END,
+//   basic_salary = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.basic_salary)}`).join(' ')}
+//   END,
+//   pessi = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.pessi)}`).join(' ')}
+//   END,
+//   eobi = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.eobi)}`).join(' ')}
+//   END,
+//   net_salary = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.net_salary)}`).join(' ')}
+//   END,
+//   additional_increments = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.additional_increments)}`).join(' ')}
+//   END,
+//   security_deduct = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.security_deduction)}`).join(' ')}
+//   END,
+//   total_security_deduct = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.security_deduction + employee.total_security_deduct_from_salary)}`).join(' ')}
+//   END,
+//   loan_deduct = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.loan_deduction)}`).join(' ')}
+//   END,
+//   total_loan_deduct = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.loan_deduction + employee.total_loan_deduct_from_salary)}`).join(' ')}
+//   END,
+//   dow = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.dow)}`).join(' ')}
+//   END,
+//   graduity = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.graduity)}`).join(' ')}
+//   END,
+//   others_allownce = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.others_allownce)}`).join(' ')}
+//   END,
+//   remaining = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.remaining)}`).join(' ')}
+//   END,
+//   remarks = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.remarks)}`).join(' ')}
+//   END,
+//   for_the_month = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.for_the_month)}`).join(' ')}
+//   END,
+//   income_tax = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.income_tax)}`).join(' ')}
+//   END,
+//   principal_allownce = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.principal_allownce)}`).join(' ')}
+//   END,
+//   medical_allownce = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.medical_allownce)}`).join(' ')}
+//   END,
+//   special_allownce = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.special_allownce)}`).join(' ')}
+//   END,
+//   rebate = CASE id
+//     ${employeesToUpdate.map(employee => `WHEN ${conn.escape(employee.salary_update_id)} THEN ${conn.escape(employee.rebate)}`).join(' ')}
+//   END
+// WHERE id IN (${employeesToUpdate.map(employee => conn.escape(employee.salary_update_id)).join(', ')});`;
+
+function handleUpdate(conn, employeesToUpdate, newEmployees, res) {
+  if (employeesToUpdate.length > 0) {
+    const updateQuery = `
+      UPDATE employee_salary_records
+      SET
+       overtime = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.overtime)}`
+            )
+            .join(" ")}
+        END,
+        income_tax = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.income_tax)}`
+            )
+            .join(" ")}
+         END,
+         overtime_amount = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.overtime_amount)}`
+            )
+            .join(" ")}
+        END,
+        dow = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.dow)}`
+            )
+            .join(" ")}
+        END,
+        graduity = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.graduity)}`
+            )
+            .join(" ")}
+        END,
+        others_allownce = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.others_allownce)}`
+            )
+            .join(" ")}
+        END,
+        other_deduction = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.other_deduction)}`
+            )
+            .join(" ")}
+        END,
+        remaining = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.remaining)}`
+            )
+            .join(" ")}
+        END,
+        remarks = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.remarks)}`
+            )
+            .join(" ")}
+        END,
+        paid_through_id = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.paid_through_id)}`
+            )
+            .join(" ")}
+        END,
+        account_no = CASE id
+          ${employeesToUpdate
+            .map(
+              (employee) =>
+                `WHEN ${conn.escape(
+                  employee.salary_update_id
+                )} THEN ${conn.escape(employee.account_no)}`
+            )
+            .join(" ")}
+        END
+      WHERE id IN (${employeesToUpdate
+        .map((employee) => conn.escape(employee.salary_update_id))
+        .join(", ")});`;
+    conn.query(updateQuery, (err, result) => {
+      if (err) {
+        return conn.rollback(() => {
+          console.error("Error updating records:", err);
+          return res
+            .status(500)
+            .json({ error: "Database error during update" });
+        });
+      }
+
+      handleDeductions(conn, newEmployees, res);
+    });
+  } else {
+    handleDeductions(conn, newEmployees, res);
+  }
+}
+
+function handleDeductions(conn, newEmployees, res) {
+  // Filter employees with security deductions
+  const employeesWithSecurityDeduction = newEmployees.filter(
+    (employee) => employee.security_deduction > 0
+  );
+  // Filter employees with loan deductions
+  const employeesWithLoanDeduction = newEmployees.filter(
+    (employee) => employee.loan_deduction > 0
+  );
+
+  // Check if any deductions need to be updated (either security or loan)
+  if (
+    employeesWithSecurityDeduction.length > 0 ||
+    employeesWithLoanDeduction.length > 0
+  ) {
+    let securityUpdateQuery = "";
+    let loanUpdateQuery = "";
+
+    // Handle security deduction updates
+    if (employeesWithSecurityDeduction.length > 0) {
+      securityUpdateQuery = `
+        UPDATE school_employees se
+        JOIN (
+          ${employeesWithSecurityDeduction
+            .map(
+              (employee) => `
+            SELECT ${conn.escape(employee.employee_id)} AS employee_id, 
+                   ${conn.escape(
+                     employee.security_deduction +
+                       employee.total_security_deduct_from_salary
+                   )} AS total_security_deduct_from_salary
+          `
+            )
+            .join(" UNION ALL ")}
+        ) AS updates
+        ON se.id = updates.employee_id
+        SET se.total_security_deduct_from_salary = updates.total_security_deduct_from_salary`;
+    }
+
+    // Handle loan deduction updates
+    if (employeesWithLoanDeduction.length > 0) {
+      loanUpdateQuery = `
+        UPDATE school_employees se
+        JOIN (
+          ${employeesWithLoanDeduction
+            .map(
+              (employee) => `
+            SELECT ${conn.escape(employee.employee_id)} AS employee_id, 
+                   ${conn.escape(
+                     employee.loan_deduction +
+                       employee.total_loan_deduct_from_salary
+                   )} AS total_loan_deduct_from_salary
+          `
+            )
+            .join(" UNION ALL ")}
+        ) AS updates
+        ON se.id = updates.employee_id
+        SET se.total_loan_deduct_from_salary = updates.total_loan_deduct_from_salary`;
+    }
+
+    // Execute the bulk update query for security deductions first (if exists)
+    if (securityUpdateQuery) {
+      conn.query(securityUpdateQuery, (err, result) => {
+        if (err) {
+          return conn.rollback(() => {
+            console.error("Error updating security deductions:", err);
+            return res.status(500).json({
+              error: "Database error during security deduction updates",
+            });
+          });
+        }
+
+        // If loan deductions need to be updated as well, execute the second query
+        if (loanUpdateQuery) {
+          conn.query(loanUpdateQuery, (err, result) => {
+            if (err) {
+              return conn.rollback(() => {
+                console.error("Error updating loan deductions:", err);
+                return res.status(500).json({
+                  error: "Database error during loan deduction updates",
+                });
+              });
+            }
+
+            // Commit the transaction after both security and loan deductions are updated
+            conn.commit((err) => {
+              if (err) {
+                return conn.rollback(() => {
+                  console.error("Error committing transaction:", err);
+                  return res
+                    .status(500)
+                    .json({ error: "Transaction commit error" });
+                });
+              }
+              res.json({
+                message: "Records inserted and deductions updated successfully",
+                affectedRows: result.affectedRows,
+              });
+            });
+          });
+        } else {
+          // If no loan deductions need to be updated, commit the transaction
+          conn.commit((err) => {
+            if (err) {
+              return conn.rollback(() => {
+                console.error("Error committing transaction:", err);
+                return res
+                  .status(500)
+                  .json({ error: "Transaction commit error" });
+              });
+            }
+            res.json({
+              message: "Security deductions updated successfully",
+              affectedRows: result.affectedRows,
+            });
+          });
+        }
+      });
+    } else if (loanUpdateQuery) {
+      // If only loan deductions need to be updated, execute the loan update query
+      conn.query(loanUpdateQuery, (err, result) => {
+        if (err) {
+          return conn.rollback(() => {
+            console.error("Error updating loan deductions:", err);
+            return res
+              .status(500)
+              .json({ error: "Database error during loan deduction updates" });
+          });
+        }
+
+        // Commit the transaction after loan deductions are updated
+        conn.commit((err) => {
+          if (err) {
+            return conn.rollback(() => {
+              console.error("Error committing transaction:", err);
+              return res
+                .status(500)
+                .json({ error: "Transaction commit error" });
+            });
+          }
+          res.json({
+            message: "Loan deductions updated successfully",
+            affectedRows: result.affectedRows,
+          });
+        });
+      });
+    }
+  } else {
+    // If no deductions need to be updated, commit the transaction
+    conn.commit((err) => {
+      if (err) {
+        return conn.rollback(() => {
+          console.error("Error committing transaction:", err);
+          return res.status(500).json({ error: "Transaction commit error" });
+        });
+      }
+      res.json({
+        message:
+          "Records inserted successfully. No updates required for deductions.",
+      });
+    });
+  }
+}
+
+// // Function to handle bulk update for security and loan deductions
+// function handleDeductions(conn, newEmployees, res) {
+//   // Filter employees with security deductions
+//   const employeesWithSecurityDeduction = newEmployees.filter(employee => employee.security_deduction > 0);
+//   // Filter employees with loan deductions
+//   const employeesWithLoanDeduction = newEmployees.filter(employee => employee.loan_deduction > 0);
+
+//   // Check if any deductions need to be updated (either security or loan)
+//   if (employeesWithSecurityDeduction.length > 0 || employeesWithLoanDeduction.length > 0) {
+//     let updateQueryParts = [];
+
+//     // Handle security deduction updates
+//     if (employeesWithSecurityDeduction.length > 0) {
+//       const securityUpdateQuery = `
+//         UPDATE school_employees se
+//         JOIN (
+//           ${employeesWithSecurityDeduction.map(employee => `
+//             SELECT ${conn.escape(employee.employee_id)} AS employee_id,
+//                    ${conn.escape(employee.security_deduction + employee.total_security_deduct_from_salary)} AS total_security_deduct_from_salary
+//           `).join(' UNION ALL ')}
+//         ) AS updates
+//         ON se.id = updates.employee_id
+//         SET se.total_security_deduct_from_salary = updates.total_security_deduct_from_salary`;
+//       updateQueryParts.push(securityUpdateQuery);
+//     }
+
+//     // Handle loan deduction updates
+//     if (employeesWithLoanDeduction.length > 0) {
+//       const loanUpdateQuery = `
+//         UPDATE school_employees se
+//         JOIN (
+//           ${employeesWithLoanDeduction.map(employee => `
+//             SELECT ${conn.escape(employee.employee_id)} AS employee_id,
+//                    ${conn.escape(employee.loan_deduction + employee.total_loan_deduct_from_salary)} AS total_loan_deduct_from_salary
+//           `).join(' UNION ALL ')}
+//         ) AS updates
+//         ON se.id = updates.employee_id
+//         SET se.total_loan_deduct_from_salary = updates.total_loan_deduct_from_salary`;
+//       updateQueryParts.push(loanUpdateQuery);
+//     }
+
+//     // Combine both queries if necessary
+//     const updateQuery = updateQueryParts.join('; ');
+
+//     // Execute the bulk update query for both security and loan deductions
+//     conn.query(updateQuery, (err, result) => {
+//       if (err) {
+//         return conn.rollback(() => {
+//           console.error('Error updating deductions:', err);
+//           return res.status(500).json({ error: 'Database error during deduction updates' });
+//         });
+//       }
+
+//       // Commit the transaction after all deductions are updated
+//       conn.commit(err => {
+//         if (err) {
+//           return conn.rollback(() => {
+//             console.error('Error committing transaction:', err);
+//             return res.status(500).json({ error: 'Transaction commit error' });
+//           });
+//         }
+//         res.json({ message: 'Records inserted and deductions updated successfully', affectedRows: result.affectedRows });
+//       });
+//     });
+//   } else {
+//     // If no deductions need to be updated, commit the transaction
+//     conn.commit(err => {
+//       if (err) {
+//         return conn.rollback(() => {
+//           console.error('Error committing transaction:', err);
+//           return res.status(500).json({ error: 'Transaction commit error' });
+//         });
+//       }
+//       res.json({ message: 'Records inserted successfully. No updates required for deductions.' });
+//     });
+//   }
+// }
+
+app.post("/insert-class", (req, res) => {
+  const { class_name, section_id, fee_group_id, campus_id, hidden_id, user_id, session_id, section_name, fee_group_name, parent_class_id } =
+    req.body;
+
+  const checkQuery = `
+    SELECT * FROM classes 
+    WHERE status = 'On' AND class = ? AND section_id = ? AND fee_group_id = ? AND campus_id = ?
+    ${hidden_id ? "AND id != ?" : ""}
+  `;
+  const checkValues = hidden_id
+    ? [class_name, section_id, fee_group_id, campus_id, hidden_id]
+    : [class_name, section_id, fee_group_id, campus_id];
+
+  connection.query(checkQuery, checkValues, (checkErr, checkResult) => {
+    if (checkErr) {
+      console.error("Error checking class existence:", checkErr);
+      return res.status(500).json({ error: "Error checking class existence" });
+    }
+
+    if (checkResult.length > 0) {
+      return res.status(400).json({
+        error: "Class with the same section and fee group already exists",
+      });
+    }
+
+    if (hidden_id) {
+      const updateQuery = `
+        UPDATE classes
+        SET class = ?, section_id = ?, fee_group_id = ?, campus_id = ?, parent_class_id = ?
+        WHERE id = ?
+      `;
+      const updateValues = [
+        class_name,
+        section_id,
+        fee_group_id,
+        campus_id,
+        parent_class_id,
+        hidden_id,
+      ];
+
+      connection.query(updateQuery, updateValues, (updateErr, updateResult) => {
+        if (updateErr) {
+          console.error("Error updating data:", updateErr);
+          return res.status(500).json({ error: "Error updating data" });
+        } else {
+
+
+            let descriptions = {
+        class_name:class_name,
+        section_name:section_name,
+        fee_group_name:fee_group_name
+        }  
+
+
+           logAction('UPDATE', 'classes', 'Update Class Name', hidden_id, user_id, campus_id, session_id);
+          return res.json({ message: "Data updated successfully!" });
+        }
+      });
+    } else {
+      const insertQuery = `
+        INSERT INTO classes (class, section_id, fee_group_id, campus_id, parent_class_id)
+        VALUES (?, ?, ?, ?, ?)
+      `;
+      const insertValues = [class_name, section_id, fee_group_id, campus_id, parent_class_id];
+
+      connection.query(insertQuery, insertValues, (insertErr, insertResult) => {
+        if (insertErr) {
+          console.error("Error inserting data:", insertErr);
+          return res.status(500).json({ error: "Error inserting data" });
+        } else {
+           let descriptions = {
+        class_name:class_name,
+        section_name:section_name,
+        fee_group_name:fee_group_name
+        }  
+           logAction('CREATE', 'classes', 'Create Class Name', insertResult.insertId, user_id, campus_id, session_id);
+          return res.json({ message: "Data saved successfully!" });
+
+        }
+      });
+    }
+  });
+});
+
+
+
+
+app.post("/insert-house-and-club", (req, res) => {
+  const { house_or_club_name, house_or_club, status, campus_id, hidden_id, user_id, session_id } = req.body;
+
+  const checkQuery = `
+    SELECT * FROM house_or_club 
+    WHERE status = 'On' AND house_or_club_name = ? AND house_or_club = ? AND campus_id = ? 
+    ${hidden_id ? "AND id != ?" : ""}
+  `;
+  const checkValues = hidden_id
+    ? [house_or_club_name, house_or_club, status, campus_id, hidden_id]
+    : [house_or_club_name, house_or_club, campus_id];
+
+  connection.query(checkQuery, checkValues, (checkErr, checkResult) => {
+    if (checkErr) {
+      console.error("Error checking class existence:", checkErr);
+      return res.status(500).json({ error: "Error checking class existence" });
+    }
+
+    if (checkResult.length > 0) {
+      return res.status(400).json({
+        error: "Club or House Already Exist",
+      });
+    }
+
+    if (hidden_id) {
+      const updateQuery = `
+        UPDATE house_or_club
+        SET house_or_club_name = ?, house_or_club = ?, status = ?, campus_id = ?
+        WHERE id = ?
+      `;
+      const updateValues = [
+        house_or_club_name,
+        house_or_club,
+        status,
+        campus_id,
+        hidden_id,
+      ];
+
+      connection.query(updateQuery, updateValues, (updateErr, updateResult) => {
+        if (updateErr) {
+          console.error("Error updating data:", updateErr);
+          return res.status(500).json({ error: "Error updating data" });
+        } else {
+           logAction('UPDATE', 'house_or_club', 'House Or Club Update Name' , hidden_id, user_id, campus_id, session_id);
+          return res.json({ message: "Data updated successfully!" });
+        }
+      });
+    } else {
+      const insertQuery = `
+        INSERT INTO house_or_club (house_or_club_name, house_or_club, status, campus_id)
+        VALUES (?, ?, ?, ?)
+      `;
+      const insertValues = [house_or_club_name, house_or_club, status, campus_id];
+
+      connection.query(insertQuery, insertValues, (insertErr, insertResult) => {
+        if (insertErr) {
+          console.error("Error inserting data:", insertErr);
+          return res.status(500).json({ error: "Error inserting data" });
+        } else {
+          
+          logAction('CREATE', 'house_or_club', 'Insert House Or Club Name'  ,insertResult.insertId, user_id, campus_id, session_id);
+          return res.json({ message: "Data saved successfully!" });
+        }
+      });
+    }
+  });
+});
+
+
+
+app.post("/insert-section", (req, res) => {
+  const { section_name, campus_id, hidden_id, user_id, session_id } = req.body;
+
+  // Validation for section name uniqueness
+  const checkUniqueQuery = `
+    SELECT COUNT(*) as count FROM sections WHERE section_name = ? AND status = 'On' AND campus_id = ? AND id != ?
+  `;
+  const checkUniqueValues = [section_name, campus_id, hidden_id || 0];
+
+  connection.query(
+    checkUniqueQuery,
+    checkUniqueValues,
+    (checkErr, checkResult) => {
+      if (checkErr) {
+        console.error("Error checking uniqueness:", checkErr);
+        return res.status(500).json({ error: "Error checking uniqueness" });
+      } else if (checkResult[0].count > 0) {
+        return res.status(400).json({ error: "Section name already exist!" });
+      } else {
+        // Proceed with insert or update
+        if (hidden_id) {
+          const updateQuery = `
+          UPDATE sections
+          SET section_name = ? WHERE id = ?
+        `;
+          const updateValues = [section_name, hidden_id];
+
+          connection.query(
+            updateQuery,
+            updateValues,
+            (updateErr, updateResult) => {
+              if (updateErr) {
+                console.error("Error updating data:", updateErr);
+                return res.status(500).json({ error: "Error updating data" });
+              } else {
+                 let descriptions = {
+                section_name:section_name,
+                }  
+                logAction('UPDATE', 'sections', 'Update Section Name' ,hidden_id, user_id, campus_id, session_id);
+                return res.json({ message: "Data updated successfully!" });
+              }
+            }
+          );
+        } else {
+          const insertQuery = `
+          INSERT INTO sections (section_name, campus_id)
+          VALUES (?, ?)
+        `;
+          const insertValues = [section_name, campus_id];
+
+          connection.query(
+            insertQuery,
+            insertValues,
+            (insertErr, insertResult) => {
+              if (insertErr) {
+                console.error("Error inserting data:", insertErr);
+                return res.status(500).json({ error: "Error inserting data" });
+              } else {
+                 let descriptions = {
+                section_name:section_name,
+                }  
+                logAction('CREATE', 'sections', 'Insert Section Table' ,insertResult.insertId, user_id, campus_id, session_id);
+                return res.json({ message: "Data saved successfully!" });
+              }
+            }
+          );
+        }
+      }
+    }
+  );
+});
+
+
+//actually this is logo image but I name student image
+app.post("/insert-campus-information", upload.single('student_image'), async (req, res) => {
+  const { phone_no, address, email, campus_id } = req.body;
+  let logoPath = null;
+
+
+  try {
+    // Handle file upload if present
+    if (req.file) {
+      console.log("hitted");
+      // Generate timestamp for filename
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const fileExtension = path.extname(req.file.originalname);
+      const newFilename = timestamp + fileExtension;
+      const newPath = path.join(path.dirname(req.file.path), newFilename);
+      
+      // Rename the file
+      fs.renameSync(req.file.path, newPath);
+      logoPath = newFilename;
+    }
+
+    // Build UPDATE query based on whether we have a new logo
+    let updateQuery, updateValues;
+    
+    if (logoPath) {
+      updateQuery = `UPDATE campuses 
+                    SET phone_no = ?, email = ?, address = ?, logo = ? 
+                    WHERE id = ?`;
+      updateValues = [phone_no, email, address, logoPath, campus_id];
+    } else {
+      updateQuery = `UPDATE campuses 
+                    SET phone_no = ?, email = ?, address = ? 
+                    WHERE id = ?`;
+      updateValues = [phone_no, email, address, campus_id];
+    }
+
+    // Use the promisified query method
+    await connection.query(updateQuery, updateValues);
+    
+    return res.json({ message: "Data updated successfully!" });
+
+  } catch (err) {
+    console.error("Error processing request:", err);
+    
+    // Clean up uploaded file if there was an error
+    if (logoPath) {
+      try {
+        fs.unlinkSync(path.join(uploadDir, logoPath));
+      } catch (unlinkErr) {
+        console.error('Error cleaning up file:', unlinkErr);
+      }
+    } else if (req.file && fs.existsSync(req.file.path)) {
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (unlinkErr) {
+        console.error('Error cleaning up file:', unlinkErr);
+      }
+    }
+    
+    return res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+app.post("/insert-student-account", async (req, res) => {
+  const { class_id, campus_id, session_id, user_id } = req.body;
+
+  try {
+    // Step 1: Fetch students based on class_id, campus_id, and session_id
+    const students = await connection.query(
+      "SELECT id, student_unique_id, full_name FROM students WHERE class_id IN (?) AND campus_id = ? AND session_id = ?",
+      [class_id, campus_id, session_id]
+    );
+
+    // Step 2: Prepare the password hash
+    const password = '123456';
+    const hashedPassword = bcrypt.hashSync(password, 8); // Hash the password with 8 salt rounds
+
+    // Step 3: Prepare data for insert
+    const studentsWithUsernameAndPassword = students.map(student => {
+      const username = student.full_name.replace(/[^a-zA-Z0-9]/g, '') + student.id; // Clean username
+      return [username, hashedPassword, 'Student', student.student_unique_id, campus_id ]; // Prepare data for bulk insert
+    });
+
+    // Step 4: Check if any student already has an account (user_id exists in users table)
+    const existingUsers = await connection.query(
+      "SELECT user_id FROM users WHERE user_id IN (?) AND user_type = 'student'",
+      [students.map(student => student.student_unique_id)]
+    );
+
+
+  
+
+    // Step 5: Filter out students who already have accounts (exclude them from insert)
+    const existingUserIds = existingUsers.map(user => user.user_id);
+    const studentsToInsert = studentsWithUsernameAndPassword.filter(student =>
+      !existingUserIds.includes(student[3]) // Exclude if user_id already exists
+    );
+
+    // console.log(existingUserIds, "existingUserIds", studentsWithUsernameAndPassword);
+
+
+    if (studentsToInsert.length > 0) {
+      // Step 6: Insert only students who don't already have an account
+      const query = `
+        INSERT INTO users (username, password, user_type, user_id, campus_id)
+        VALUES ?
+      `;
+      await connection.query(query, [studentsToInsert]);
+    }
+
+    // Step 7: Respond with success and data of students inserted
+    res.json({ success: true, insertedStudents: studentsToInsert });
+
+    
+    logAction('CREATE', 'users' , 'Create Students Account', 0, user_id, campus_id, session_id);
+
+  } catch (error) {
+    console.error("Error processing student data:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+app.post("/insert-teacher-account", async (req, res) => {
+  const { teacher_ids, campus_id, session_id } = req.body;
+
+  try {
+    // Step 1: Fetch students based on class_id, campus_id, and session_id
+    const students = await connection.query(
+      `SELECT school_employees.id, school_employees.full_name FROM school_employees
+       JOIN 
+       employee_roles ON school_employees.employee_role_id = employee_roles.id WHERE school_employees.campus_id = ? AND employee_roles.employee_role='Teacher' AND school_employees.id IN (?)`,
+      [campus_id, teacher_ids]
+    );
+
+    // Step 2: Prepare the password hash
+    const password = '123456';
+    const hashedPassword = bcrypt.hashSync(password, 8); // Hash the password with 8 salt rounds
+
+    // Step 3: Prepare data for insert
+    const studentsWithUsernameAndPassword = students.map(student => {
+      const username = student.full_name.replace(/[^a-zA-Z0-9]/g, '') + student.id; // Clean username
+      return [username, hashedPassword, 'Teacher', student.id, campus_id ]; // Prepare data for bulk insert
+    });
+
+    // Step 4: Check if any student already has an account (user_id exists in users table)
+    const existingUsers = await connection.query(
+      "SELECT user_id FROM users WHERE user_id IN (?) AND user_type = 'teacher'",
+      [students.map(student => student.id)]
+    );
+
+
+  
+
+    // Step 5: Filter out students who already have accounts (exclude them from insert)
+    const existingUserIds = existingUsers.map(user => user.user_id);
+    const studentsToInsert = studentsWithUsernameAndPassword.filter(student =>
+      !existingUserIds.includes(student[3]) // Exclude if user_id already exists
+    );
+
+    // console.log(existingUserIds, "existingUserIds", studentsWithUsernameAndPassword);
+
+
+    if (studentsToInsert.length > 0) {
+      // Step 6: Insert only students who don't already have an account
+      const query = `
+        INSERT INTO users (username, password, user_type, user_id, campus_id)
+        VALUES ?
+      `;
+      await connection.query(query, [studentsToInsert]);
+    }
+
+    // Step 7: Respond with success and data of students inserted
+    res.json({ success: true, insertedStudents: studentsToInsert });
+
+  } catch (error) {
+    console.error("Error processing student data:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+
+
+
+
+app.post("/insert-subject", (req, res) => {
+  const { subjects, subject_type, subject_code, hidden_id, campus_id} = req.body;
+
+  const checkQuery = `
+    SELECT * FROM subjects 
+    WHERE subjects = ? AND subject_type = ? AND subject_code = ? AND campus_id = ?
+    ${hidden_id ? "AND id != ?" : ""}
+  `;
+  const checkValues = hidden_id
+    ? [subjects, subject_type, subject_code, campus_id,  hidden_id]
+    : [subjects, subject_type, subject_code, campus_id];
+
+  connection.query(checkQuery, checkValues, (checkErr, checkResult) => {
+    if (checkErr) {
+      console.error("Error checking class existence:", checkErr);
+      return res.status(500).json({ error: "Error checking class existence" });
+    }
+
+    if (checkResult.length > 0) {
+      return res.status(400).json({
+        error: "Subject Already Exist",
+      });
+    }
+
+    if (hidden_id) {
+      const updateQuery = `
+        UPDATE subjects
+        SET subjects = ?, subject_type = ?, subject_code = ?, campus_id
+        WHERE id = ?
+      `;
+      const updateValues = [
+        subjects,
+        subject_type,
+        subject_code,
+        campus_id,
+        hidden_id,
+      ];
+
+      connection.query(updateQuery, updateValues, (updateErr, updateResult) => {
+        if (updateErr) {
+          console.error("Error updating data:", updateErr);
+          return res.status(500).json({ error: "Error updating data" });
+        } else {
+          return res.json({ message: "Data updated successfully!" });
+        }
+      });
+    } else {
+      const insertQuery = `
+        INSERT INTO subjects (subjects, subject_type, subject_code, campus_id)
+        VALUES (?, ?, ?, ?)
+      `;
+      const insertValues = [subjects, subject_type, subject_code, campus_id];
+
+      connection.query(insertQuery, insertValues, (insertErr, insertResult) => {
+        if (insertErr) {
+          console.error("Error inserting data:", insertErr);
+          return res.status(500).json({ error: "Error inserting data" });
+        } else {
+          return res.json({ message: "Data saved successfully!" });
+        }
+      });
+    }
+  });
+});
+
+
+
+
+
+
+
+
+app.post("/insert-fee-group", (req, res) => {
+  const { fee_group_name, campus_id, hidden_id, user_id, session_id } = req.body;
+
+  // Validation for fee group name uniqueness
+  const checkUniqueQuery = `
+    SELECT COUNT(*) as count FROM fee_groups WHERE fee_group_name = ? AND status = 'On' AND campus_id = ? AND id != ?
+  `;
+  const checkUniqueValues = [fee_group_name, campus_id, hidden_id || 0];
+
+  connection.query(
+    checkUniqueQuery,
+    checkUniqueValues,
+    (checkErr, checkResult) => {
+      if (checkErr) {
+        console.error("Error checking uniqueness:", checkErr);
+        return res.status(500).json({ error: "Error checking uniqueness" });
+      } else if (checkResult[0].count > 0) {
+        return res
+          .status(400)
+          .json({ error: "Fee group name already exists!" });
+      } else {
+        // Proceed with insert or update
+        if (hidden_id) {
+          const updateQuery = `
+          UPDATE fee_groups
+          SET fee_group_name = ? WHERE id = ?
+        `;
+          const updateValues = [fee_group_name, hidden_id];
+
+          connection.query(
+            updateQuery,
+            updateValues,
+            (updateErr, updateResult) => {
+              if (updateErr) {
+                console.error("Error updating data:", updateErr);
+                return res.status(500).json({ error: "Error updating data" });
+              } else {
+                logAction('UPDATE', 'fee_groups' ,'Update Fee Group Table', hidden_id, user_id, campus_id, session_id);
+                return res.json({ message: "Data updated successfully!" });
+              }
+            }
+          );
+        } else {
+          const insertQuery = `
+          INSERT INTO fee_groups (fee_group_name, campus_id)
+          VALUES (?, ?)
+        `;
+          const insertValues = [fee_group_name, campus_id];
+
+          connection.query(
+            insertQuery,
+            insertValues,
+            (insertErr, insertResult) => {
+              if (insertErr) {
+                console.error("Error inserting data:", insertErr);
+                return res.status(500).json({ error: "Error inserting data" });
+              } else {
+                 logAction('CREATE', 'fee_groups', 'Insert Fee Group', insertResult.insertId, user_id, campus_id, session_id);
+                return res.json({ message: "Data saved successfully!" });
+              }
+            }
+          );
+        }
+      }
+    }
+  );
+});
+
+app.put("/soft-delete-class/:id/:session_id/:campus_id/:user_id/:class_name/:section_name/:fee_group_name", (req, res) => {
+  const classId = parseInt(req.params.id);
+   const session_id = parseInt(req.params.session_id);
+    const campus_id = parseInt(req.params.campus_id);
+     const user_id = parseInt(req.params.user_id);
+  const class_name = req.params.class_name;
+    const section_name = req.params.section_name;
+      const fee_group_name = req.params.fee_group_name;
+
+      // console.log(class_name, section_name, fee_group_name);
+
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      res.status(500).json({ error: "Error connecting to database" });
+      return;
+    }
+
+    const sql = "UPDATE classes SET status = ? WHERE id = ?";
+    const values = ["Off", classId]; // Assuming you use 'deleted' as the status value for soft delete
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating status:", error);
+        res.status(500).json({ error: "Error updating status" });
+      } else {
+        console.log("Status updated successfully");
+        res.status(200).json({ message: "Status updated successfully" });
+         let descriptions = {
+                 class_name:class_name,
+                section_name:section_name,
+                fee_group_name:fee_group_name
+                }  
+          logAction('DELETE', 'classes', 'Delete Class' ,classId, user_id, campus_id, session_id);
+      }
+    });
+  });
+});
+
+app.put("/soft-delete-section/:id/:user_id/:campus_id/:session_id", (req, res) => {
+  const section_id = parseInt(req.params.id);
+  const user_id = parseInt(req.params.user_id);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      res.status(500).json({ error: "Error connecting to database" });
+      return;
+    }
+
+    const sql = "UPDATE sections SET status = ? WHERE id = ?";
+    const values = ["Off", section_id]; // Assuming you use 'deleted' as the status value for soft delete
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating status:", error);
+        res.status(500).json({ error: "Error updating status" });
+      } else {
+        logAction('DELETE','sections' ,'Delete Section', section_id, user_id, campus_id, session_id);
+        console.log("Status updated successfully");
+        res.status(200).json({ message: "Status updated successfully" });
+      }
+    });
+  });
+});
+
+app.put("/soft-delete-selected-categories/:id/:user_id/:campus_id/:session_id", (req, res) => {
+  const category_id = parseInt(req.params.id);
+ const user_id = parseInt(req.params.user_id);
+  const campus_id = parseInt(req.params.campus_id);
+   const session_id = parseInt(req.params.session_id);
+
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      res.status(500).json({ error: "Error connecting to database" });
+      return;
+    }
+
+    const sql =
+      "UPDATE selected_categories_campuswise SET status = ? WHERE id = ?";
+    const values = ["Off", category_id]; // Assuming you use 'deleted' as the status value for soft delete
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating status:", error);
+        res.status(500).json({ error: "Error updating status" });
+      } else {
+         logAction('DELETE', 'school_categories' ,'Delete School Categories', category_id, user_id, campus_id, session_id);
+        console.log("Status updated successfully");
+        res.status(200).json({ message: "Status updated successfully" });
+      }
+    });
+  });
+});
+
+
+
+
+
+// Route to fetch sections list
+// app.get("/sections-list", async (req, res) => {
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const search_data = req.query.search;
+//   const campus_id = req.query.campus_id;
+
+//   if (!campus_id) {
+//     return res.status(400).json({ error: "Campus ID is required" });
+//   }
+
+//   try {
+//     let sql = `SELECT sections.id, sections.section_name
+//                FROM sections
+//                WHERE sections.status = 'On' AND sections.campus_id = ?`;
+//     let countSql = `SELECT COUNT(*) AS total FROM sections
+//                     WHERE sections.status = 'On' AND sections.campus_id = ?`;
+
+//     const params = [campus_id];
+
+//     if (search_data) {
+//       sql += ` AND sections.section_name LIKE ?`;
+//       countSql += ` AND sections.section_name LIKE ?`;
+//       params.push(`%${search_data}%`);
+//     }
+
+//     sql += ` LIMIT ? OFFSET ?`;
+//     params.push(limit, offset);
+
+//     const [dataResults, countResult] = await Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(sql, params, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(
+//           countSql,
+//           params.slice(0, params.length - 2),
+//           (err, results) => {
+//             if (err) reject(err);
+//             else resolve(results);
+//           }
+//         );
+//       }),
+//     ]);
+
+//     const total = countResult[0].total;
+//     const totalPages = Math.ceil(total / limit);
+
+//     res.json({
+//       total,
+//       currentPage: page,
+//       totalPages,
+//       results: dataResults,
+//     });
+//   } catch (error) {
+//     console.error("Error fetching sections:", error);
+//     res.status(500).json({ error: "Internal server error" });
+//   }
+// });
+
+
+
+
+// // Route to fetch sections list
+// app.get("/subject-list", async (req, res) => {
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const search_data = req.query.search;
+//   const campus_id = req.query.campus_id;
+
+//   if (!campus_id) {
+//     return res.status(400).json({ error: "Campus ID is required" });
+//   }
+
+//   try {
+//     let sql = `SELECT *
+//                FROM subjects`;
+//     let countSql = `SELECT COUNT(*) AS total FROM subjects`;
+
+
+//     if (search_data) {
+//       sql += ` WHERE subjects.subjects LIKE ?`;
+//       countSql += ` WHERE subjects.subjects LIKE ?`;
+//       params.push(`%${search_data}%`);
+//     }
+
+//     sql += ` LIMIT ? OFFSET ?`;
+//     params.push(limit, offset);
+
+//     const [dataResults, countResult] = await Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(sql, params, (err, results) => {
+//           if (err) reject(err);
+//           else resolve(results);
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(
+//           countSql,
+//           params.slice(0, params.length - 2),
+//           (err, results) => {
+//             if (err) reject(err);
+//             else resolve(results);
+//           }
+//         );
+//       }),
+//     ]);
+
+//     const total = countResult[0].total;
+//     const totalPages = Math.ceil(total / limit);
+
+//     res.json({
+//       total,
+//       currentPage: page,
+//       totalPages,
+//       results: dataResults,
+//     });
+//   } catch (error) {
+//     console.error("Error fetching sections:", error);
+//     res.status(500).json({ error: "Internal server error" });
+//   }
+// });
+
+
+
+
+app.get("/subject-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  try {
+    let sql = `SELECT * FROM subjects WHERE campus_id = ?`;
+    let countSql = `SELECT COUNT(*) AS total FROM subjects WHERE campus_id = ?`;
+
+    let params = [campus_id]; // Use campus_id in the params array
+
+    if (search_data) {
+      sql += ` AND subjects.subjects LIKE ?`;
+      countSql += ` AND subjects.subjects LIKE ?`;
+      params.push(`%${search_data}%`);
+    }
+
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(
+          countSql,
+          params.slice(0, params.length - 2),
+          (err, results) => {
+            if (err) reject(err);
+            else resolve(results);
+          }
+        );
+      }),
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching subjects:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+
+
+
+// Route to fetch fee groups list
+app.get("/fee-groups-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  try {
+    let sql = `SELECT fee_groups.id, fee_groups.fee_group_name
+               FROM fee_groups
+               WHERE fee_groups.status = 'On' AND fee_groups.campus_id = ?`;
+    let countSql = `SELECT COUNT(*) AS total FROM fee_groups
+                    WHERE fee_groups.status = 'On' AND fee_groups.campus_id = ?`;
+
+    const params = [campus_id];
+
+    if (search_data) {
+      sql += ` AND fee_groups.fee_group_name LIKE ?`;
+      countSql += ` AND fee_groups.fee_group_name LIKE ?`;
+      params.push(`%${search_data}%`);
+    }
+
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(
+          countSql,
+          params.slice(0, params.length - 2),
+          (err, results) => {
+            if (err) reject(err);
+            else resolve(results);
+          }
+        );
+      }),
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching fee groups:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+// Route to fetch classes list
+app.get("/classes-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  try {
+    let sql = `SELECT classes.id, classes.class, sections.section_name, fee_groups.fee_group_name, parent_classes.parent_class, classes.campus_id, classes.created_at, classes.updated_at 
+               FROM classes
+               LEFT JOIN sections ON classes.section_id = sections.id
+               LEFT JOIN fee_groups ON classes.fee_group_id = fee_groups.id
+               LEFT JOIN parent_classes ON classes.parent_class_id = parent_classes.id
+               WHERE classes.status = 'On' AND classes.campus_id = ?`;
+    let countSql = `SELECT COUNT(*) AS total FROM classes
+                    LEFT JOIN sections ON classes.section_id = sections.id
+                    LEFT JOIN fee_groups ON classes.fee_group_id = fee_groups.id
+                    WHERE classes.status = 'On' AND classes.campus_id = ?`;
+
+    const params = [campus_id];
+
+    if (search_data) {
+      sql += ` AND (classes.class LIKE ? OR sections.section_name LIKE ? OR fee_groups.fee_group_name LIKE ?)`;
+      countSql += ` AND (classes.class LIKE ? OR sections.section_name LIKE ? OR fee_groups.fee_group_name LIKE ?)`;
+      params.push(`%${search_data}%`, `%${search_data}%`, `%${search_data}%`);
+    }
+
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(
+          countSql,
+          params.slice(0, params.length - 2),
+          (err, results) => {
+            if (err) reject(err);
+            else resolve(results);
+          }
+        );
+      }),
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching classes:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+// Route to fetch classes list
+app.get("/house-and-club-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  try {
+    let sql = `SELECT *
+               FROM house_or_club WHERE
+               house_or_club.status = 'On' AND house_or_club.campus_id = ?`;
+    let countSql = `SELECT COUNT(*) AS total  FROM house_or_club WHERE
+               house_or_club.status = 'On' AND house_or_club.campus_id = ?`;
+
+    const params = [campus_id];
+
+    if (search_data) {
+      sql += ` AND (house_or_club.house_or_club_name LIKE ?)`;
+      countSql += ` AND (house_or_club.house_or_club_name LIKE ?)`;
+      params.push(`%${search_data}%`);
+    }
+
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(
+          countSql,
+          params.slice(0, params.length - 2),
+          (err, results) => {
+            if (err) reject(err);
+            else resolve(results);
+          }
+        );
+      }),
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching classes:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+// Route to fetch selected categories campuswise
+app.get("/selected-categories-campuswise-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  try {
+    let sql = `SELECT selected_categories_campuswise.id, 
+    selected_categories_campuswise.category_id, 
+        school_categories.category
+    FROM selected_categories_campuswise
+    JOIN school_categories 
+    ON selected_categories_campuswise.category_id = school_categories.id
+    WHERE selected_categories_campuswise.status = 'On' 
+    AND selected_categories_campuswise.campus_id = ?
+    ORDER BY selected_categories_campuswise.id DESC`;
+
+    let countSql = `SELECT COUNT(*) AS total FROM selected_categories_campuswise
+                    JOIN school_categories ON selected_categories_campuswise.category_id = school_categories.id
+                    WHERE selected_categories_campuswise.status = 'On' AND selected_categories_campuswise.campus_id = ?`;
+
+    const params = [campus_id];
+
+    if (search_data) {
+      sql += ` AND school_categories.category_name LIKE ?`;
+      countSql += ` AND school_categories.category_name LIKE ?`;
+      params.push(`%${search_data}%`);
+    }
+
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(
+          countSql,
+          params.slice(0, params.length - 2),
+          (err, results) => {
+            if (err) reject(err);
+            else resolve(results);
+          }
+        );
+      }),
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching selected categories:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+app.get("/assign-subject-classwise-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  try {
+    let sql = `SELECT *
+      FROM assing_subjects_class
+      JOIN classes ON assing_subjects_class.class_id = classes.id
+      JOIN sections ON classes.section_id = sections.id 
+      WHERE assing_subjects_class.campus_id = ?`;
+
+    let countSql = `SELECT COUNT(DISTINCT assing_subjects_class.class_id, classes.section_id) AS total
+      FROM assing_subjects_class
+      JOIN classes ON assing_subjects_class.class_id = classes.id
+      JOIN sections ON classes.section_id = sections.id
+      WHERE assing_subjects_class.campus_id = ?`;
+
+    const params = [campus_id];
+
+    if (search_data) {
+      sql += ` AND classes.class_name LIKE ?`; // Assuming you're searching class names
+      countSql += ` AND classes.class_name LIKE ?`; // Adjust this field accordingly
+      params.push(`%${search_data}%`);
+    }
+
+    sql += ` GROUP BY assing_subjects_class.class_id, classes.section_id
+      ORDER BY classes.id ASC LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(countSql, params.slice(0, params.length - 2), (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching selected categories:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+app.get("/assign-subject-teachers-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+
+  if (!campus_id) {
+    return res.status(400).json({ error: "Campus ID is required" });
+  }
+
+  try {
+    let sql = `SELECT school_employees.*, employee_posts.employee_post FROM school_employees INNER JOIN employee_posts ON school_employees.employee_post_id = employee_posts.id
+      WHERE school_employees.campus_id = ?`;
+
+    let countSql = `SELECT count(*) as total FROM school_employees INNER JOIN employee_posts ON school_employees.employee_post_id = employee_posts.id
+      WHERE school_employees.campus_id = ?`;
+
+    const params = [campus_id];
+
+    // If there's search data, add it to the SQL queries
+    if (search_data) {
+      sql += ` AND (school_employees.full_name LIKE ? OR employee_posts.employee_post LIKE ?)`;
+      countSql += ` AND (school_employees.full_name LIKE ? OR employee_posts.employee_post LIKE ?)`;
+      const searchTerm = `%${search_data}%`;
+      params.push(searchTerm, searchTerm);
+    }
+
+    // Add pagination to the SQL query
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    // Run both queries in parallel using Promise.all
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(countSql, params.slice(0, params.length - 2), (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching selected categories:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+app.get("/get-class-data/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT id, class as class_name, section_id, fee_group_id, parent_class_id  FROM classes WHERE id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+app.get("/get-house-and-club/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT * FROM house_or_club WHERE id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+app.get("/get-homework/:id_get/:campus_id/:session_id", (req, res) => {
+  const id_get = req.params.id_get;
+  const campus_id = req.params.campus_id;
+  const session_id = req.params.session_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `
+    
+    SELECT hw.*, 
+        hw.id as admission_id,
+        c.class as class_name, 
+        s.section_name, 
+        sub.subjects,
+        tch.shift,
+        ascl.subject_id,
+        ascl.class_id,
+        ascl.section_id
+      FROM homework hw
+      JOIN assing_subjects_class_teacher tch ON hw.assing_subjects_class_teacher_id = tch.id
+      JOIN assing_subjects_class ascl ON tch.assign_subject_class_id = ascl.id
+      JOIN subjects sub ON ascl.subject_id = sub.id
+      JOIN classes c ON ascl.class_id = c.id
+      JOIN sections s ON ascl.section_id = s.id
+      WHERE hw.campus_id = ? AND hw.session_id = ? AND hw.id = ?`;
+
+    const values = [campus_id, session_id, id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+app.get("/edit-pay_scale_wise_basic_salary/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT * FROM pay_scale_wise_basic_salary WHERE id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+
+app.get("/get-section-data/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT id, section_name FROM sections WHERE id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.get("/get-campus-info-data/:campus_id", (req, res) => {
+  const id_get = req.params.campus_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT phone_no, email, address, logo FROM campuses WHERE id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+
+app.get("/get-student-activities-data/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT student_activities.*,   DATE_FORMAT(student_activities.activity_date, '%Y-%m-%d') AS activity_date, students.shift, students.full_name, students.class_id, students.section_id, classes.class as class_name, sections.section_name  FROM student_activities INNER JOIN students ON student_activities.student_id = students.id
+    INNER JOIN classes ON students.class_id =  classes.id INNER JOIN sections ON students.section_id = sections.id
+    WHERE student_activities.id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+
+app.get("/get-student-discipline-data/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT student_discipline.*,   DATE_FORMAT(student_discipline.date_of_incident, '%Y-%m-%d') AS date_of_incident, students.shift, students.full_name, students.class_id, students.section_id, classes.class as class_name, sections.section_name  FROM student_discipline INNER JOIN students ON student_discipline.student_id = students.id
+    INNER JOIN classes ON students.class_id =  classes.id INNER JOIN sections ON students.section_id = sections.id
+    WHERE student_discipline.id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+app.get("/get-employee-discipline-data/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT employee_discipline.*, employee_posts.employee_post,   DATE_FORMAT(employee_discipline.date_of_incident, '%Y-%m-%d') AS date_of_incident, school_employees.full_name
+    FROM employee_discipline  JOIN school_employees ON employee_discipline.employee_id = school_employees.id
+     JOIN 
+          employee_roles ON school_employees.employee_role_id = employee_roles.id 
+      JOIN 
+          employee_posts ON school_employees.employee_post_id = employee_posts.id
+      JOIN 
+          pay_scale ON school_employees.pay_scale_id = pay_scale.id
+    WHERE employee_discipline.id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+// app.get("/attendance-report-data", (req, res) => {
+//   const month_get = req.query.for_the_month; // format should be YYYY-MM (e.g., 2024-10)
+//   const session_id = req.query.session_id;
+//   const campus_id = req.query.campus_id;
+
+//   // Split year and month from the query parameter
+//   const [year, month] = month_get.split("-");
+
+//   // Convert the month from MM format (01-12) to zero-indexed format (00-11) for JavaScript Date object
+//   const zeroIndexedMonth = parseInt(month, 10) - 1;
+
+//   // Create the first date of the given month (e.g., 2024-10-01)
+//   const firstDate = `${year}-${month}-01`;
+
+//   // Create the last date of the given month by using new Date(year, month+1, 0)
+//   const lastDateObj = new Date(year, zeroIndexedMonth + 1, 0); // Adding 1 to the month to get the correct last day of the month
+//   const lastDate = lastDateObj.toISOString().split("T")[0]; // Format as YYYY-MM-DD
+
+//   console.log("First Date:", firstDate); // Should log e.g., "2024-10-01"
+//   console.log("Last Date:", lastDate); // Should log e.g., "2024-10-31"
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching" });
+//       return;
+//     }
+
+//     // SQL query to fetch data between the first and last date of the month, filtered by campus_id and session_id
+//     const sql = `SELECT school_employee_attendance.*, e.full_name, ep.employee_post, ps.pay_scale, ps.job_type 
+//                 FROM school_employee_attendance 
+//                 INNER JOIN school_employees e ON e.id = school_employee_attendance.employee_id
+//                 LEFT JOIN employee_posts ep ON e.employee_post_id = ep.id
+//                 LEFT JOIN pay_scale ps ON e.pay_scale_id = ps.id
+//                 WHERE school_employee_attendance.date BETWEEN ? AND ? 
+//                 AND school_employee_attendance.campus_id = ? 
+//                 AND school_employee_attendance.session_id = ?`;
+
+//     const values = [firstDate, lastDate, campus_id, session_id];
+
+//     connection.query(sql, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error("Error executing SQL query: ", error);
+//         res.status(500).json({ error: "Internal server error" });
+//       } else {
+//         res.json({
+//           results,
+//           for_the_month: month_get,
+//         });
+//       }
+//     });
+//   });
+// });
+
+
+
+app.get("/attendance-report-data", (req, res) => {
+  const month_get = req.query.for_the_month; // format should be YYYY-MM (e.g., 2024-10)
+  // const session_id = req.query.session_id;
+  const campus_id = req.query.campus_id;
+
+  // Split year and month from the query parameter
+  const [year, month] = month_get.split("-");
+
+  // Convert the month from MM format (01-12) to zero-indexed format (00-11) for JavaScript Date object
+  const zeroIndexedMonth = parseInt(month, 10) - 1;
+
+  // Create the first date of the given month (e.g., 2024-10-01)
+  const firstDate = `${year}-${month}-01`;
+
+  // Create the last date of the given month by using Date.UTC to avoid timezone issues
+  const lastDateObj = new Date(Date.UTC(year, zeroIndexedMonth + 1, 0)); // Adding 1 to the month to get the correct last day of the month
+  const lastDate = lastDateObj.toISOString().split("T")[0]; // Format as YYYY-MM-DD
+
+  console.log("First Date:", firstDate); // Should log e.g., "2024-10-01"
+  console.log("Last Date:", lastDate); // Should log e.g., "2024-10-31"
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    // SQL query to fetch data between the first and last date of the month, filtered by campus_id and session_id
+    const sql = `SELECT school_employee_attendance.*, e.full_name, ep.employee_post, ps.pay_scale, ps.job_type 
+                FROM school_employee_attendance 
+                INNER JOIN school_employees e ON e.id = school_employee_attendance.employee_id
+                LEFT JOIN employee_posts ep ON e.employee_post_id = ep.id
+                LEFT JOIN pay_scale ps ON e.pay_scale_id = ps.id
+                WHERE school_employee_attendance.date BETWEEN ? AND ? 
+                AND school_employee_attendance.campus_id = ?`;
+
+    const values = [firstDate, lastDate, campus_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+          for_the_month: month_get,
+        });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+app.get("/student-attendance-report-data", (req, res) => {
+  const month_get = req.query.for_the_month; // format should be YYYY-MM (e.g., 2024-10)
+  const session_id = req.query.session_id;
+  const campus_id = req.query.campus_id;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+
+  // Split year and month from the query parameter
+  const [year, month] = month_get.split("-");
+
+  // Convert the month from MM format (01-12) to zero-indexed format (00-11) for JavaScript Date object
+  const zeroIndexedMonth = parseInt(month, 10) - 1;
+
+  // Create the first date of the given month (e.g., 2024-10-01)
+  const firstDate = `${year}-${month}-01`;
+
+  // Create the last date of the given month by using Date.UTC to avoid timezone issues
+  const lastDateObj = new Date(Date.UTC(year, zeroIndexedMonth + 1, 0)); // Adding 1 to the month to get the correct last day of the month
+  const lastDate = lastDateObj.toISOString().split("T")[0]; // Format as YYYY-MM-DD
+
+  console.log("First Date:", firstDate); // Should log e.g., "2024-10-01"
+  console.log("Last Date:", lastDate); // Should log e.g., "2024-10-31"
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `
+    SELECT 
+            school_student_attendance.*, students.full_name
+        FROM 
+            school_student_attendance
+        INNER JOIN students ON students.id = school_student_attendance.student_id
+        WHERE 
+          school_student_attendance.date BETWEEN ? AND ? 
+          AND students.status_on_off = 'On' 
+          AND students.status IN ('Promoted', 'New Admission')
+          AND school_student_attendance.campus_id = ? 
+          AND school_student_attendance.session_id = ? 
+          AND school_student_attendance.class_id = ?
+          AND school_student_attendance.section_id = ?`;
+
+    const values = [firstDate, lastDate, campus_id, session_id, class_id, section_id];
+
+    const logSQLWithValues = (query, values) => {
+      let i = 0;
+      const formattedQuery = query.replace(/\?/g, () => {
+        const value = values[i++];
+        // Add quotes for string values to match SQL syntax
+        return typeof value === "string" ? `'${value}'` : value;
+      });
+      console.log("Executing SQL Query with Values:", formattedQuery);
+    };
+
+    logSQLWithValues(sql, values);
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+          for_the_month: month_get,
+        });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.get("/get-fee-group-data/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT id, fee_group_name FROM fee_groups WHERE id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+// Route to soft delete a fee group
+app.put("/soft-delete-fee-group/:id/:user_id/:campus_id/:session_id", (req, res) => {
+  const { id, user_id, campus_id, session_id } = req.params;
+
+  if (!id || isNaN(id)) {
+    return res.status(400).json({ error: "Valid ID is required" });
+  }
+
+  const deleteQuery = `
+    UPDATE fee_groups
+    SET status = 'Off'
+    WHERE id = ?
+  `;
+  const deleteValues = [id];
+
+  connection.query(deleteQuery, deleteValues, (deleteErr, deleteResult) => {
+    if (deleteErr) {
+      console.error("Error updating status:", deleteErr);
+      return res.status(500).json({ error: "Error updating status" });
+    } else {
+       logAction('DELETE', 'fee_groups' ,'Delete Fee Group', id, user_id, campus_id, session_id);
+      return res.json({ message: "Status updated successfully!" });
+    }
+  });
+});
+
+app.get("/get-selected-categories-data/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT * FROM selected_categories_campuswise WHERE id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+// app.post('/insert-heads', (req, res) => {
+//   const {
+//     head_name, status, campus_id, hidden_id
+//   } = req.body;
+
+//   if (hidden_id) {
+//     // Update existing admission
+//     let updateQuery = `
+//       UPDATE heads
+//       SET
+//         head_name = ?, status = ?
+//        `;
+
+//     const updateValues = [
+//       head_name, status
+//     ];
+
+//     updateQuery += ` WHERE id = ?`;
+//     updateValues.push(hidden_id);
+
+//     connection.query(updateQuery, updateValues, (err, result) => {
+//       if (err) {
+//         console.error('Error updating data:', err);
+//         res.status(500).json({ error: 'Error updating data' });
+//       } else {
+//         res.json({ message: 'Data updated successfully!' });
+//       }
+//     });
+
+//   } else {
+
+//     console.log(req.body);
+//     // Insert new admission
+//     const insertQuery = `
+//       INSERT INTO heads (
+//        head_name, status, campus_id
+//       ) VALUES (?, ?, ?)
+//     `;
+
+//     const insertValues = [
+//       head_name, status, campus_id
+//     ];
+
+//     connection.query(insertQuery, insertValues, (err, result) => {
+//       if (err) {
+//         console.error('Error inserting data:', err);
+//         res.status(500).json({ error: 'Error inserting data' });
+//       } else {
+//         res.json({ message: 'Data saved successfully!' });
+//       }
+//     });
+//   }
+// });
+
+
+
+
+
+app.post("/insert-heads", (req, res) => {
+  const { head_name, status, campus_id, hidden_id, voucher_type, checked_status } = req.body;
+
+  // Validate required fields
+  if (!head_name || !status || !campus_id) {
+    return res
+      .status(400)
+      .json({ error: "head_name, status, and campus_id are required" });
+  }
+
+  // Validate status value
+  const validStatuses = ["On", "Off"];
+  if (!validStatuses.includes(status)) {
+    return res.status(400).json({ error: "Invalid status value" });
+  }
+
+  // Validate head_name to ensure it's a string and not empty
+  if (typeof head_name !== "string" || head_name.trim().length === 0) {
+    return res.status(400).json({ error: "Invalid head_name" });
+  }
+
+  // Validate campus_id to ensure it's a number
+  if (isNaN(campus_id)) {
+    return res.status(400).json({ error: "Invalid campus_id" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // Check for uniqueness of head_name
+    let uniquenessCheckQuery =
+      'SELECT COUNT(*) AS count FROM heads WHERE head_name = ? AND status = "On" AND campus_id = ?';
+    const uniquenessCheckValues = [head_name, campus_id];
+
+    if (hidden_id) {
+      uniquenessCheckQuery += " AND id != ?";
+      uniquenessCheckValues.push(hidden_id);
+    }
+
+    connection.query(
+      uniquenessCheckQuery,
+      uniquenessCheckValues,
+      (err, result) => {
+        if (err) {
+          console.error("Error checking uniqueness:", err);
+          connection.release();
+          res.status(500).json({ error: "Error checking uniqueness" });
+          return;
+        }
+
+        if (result[0].count > 0) {
+          connection.release();
+          return res.status(400).json({ error: "head_name must be unique" });
+        }
+
+        // If uniqueness check passes, proceed with insert or update
+        if (hidden_id) {
+          // Update existing record
+          let updateQuery = `
+          UPDATE heads
+          SET head_name = ?, status = ?, campus_id = ?, voucher_type = ?, checked_status = ?
+          WHERE id = ?
+        `;
+
+          const updateValues = [head_name, status, campus_id, voucher_type, checked_status, hidden_id];
+
+          connection.query(updateQuery, updateValues, (err, result) => {
+            connection.release(); // Release the connection
+
+            if (err) {
+              console.error("Error updating data:", err);
+              res.status(500).json({ error: "Error updating data" });
+            } else {
+              res.json({ message: "Data updated successfully!" });
+            }
+          });
+        } else {
+          // Insert new record
+          const insertQuery = `
+          INSERT INTO heads (head_name, status, campus_id, voucher_type, checked_status)
+          VALUES (?, ?, ?, ?, ?)
+        `;
+
+          const insertValues = [head_name, status, campus_id, voucher_type, checked_status];
+
+          connection.query(insertQuery, insertValues, (err, result) => {
+            connection.release(); // Release the connection
+
+            if (err) {
+              console.error("Error inserting data:", err);
+              res.status(500).json({ error: "Error inserting data" });
+            } else {
+              res.json({ message: "Data saved successfully!" });
+            }
+          });
+        }
+      }
+    );
+  });
+});
+
+
+
+
+
+
+
+app.post("/insert-account-main-heads", (req, res) => {
+  const { head_name, status, campus_id, hidden_id } = req.body;
+
+  // Validate required fields
+  if (!head_name) {
+    return res
+      .status(400)
+      .json({ error: "head_name are required" });
+  }
+
+  // Validate head_name to ensure it's a string and not empty
+  if (typeof head_name !== "string" || head_name.trim().length === 0) {
+    return res.status(400).json({ error: "Invalid head_name" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // Check for uniqueness of head_name
+    let uniquenessCheckQuery =
+      'SELECT COUNT(*) AS count FROM heads WHERE head_name = ? AND status = "On"';
+    const uniquenessCheckValues = [head_name];
+
+    if (hidden_id) {
+      uniquenessCheckQuery += " AND id != ?";
+      uniquenessCheckValues.push(hidden_id);
+    }
+
+    connection.query(
+      uniquenessCheckQuery,
+      uniquenessCheckValues,
+      (err, result) => {
+        if (err) {
+          console.error("Error checking uniqueness:", err);
+          connection.release();
+          res.status(500).json({ error: "Error checking uniqueness" });
+          return;
+        }
+
+        if (result[0].count > 0) {
+          connection.release();
+          return res.status(400).json({ error: "head_name must be unique" });
+        }
+
+        // If uniqueness check passes, proceed with insert or update
+        if (hidden_id) {
+          // Update existing record
+          let updateQuery = `
+          UPDATE heads
+          SET head_name = ?, status = ?, campus_id = ?
+          WHERE id = ?
+        `;
+
+          const updateValues = [head_name, status, campus_id, hidden_id];
+
+          connection.query(updateQuery, updateValues, (err, result) => {
+            connection.release(); // Release the connection
+
+            if (err) {
+              console.error("Error updating data:", err);
+              res.status(500).json({ error: "Error updating data" });
+            } else {
+              res.json({ message: "Data updated successfully!" });
+            }
+          });
+        } else {
+          // Insert new record
+          const insertQuery = `
+          INSERT INTO heads (head_name, status, campus_id)
+          VALUES (?, ?, ?)
+        `;
+
+          const insertValues = [head_name, status, campus_id];
+
+          connection.query(insertQuery, insertValues, (err, result) => {
+            connection.release(); // Release the connection
+
+            if (err) {
+              console.error("Error inserting data:", err);
+              res.status(500).json({ error: "Error inserting data" });
+            } else {
+              res.json({ message: "Data saved successfully!" });
+            }
+          });
+        }
+      }
+    );
+  });
+});
+
+
+
+
+
+
+
+
+app.get("/heads-list", (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const campus_id= req.query.campus_id;
+  const search_data = req.query.search; // Use const for search_data since it's not reassigned
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    let sql = `SELECT *
+               FROM heads
+               WHERE campus_id = ${campus_id}`;
+
+    if (search_data) {
+      sql += ` AND head_name LIKE '%${search_data}%'`;
+    }
+
+    sql += ` LIMIT ${limit} OFFSET ${offset}`;
+
+    
+
+    // Execute the query
+    connection.query(sql, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+        return;
+      }
+
+      // Query to get total count of items
+      let countSql = `SELECT COUNT(*) AS total 
+                      FROM heads WHERE campus_id = ${campus_id}`;
+
+      if (search_data) {
+        countSql += ` AND head_name LIKE '%${search_data}%'`;
+      }
+
+      // Execute the count query
+      connection.query(countSql, (countError, countResult) => {
+        connection.release(); // Release the connection
+
+        if (countError) {
+          console.error("Error executing count SQL query: ", countError);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        const total = countResult[0].total;
+        const totalPages = Math.ceil(total / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          total,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      });
+    });
+  });
+});
+
+
+
+
+
+app.get("/charts-of-account", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    let sql = `SELECT m.main_head_name, s.code, s.name, s.level FROM  main_head_coa m LEFT JOIN sub_head_coa s ON m.id = s.main_head_id`;
+
+    // Execute the query
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      // Send the query results as JSON
+      res.json({
+        results,
+      });
+    });
+  });
+});
+
+
+
+
+
+// app.get('/heads-list', (req, res) => {
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const search_data = req.query.search; // Use const for search_data since it's not reassigned
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching' });
+//       return;
+//     }
+
+//     let sql = `SELECT *
+//            FROM heads
+//          `;
+
+//     if (search_data) {
+//       sql += ` WHERE head_name LIKE '%${search_data}%'`;
+//     }
+
+//     sql += ` LIMIT ${limit} OFFSET ${offset}`;
+
+//     // Execute the query
+//     connection.query(sql, (error, results) => {
+//       if (error) {
+//         console.error('Error executing SQL query: ', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//         connection.release(); // Release the connection
+//         return;
+//       }
+
+//       // Query to get total count of items
+//       let countSql = `SELECT COUNT(*) AS total FROM heads
+//       `;
+
+//       if (search_data) {
+//         countSql += ` WHERE head_name LIKE '%${search_data}%'`;
+//       }
+
+//       // Execute the count query
+//       connection.query(countSql, (countError, countResult) => {
+//         connection.release(); // Release the connection
+
+//         if (countError) {
+//           console.error('Error executing count SQL query: ', countError);
+//           res.status(500).json({ error: 'Internal server error' });
+//           return;
+//         }
+
+//         const total = countResult[0].total;
+//         const totalPages = Math.ceil(total / limit);
+
+//         // Send paginated results and pagination metadata as JSON
+//         res.json({
+//           total,
+//           currentPage: page,
+//           totalPages,
+//           results
+//         });
+//       });
+//     });
+//   });
+// });
+
+app.get("/head-get/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT * FROM heads WHERE id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+app.delete("/delete-head/:id_get", (req, res) => {
+  const id_get = parseInt(req.params.id_get);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    const sql = "UPDATE heads SET status = ? WHERE id = ?";
+    const values = ["Off", id_get]; // Assuming you use 'deleted' as the status value for soft delete
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting:", error);
+        res.status(500).json({ error: "Error deleting" });
+      } else {
+        console.log("Deleted successfully");
+        res.status(200).json({ message: "Deleted successfully" });
+      }
+    });
+  });
+});
+
+// app.post('/insert-admission', upload.single('student_image'), (req, res) => {
+//   console.log('File:', req.file);
+//   console.log('Body:', req.body);
+
+//   if (!req.file) {
+//     return res.status(400).send('No file uploaded.');
+//   }
+
+//   const {
+//     register_no, old_register_no, shift, admission_date, full_name, gender,
+//     class_id, section_id, dob, religion, cast, blood_group, mother_tongue,
+//     current_address, permanent_address, mobile_no, student_cnic, category_id,
+//     house_id, club_id, guardian_name, relation, occupation, guardian_mobile_no,
+//     guardian_address, guardian_cnic, pl_no, designation, department, session_id, campus_id, user_id, status, father_name, father_cnic, father_mobile_no,
+//   } = req.body;
+//   const student_image = req.file.filename;
+
+//   // console.log(student_image);
+
+//   // return false;
+
+//   const query = `
+//     INSERT INTO students (
+//       register_no, old_register_no, shift, admission_date, full_name, gender,
+//       class_id, section_id, dob, religion, cast, blood_group, mother_tongue,
+//       current_address, permanent_address, mobile_no, student_cnic, category_id,
+//       house_id, club_id, guardian_name, relation, occupation, guardian_mobile_no,
+//       guardian_address, guardian_cnic, pl_no, designation, department,   session_id, campus_id, user_id, status, father_name, father_cnic, father_mobile_no, student_image
+//     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+//   `;
+
+//   const values = [
+//     register_no, old_register_no, shift, admission_date, full_name, gender,
+//     class_id, section_id, dob, religion, cast, blood_group, mother_tongue,
+//     current_address, permanent_address, mobile_no, student_cnic, category_id,
+//     house_id, club_id, guardian_name, relation, occupation, guardian_mobile_no,
+//     guardian_address, guardian_cnic, pl_no, designation, department, session_id, campus_id, user_id, status, father_name, father_cnic, father_mobile_no, student_image
+//   ];
+
+//   connection.query(query, values, (err, result) => {
+//     if (err) throw err;
+//     res.json({ message: 'Data saved successfully!' });
+//   });
+// });
+
+// app.get('/admission-list', (req, res) => {
+//   // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+
+//   // Additional filters
+//   const from_date = req.query.from_date;
+//   const to_date = req.query.to_date;
+//   const class_id = req.query.class_id;
+//   const section_id = req.query.section_id;
+//   const category_id = req.query.category_id;
+//   const status = req.query.status;
+//   const search = req.query.search;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching admissions' });
+//       return;
+//     }
+
+//     let sql = `
+//         SELECT
+//             students.id,
+//             students.shift,
+//             students.register_no,
+//             students.old_register_no,
+//             students.full_name,
+//             classes.class,
+//             sections.section_name,
+//             students.father_name,
+//             students.father_cnic,
+//             school_categories.category,
+//             students.mobile_no,
+//             students.status,
+//             students.campus_id
+//         FROM
+//             students
+//         LEFT JOIN
+//             classes ON students.class_id = classes.id
+//         LEFT JOIN
+//             sections ON students.section_id = sections.id
+//         LEFT JOIN
+//             school_categories ON students.category_id = school_categories.id
+//         WHERE
+//             students.session_id = ? AND students.campus_id = ?
+//         `;
+
+//     const params = [session_id, campus_id];
+
+//     if (from_date && to_date) {
+//       sql += ` AND students.created_at BETWEEN ? AND ?`;
+//       params.push(from_date, to_date);
+//     }
+
+//     if (class_id) {
+//       sql += ` AND students.class_id = ?`;
+//       params.push(class_id);
+//     }
+
+//     if (section_id) {
+//       sql += ` AND students.section_id = ?`;
+//       params.push(section_id);
+//     }
+
+//     if (category_id) {
+//       sql += ` AND students.category_id = ?`;
+//       params.push(category_id);
+//     }
+
+//     if (status) {
+//       sql += ` AND students.status = ?`;
+//       params.push(status);
+//     }
+
+//     if (search) {
+//       sql += ` AND (
+//                 students.full_name LIKE ? OR
+//                 students.father_name LIKE ? OR
+//                 students.register_no LIKE ? OR
+//                 students.father_cnic LIKE ? OR
+//                 students.mobile_no LIKE ?
+//               )`;
+//       const searchQuery = `%${search}%`;
+//       params.push(searchQuery, searchQuery, searchQuery, searchQuery, searchQuery);
+//     }
+
+//     sql += `
+//         ORDER BY
+//             students.id DESC
+//         LIMIT ?
+//         OFFSET ?;
+//         `;
+//     params.push(limit, offset);
+
+//     let countSql = `
+//         SELECT
+//             COUNT(*) as total
+//         FROM
+//             students
+//         LEFT JOIN
+//             classes ON students.class_id = classes.id
+//         LEFT JOIN
+//             sections ON students.section_id = sections.id
+//         LEFT JOIN
+//             school_categories ON students.category_id = school_categories.id
+//         WHERE
+//             students.session_id = ? AND students.campus_id = ?
+//         `;
+
+//     const countParams = [session_id, campus_id];
+
+//     if (from_date && to_date) {
+//       countSql += ` AND students.created_at BETWEEN ? AND ?`;
+//       countParams.push(from_date, to_date);
+//     }
+
+//     if (class_id) {
+//       countSql += ` AND students.class_id = ?`;
+//       countParams.push(class_id);
+//     }
+
+//     if (section_id) {
+//       countSql += ` AND students.section_id = ?`;
+//       countParams.push(section_id);
+//     }
+
+//     if (category_id) {
+//       countSql += ` AND students.category_id = ?`;
+//       countParams.push(category_id);
+//     }
+
+//     if (status) {
+//       countSql += ` AND students.status = ?`;
+//       countParams.push(status);
+//     }
+
+//     if (search) {
+//       countSql += ` AND (
+//                     students.full_name LIKE ? OR
+//                     students.father_name LIKE ? OR
+//                     students.register_no LIKE ? OR
+//                     students.father_cnic LIKE ? OR
+//                     students.mobile_no LIKE ?
+//                   )`;
+//       const searchQuery = `%${search}%`;
+//       countParams.push(searchQuery, searchQuery, searchQuery, searchQuery, searchQuery);
+//     }
+
+//     // Execute both queries in parallel
+//     Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(sql, params, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(countSql, countParams, (countError, countResult) => {
+//           if (countError) {
+//             reject(countError);
+//           } else {
+//             resolve(countResult[0].total);
+//           }
+//         });
+//       })
+//     ]).then(([results, totalCategories]) => {
+//       connection.release(); // Release the connection
+
+//       // Calculate total pages based on total count and limit
+//       const totalPages = Math.ceil(totalCategories / limit);
+
+//       // Send paginated results and pagination metadata as JSON
+//       res.json({
+//         totalCategories,
+//         currentPage: page,
+//         totalPages,
+//         results
+//       });
+//     }).catch(error => {
+//       console.error('Error executing SQL query: ', error);
+//       res.status(500).json({ error: 'Internal server error' });
+//       connection.release(); // Release the connection
+//     });
+//   });
+// });
+
+// app.get('/admission-list', (req, res) => {
+//   // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+
+//   // Additional filters
+//   const from_date = req.query.from_date;
+//   const to_date = req.query.to_date;
+//   const class_id = req.query.class_id;
+//   const section_id = req.query.section_id;
+//   const category_id = req.query.category_id;
+//   const status = req.query.status;
+//   const search = req.query.search;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching admissions' });
+//       return;
+//     }
+
+//     let sql = `
+//         SELECT
+//             students.id,
+//             students.shift,
+//             students.register_no,
+//             students.old_register_no,
+//             students.full_name,
+//             classes.class,
+//             sections.section_name,
+//             students.father_name,
+//             students.father_cnic,
+//             school_categories.category,
+//             students.mobile_no,
+//             students.status,
+//             students.campus_id,
+//             students.session_id
+//         FROM
+//             students
+//         LEFT JOIN
+//             classes ON students.class_id = classes.id
+//         LEFT JOIN
+//             sections ON students.section_id = sections.id
+//         LEFT JOIN
+//             school_categories ON students.category_id = school_categories.id
+//         WHERE
+//             students.status_on_off = 'On' AND students.session_id = ?  AND students.campus_id = ?
+//         `;
+
+//     const params = [session_id, campus_id];
+
+//     if (from_date && to_date) {
+//       sql += ` AND students.created_at BETWEEN ? AND ?`;
+//       params.push(from_date, to_date);
+//     }
+
+//     if (class_id) {
+//       sql += ` AND students.class_id = ?`;
+//       params.push(class_id);
+//     }
+
+//     if (section_id) {
+//       sql += ` AND students.section_id = ?`;
+//       params.push(section_id);
+//     }
+
+//     if (category_id) {
+//       sql += ` AND students.category_id = ?`;
+//       params.push(category_id);
+//     }
+
+//     if (status) {
+//       sql += ` AND students.status = ?`;
+//       params.push(status);
+//     }
+
+//     if (search) {
+//       sql += ` AND (
+//                 students.full_name LIKE ? OR
+//                 students.father_name LIKE ? OR
+//                 students.register_no LIKE ? OR
+//                 students.father_cnic LIKE ? OR
+//                 students.mobile_no LIKE ?
+//               )`;
+//       const searchQuery = `%${search}%`;
+//       params.push(searchQuery, searchQuery, searchQuery, searchQuery, searchQuery);
+//     }
+
+//     sql += `
+//         ORDER BY
+//             students.id DESC
+//         LIMIT ?
+//         OFFSET ?;
+//         `;
+//     params.push(limit, offset);
+
+//     let countSql = `
+//         SELECT
+//             COUNT(*) as total
+//         FROM
+//             students
+//         JOIN school_categories
+//         school_categories.id =  students.category_id
+//         WHERE
+//             students.status_on_off = 'On' AND students.session_id = ? AND students.campus_id = ?
+//         `;
+
+//     const countParams = [session_id, campus_id];
+
+//     if (from_date && to_date) {
+//       countSql += ` AND students.created_at BETWEEN ? AND ?`;
+//       countParams.push(from_date, to_date);
+//     }
+
+//     if (class_id) {
+//       countSql += ` AND students.class_id = ?`;
+//       countParams.push(class_id);
+//     }
+
+//     if (section_id) {
+//       countSql += ` AND students.section_id = ?`;
+//       countParams.push(section_id);
+//     }
+
+//     if (category_id) {
+//       countSql += ` AND students.category_id = ?`;
+//       countParams.push(category_id);
+//     }
+
+//     if (status) {
+//       countSql += ` AND students.status = ?`;
+//       countParams.push(status);
+//     }
+
+//     if (search) {
+//       countSql += ` AND (
+//                     students.full_name LIKE ? OR
+//                     students.father_name LIKE ? OR
+//                     students.register_no LIKE ? OR
+//                     students.father_cnic LIKE ? OR
+//                     students.mobile_no LIKE ?
+//                   )`;
+//       const searchQuery = `%${search}%`;
+//       countParams.push(searchQuery, searchQuery, searchQuery, searchQuery, searchQuery);
+//     }
+
+//     // Execute both queries in parallel
+//     Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(sql, params, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(countSql, countParams, (countError, countResult) => {
+//           if (countError) {
+//             reject(countError);
+//           } else {
+//             resolve(countResult[0].total);
+//           }
+//         });
+//       })
+//     ]).then(([results, totalCategories]) => {
+//       connection.release(); // Release the connection
+
+//       // Calculate total pages based on total count and limit
+//       const totalPages = Math.ceil(totalCategories / limit);
+
+//       // Send paginated results and pagination metadata as JSON
+//       res.json({
+//         totalCategories,
+//         currentPage: page,
+//         totalPages,
+//         results
+//       });
+//     }).catch(error => {
+//       console.error('Error executing SQL query: ', error);
+//       res.status(500).json({ error: 'Internal server error' });
+//       connection.release(); // Release the connection
+//     });
+//   });
+// });
+
+
+
+
+// app.get("/admission-list", (req, res) => {
+//   // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+
+//   // Additional filters
+//   const from_date = req.query.from_date;
+//   const to_date = req.query.to_date;
+//   const class_id = req.query.class_id;
+//   const section_id = req.query.section_id;
+//   const category_id = req.query.category_id;
+//   const status = req.query.status;
+//   const search = req.query.search;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching admissions" });
+//       return;
+//     }
+
+//     // SQL query to fetch the student data with pagination
+//     let sql = `
+//         SELECT 
+//             students.id,
+//             students.shift,
+//             students.register_no,
+//             students.old_register_no,
+//             students.full_name,
+//             classes.class,
+//             sections.section_name,
+//             students.father_name,
+//             students.father_cnic,
+//             school_categories.category,
+//             students.mobile_no,
+//             students.status,
+//             students.campus_id,
+//             students.session_id
+//         FROM 
+//             students
+//         LEFT JOIN 
+//             classes ON students.class_id = classes.id 
+//         LEFT JOIN 
+//             sections ON students.section_id = sections.id
+//         LEFT JOIN 
+//             school_categories ON students.category_id = school_categories.id
+//         WHERE 
+//             students.status_on_off = 'On' 
+//             AND students.session_id = ? 
+//             AND students.campus_id = ?`;
+
+//     const params = [session_id, campus_id];
+
+//     // Apply additional filters if provided
+//     if (from_date && to_date) {
+//       sql += ` AND students.created_at BETWEEN ? AND ?`;
+//       params.push(from_date, to_date);
+//     }
+
+//     if (class_id) {
+//       sql += ` AND students.class_id = ?`;
+//       params.push(class_id);
+//     }
+
+//     if (section_id) {
+//       sql += ` AND students.section_id = ?`;
+//       params.push(section_id);
+//     }
+
+//     if (category_id) {
+//       sql += ` AND students.category_id = ?`;
+//       params.push(category_id);
+//     }
+
+//     if (status) {
+//       sql += ` AND students.status = ?`;
+//       params.push(status);
+//     }
+
+//     if (search) {
+//       sql += ` AND (
+//                 students.full_name LIKE ? OR 
+//                 students.father_name LIKE ? OR 
+//                 students.register_no LIKE ? OR 
+//                 students.father_cnic LIKE ? OR 
+//                 students.mobile_no LIKE ?
+//               )`;
+//       const searchQuery = `%${search}%`;
+//       params.push(
+//         searchQuery,
+//         searchQuery,
+//         searchQuery,
+//         searchQuery,
+//         searchQuery
+//       );
+//     }
+
+//     sql += `
+//         ORDER BY 
+//             students.id DESC
+//         LIMIT ? 
+//         OFFSET ?;
+//         `;
+//     params.push(limit, offset);
+
+//     // SQL query to count total students with the same filters
+//     let countSql = `
+//         SELECT 
+//             COUNT(*) as total
+//         FROM 
+//             students
+//         WHERE 
+//             students.status_on_off = 'On' 
+//             AND students.session_id = ? 
+//             AND students.campus_id = ?`;
+
+//     const countParams = [session_id, campus_id];
+
+//     // Apply the same filters to the count query
+//     if (from_date && to_date) {
+//       countSql += ` AND students.created_at BETWEEN ? AND ?`;
+//       countParams.push(from_date, to_date);
+//     }
+
+//     if (class_id) {
+//       countSql += ` AND students.class_id = ?`;
+//       countParams.push(class_id);
+//     }
+
+//     if (section_id) {
+//       countSql += ` AND students.section_id = ?`;
+//       countParams.push(section_id);
+//     }
+
+//     if (category_id) {
+//       countSql += ` AND students.category_id = ?`;
+//       countParams.push(category_id);
+//     }
+
+//     if (status) {
+//       countSql += ` AND students.status = ?`;
+//       countParams.push(status);
+//     }
+
+//     if (search) {
+//       countSql += ` AND (
+//                     students.full_name LIKE ? OR 
+//                     students.father_name LIKE ? OR 
+//                     students.register_no LIKE ? OR 
+//                     students.father_cnic LIKE ? OR 
+//                     students.mobile_no LIKE ?
+//                   )`;
+//       countParams.push(
+//         searchQuery,
+//         searchQuery,
+//         searchQuery,
+//         searchQuery,
+//         searchQuery
+//       );
+//     }
+
+//     // Execute both queries in parallel
+//     Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(sql, params, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(countSql, countParams, (countError, countResult) => {
+//           if (countError) {
+//             reject(countError);
+//           } else {
+//             resolve(countResult);
+//           }
+//         });
+//       }),
+//     ])
+//       .then(([results, countResult]) => {
+//         connection.release(); // Release the connection
+
+//         // Get the total count of students
+//         const overallTotal = countResult[0].total;
+//         const totalPages = Math.ceil(overallTotal / limit);
+
+//         // Send paginated results and pagination metadata as JSON
+//         res.json({
+//           overallTotal,
+//           currentPage: page,
+//           totalPages,
+//           results,
+//         });
+//       })
+//       .catch((error) => {
+//         console.error("Error executing SQL query: ", error);
+//         res.status(500).json({ error: "Internal server error" });
+//         connection.release(); // Release the connection
+//       });
+//   });
+// });
+
+
+
+
+
+app.get("/admission-list", (req, res) => {
+  // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+
+  // Additional filters
+  const from_date = req.query.from_date;
+  const to_date = req.query.to_date;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const category_id = req.query.category_id;
+  const status = req.query.status;
+  const search = req.query.search;
+  const shift = req.query.shift;
+
+   const user_id = req.query.user_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching admissions" });
+      return;
+    }
+
+    // SQL query to fetch the student data with pagination
+    let sql = `
+        SELECT 
+            students.id,
+            students.shift,
+            students.register_no,
+            students.old_register_no,
+            students.full_name,
+            classes.class,
+            sections.section_name,
+            students.father_name,
+            students.father_cnic,
+            school_categories.category,
+            students.mobile_no,
+            students.status,
+            students.campus_id,
+            students.session_id
+        FROM 
+            students
+        LEFT JOIN 
+            classes ON students.class_id = classes.id 
+        LEFT JOIN 
+            sections ON students.section_id = sections.id
+        LEFT JOIN 
+            school_categories ON students.category_id = school_categories.id
+        WHERE 
+            students.status_on_off = 'On' 
+            AND students.session_id = ? 
+            AND students.campus_id = ?`;
+
+    const params = [session_id, campus_id];
+    const searchQuery = search ? `%${search}%` : null;
+
+    // Apply additional filters if provided
+    // if (from_date && to_date) {
+    //   sql += ` AND students.admission_date BETWEEN ? AND ?`;
+    //   params.push(from_date, to_date);
+    // }
+
+      // Apply additional filters if provided
+    if (from_date && to_date && (status == 'New Admission' || status == 'Promoted')) {
+      sql += ` AND students.admission_date BETWEEN ? AND ?`;
+      params.push(from_date, to_date);
+    } else if (from_date && to_date && (status == 'Struck Off' || status == 'SLC')){
+      sql += ` AND students.status_date BETWEEN ? AND ?`;
+      params.push(from_date, to_date);
+
+     }else if (from_date && to_date){
+      sql += ` AND students.admission_date BETWEEN ? AND ?`;
+      params.push(from_date, to_date);
+
+     }
+
+
+     
+
+
+    if (class_id) {
+      sql += ` AND students.class_id = ?`;
+      params.push(class_id);
+    }
+
+    if (section_id) {
+      sql += ` AND students.section_id = ?`;
+      params.push(section_id);
+    }
+
+    if (shift) {
+      sql += ` AND students.shift = ?`;
+      params.push(shift);
+    }
+
+    if (category_id) {
+      sql += ` AND students.category_id = ?`;
+      params.push(category_id);
+    }
+
+    if (status) {
+      sql += ` AND students.status = ?`;
+      params.push(status);
+    }
+
+    if (search) {
+      sql += ` AND (
+                students.full_name LIKE ? OR 
+                students.father_name LIKE ? OR 
+                students.register_no LIKE ? OR 
+                students.father_cnic LIKE ? OR 
+                students.mobile_no LIKE ?
+              )`;
+      params.push(
+        searchQuery,
+        searchQuery,
+        searchQuery,
+        searchQuery,
+        searchQuery
+      );
+    }
+
+    sql += `
+        ORDER BY 
+            students.id DESC
+        LIMIT ? 
+        OFFSET ?;
+        `;
+    params.push(limit, offset);
+
+    // SQL query to count total students with the same filters
+    let countSql = `
+        SELECT 
+            COUNT(*) as total
+        FROM 
+            students
+        WHERE 
+            students.status_on_off = 'On' 
+            AND students.session_id = ? 
+            AND students.campus_id = ?`;
+
+    const countParams = [session_id, campus_id];
+
+    // Apply the same filters to the count query
+    if (from_date && to_date) {
+      countSql += ` AND students.created_at BETWEEN ? AND ?`;
+      countParams.push(from_date, to_date);
+    }
+
+    if (class_id) {
+      countSql += ` AND students.class_id = ?`;
+      countParams.push(class_id);
+    }
+
+    if (section_id) {
+      countSql += ` AND students.section_id = ?`;
+      countParams.push(section_id);
+    }
+
+
+    if (shift) {
+      countSql += ` AND students.shift = ?`;
+      countParams.push(shift);
+    }
+
+    if (category_id) {
+      countSql += ` AND students.category_id = ?`;
+      countParams.push(category_id);
+    }
+
+    if (status) {
+      countSql += ` AND students.status = ?`;
+      countParams.push(status);
+    }
+
+    if (search) {
+      countSql += ` AND (
+                    students.full_name LIKE ? OR 
+                    students.father_name LIKE ? OR 
+                    students.register_no LIKE ? OR 
+                    students.father_cnic LIKE ? OR 
+                    students.mobile_no LIKE ?
+                  )`;
+      countParams.push(
+        searchQuery,
+        searchQuery,
+        searchQuery,
+        searchQuery,
+        searchQuery
+      );
+    }
+
+    // Execute both queries in parallel
+    Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(countSql, countParams, (countError, countResult) => {
+          if (countError) {
+            reject(countError);
+          } else {
+            resolve(countResult);
+          }
+        });
+      }),
+    ])
+      .then(([results, countResult]) => {
+        connection.release(); // Release the connection
+
+        // Get the total count of students
+        const overallTotal = countResult[0].total;
+        const totalPages = Math.ceil(overallTotal / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          overallTotal,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+
+
+          // logAction('VIEW', 'students', 0, user_id, campus_id, session_id);
+
+      })
+      .catch((error) => {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+      });
+  });
+});
+
+
+
+
+app.get("/student-id-card-generate", (req, res) => {
+  // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const shift = req.query.shift;
+
+  
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching admissions" });
+      return;
+    }
+
+    // SQL query to fetch the student data with pagination
+    let sql = `
+        SELECT 
+            students.id,
+            students.shift,
+            students.register_no,
+            students.old_register_no,
+            students.full_name,
+            classes.class,
+            sections.section_name,
+            students.father_name,
+            students.father_cnic,
+            school_categories.category,
+            students.mobile_no,
+            students.status,
+            students.campus_id,
+            students.session_id
+        FROM 
+            students
+        LEFT JOIN 
+            classes ON students.class_id = classes.id 
+        LEFT JOIN 
+            sections ON students.section_id = sections.id
+        LEFT JOIN 
+            school_categories ON students.category_id = school_categories.id
+        WHERE 
+            students.status_on_off = 'On' 
+            AND students.status IN ('New Admission', 'Promoted') 
+            AND students.session_id = ? 
+            AND students.campus_id = ?`;
+
+    const params = [session_id, campus_id];
+
+    if (class_id) {
+      sql += ` AND students.class_id = ?`;
+      params.push(class_id);
+    }
+
+    if (section_id) {
+      sql += ` AND students.section_id = ?`;
+      params.push(section_id);
+    }
+
+    if (shift) {
+      sql += ` AND students.shift = ?`;
+      params.push(shift);
+    } 
+
+    sql += `
+        ORDER BY 
+            students.id DESC
+        `;
+
+    // params.push(limit, offset);
+
+    // SQL query to count total students with the same filters
+    let countSql = `
+        SELECT 
+            COUNT(*) as total
+        FROM 
+            students
+        WHERE 
+            students.status_on_off = 'On' 
+            AND students.session_id = ? 
+            AND students.campus_id = ?`;
+
+    const countParams = [session_id, campus_id];
+
+    if (class_id) {
+      countSql += ` AND students.class_id = ?`;
+      countParams.push(class_id);
+    }
+
+    if (section_id) {
+      countSql += ` AND students.section_id = ?`;
+      countParams.push(section_id);
+    }
+
+    if (shift) {
+      countSql += ` AND students.shift = ?`;
+      countParams.push(shift);
+    }
+
+
+    // Execute both queries in parallel
+    Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(countSql, countParams, (countError, countResult) => {
+          if (countError) {
+            reject(countError);
+          } else {
+            resolve(countResult);
+          }
+        });
+      }),
+    ])
+      .then(([results, countResult]) => {
+        connection.release(); // Release the connection
+
+        // Get the total count of students
+        const overallTotal = countResult[0].total;
+        const totalPages = Math.ceil(overallTotal / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          overallTotal,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      })
+      .catch((error) => {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+      });
+  });
+});
+
+
+
+
+
+app.get("/employee-id-card-generate", (req, res) => {
+  // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const campus_id = req.query.campus_id;
+  const shift = req.query.shift;
+  
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching admissions" });
+      return;
+    }
+
+    // SQL query to fetch the student data with pagination
+    let sql = `
+    SELECT 
+        school_employees.*,
+        employee_roles.employee_role,
+        employee_posts.employee_post,
+        pay_scale.pay_scale,
+        pay_scale.job_type
+    FROM 
+        school_employees
+     JOIN 
+        employee_roles ON school_employees.employee_role_id = employee_roles.id 
+     JOIN 
+        employee_posts ON school_employees.employee_post_id = employee_posts.id
+     JOIN 
+        pay_scale ON school_employees.pay_scale_id = pay_scale.id
+     WHERE 
+      school_employees.soft_delete = 'On' AND school_employees.campus_id = ?
+    `;
+
+    const params = [campus_id];
+
+    if (shift) {
+      sql += ` AND school_employees.work_shift = ?`;
+      params.push(shift);
+    } 
+
+    sql += `
+        ORDER BY 
+            school_employees.id DESC`;
+
+    // params.push(limit, offset);
+
+    // SQL query to count total students with the same filters
+    let countSql = `
+        SELECT 
+            COUNT(*) as total
+        FROM 
+            school_employees
+        
+        WHERE 
+      school_employees.soft_delete = 'On' AND school_employees.campus_id = ?`;
+
+      const countParams = [campus_id];
+
+    if (shift) {
+      countSql += ` AND school_employees.work_shift = ?`;
+      countParams.push(shift);
+    }
+
+
+    // Execute both queries in parallel
+    Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(countSql, countParams, (countError, countResult) => {
+          if (countError) {
+            reject(countError);
+          } else {
+            resolve(countResult);
+          }
+        });
+      }),
+    ])
+      .then(([results, countResult]) => {
+        connection.release(); // Release the connection
+
+        // Get the total count of students
+        const overallTotal = countResult[0].total;
+        const totalPages = 0;
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          results,
+        });
+      })
+      .catch((error) => {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+      });
+  });
+});
+
+
+
+
+// app.get('/admission-list', (req, res) => {
+//   // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+
+//   // Additional filters
+//   const from_date = req.query.from_date;
+//   const to_date = req.query.to_date;
+//   const class_id = req.query.class_id;
+//   const section_id = req.query.section_id;
+//   const category_id = req.query.category_id;
+//   const status = req.query.status;
+//   const search = req.query.search;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching admissions' });
+//       return;
+//     }
+
+//     let sql = `
+//         SELECT
+//             students.id,
+//             students.shift,
+//             students.register_no,
+//             students.old_register_no,
+//             students.full_name,
+//             classes.class,
+//             sections.section_name,
+//             students.father_name,
+//             students.father_cnic,
+//             school_categories.category,
+//             students.mobile_no,
+//             students.status,
+//             students.campus_id,
+//             students.session_id
+//         FROM
+//             students
+//         LEFT JOIN
+//             classes ON students.class_id = classes.id
+//         LEFT JOIN
+//             sections ON students.section_id = sections.id
+//         LEFT JOIN
+//             school_categories ON students.category_id = school_categories.id
+//         WHERE
+//             students.status_on_off = 'On' AND students.session_id = ? AND students.campus_id = ?
+//         `;
+
+//     const params = [session_id, campus_id];
+
+//     if (from_date && to_date) {
+//       sql += ` AND students.created_at BETWEEN ? AND ?`;
+//       params.push(from_date, to_date);
+//     }
+
+//     if (class_id) {
+//       sql += ` AND students.class_id = ?`;
+//       params.push(class_id);
+//     }
+
+//     if (section_id) {
+//       sql += ` AND students.section_id = ?`;
+//       params.push(section_id);
+//     }
+
+//     if (category_id) {
+//       sql += ` AND students.category_id = ?`;
+//       params.push(category_id);
+//     }
+
+//     if (status) {
+//       sql += ` AND students.status = ?`;
+//       params.push(status);
+//     }
+
+//     if (search) {
+//       sql += ` AND (
+//                 students.full_name LIKE ? OR
+//                 students.father_name LIKE ? OR
+//                 students.register_no LIKE ? OR
+//                 students.father_cnic LIKE ? OR
+//                 students.mobile_no LIKE ?
+//               )`;
+//       const searchQuery = `%${search}%`;
+//       params.push(searchQuery, searchQuery, searchQuery, searchQuery, searchQuery);
+//     }
+
+//     sql += `
+//         ORDER BY
+//             students.id DESC
+//         LIMIT ?
+//         OFFSET ?;
+//         `;
+//     params.push(limit, offset);
+
+//     let countSql = `
+//         SELECT
+//             COUNT(*) as total
+//         FROM
+//             students
+//         WHERE
+//             students.status_on_off = 'On'
+//             AND students.session_id = ?
+//             AND students.campus_id = ?`;
+
+//     const countParams = [session_id, campus_id];
+
+//     if (from_date && to_date) {
+//       countSql += ` AND students.created_at BETWEEN ? AND ?`;
+//       countParams.push(from_date, to_date);
+//     }
+
+//     if (class_id) {
+//       countSql += ` AND students.class_id = ?`;
+//       countParams.push(class_id);
+//     }
+
+//     if (section_id) {
+//       countSql += ` AND students.section_id = ?`;
+//       countParams.push(section_id);
+//     }
+
+//     if (category_id) {
+//       countSql += ` AND students.category_id = ?`;
+//       countParams.push(category_id);
+//     }
+
+//     if (status) {
+//       countSql += ` AND students.status = ?`;
+//       countParams.push(status);
+//     }
+
+//     if (search) {
+//       countSql += ` AND (
+//                     students.full_name LIKE ? OR
+//                     students.father_name LIKE ? OR
+//                     students.register_no LIKE ? OR
+//                     students.father_cnic LIKE ? OR
+//                     students.mobile_no LIKE ?
+//                   )`;
+//       const searchQuery = `%${search}%`;
+//       countParams.push(searchQuery, searchQuery, searchQuery, searchQuery, searchQuery);
+//     }
+
+//     countSql += `
+//         WITH ROLLUP;
+//     `;
+
+//     // Execute both queries in parallel
+//     Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(sql, params, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(countSql, countParams, (countError, countResult) => {
+//           if (countError) {
+//             reject(countError);
+//           } else {
+//             resolve(countResult);
+//           }
+//         });
+//       })
+//     ]).then(([results, countResult]) => {
+//       connection.release(); // Release the connection
+
+//       // Log the count result for debugging
+//       console.log('Count Result:', countResult);
+
+//       // Calculate total pages based on total count and limit
+//       const overallTotalRow = countResult.find(row => row.category === null);
+//       const overallTotal = overallTotalRow ? overallTotalRow.total : 0;
+//       const totalPages = Math.ceil(overallTotal / limit);
+
+//       // Send paginated results and pagination metadata as JSON
+//       res.json({
+//         overallTotal,
+//         currentPage: page,
+//         totalPages,
+//         results
+//       });
+//     }).catch(error => {
+//       console.error('Error executing SQL query: ', error);
+//       res.status(500).json({ error: 'Internal server error' });
+//       connection.release(); // Release the connection
+//     });
+//   });
+// });
+
+//start from employee list
+// app.get('/employee-list', (req, res) => {
+//   // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+
+//   // Additional filters
+//   const from_date = req.query.from_date;
+//   const to_date = req.query.to_date;
+//   const role_id = req.query.role;
+//   const post_id = req.query.post;
+//   const pay_scale_id = req.query.scale;
+//   const status = req.query.status;
+//   const search = req.query.search;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching admissions' });
+//       return;
+//     }
+
+//     let sql = `
+//         SELECT
+//             school_employees.*
+//         FROM
+//             school_employees
+//         LEFT JOIN
+//             employee_roles ON school_employees.employee_role_id = employee_roles.id
+//         LEFT JOIN
+//             employee_post ON school_employees.employee_post_id = employee_posts.id
+//         LEFT JOIN
+//             pay_scale ON school_employees.pay_scale_id = pay_scale.id
+//         WHERE
+//            school_employees.status = 'On' AND students.campus_id = ?
+//         `;
+
+//     const params = [campus_id];
+
+//     if (from_date && to_date) {
+//       sql += ` AND school_employees.register_no BETWEEN ? AND ?`;
+//       params.push(from_date, to_date);
+//     }
+
+//     if (role_id) {
+//       sql += ` AND school_employees.employee_role_id = ?`;
+//       params.push(role_id);
+//     }
+
+//     if (post_id) {
+//       sql += ` AND school_employees.employee_post_id = ?`;
+//       params.push(post_id);
+//     }
+
+//     if (pay_scale_id) {
+//       sql += ` AND school_employees.pay_scale_id = ?`;
+//       params.push(scale_id);
+//     }
+
+//     if (status) {
+//       sql += ` AND school_employees.status = ?`;
+//       params.push(status);
+//     }
+
+//     if (search) {
+//       sql += ` AND (
+//                 school_employees.full_name LIKE ? OR
+//                 school_employees.father_name LIKE ? OR
+//                 school_employees.register_no LIKE ? OR
+//                 school_employees.mobile_no LIKE ? OR
+//                 school_employees.cnic LIKE ?
+//               )`;
+//       const searchQuery = `%${search}%`;
+//       params.push(searchQuery, searchQuery, searchQuery, searchQuery, searchQuery);
+//     }
+
+//     sql += `
+//         ORDER BY
+//             school_employees.id DESC
+//         LIMIT ?
+//         OFFSET ?;
+//         `;
+//     params.push(limit, offset);
+
+//     let countSql = `
+//         SELECT
+//             COUNT(*) as total,
+//             school_categories.category,
+//             COUNT(students.id) as category_count
+//         FROM
+//             students
+//         JOIN
+//             school_categories ON school_categories.id = students.category_id
+//         WHERE
+//             students.status_on_off = 'On'
+//             AND students.session_id = ?
+//             AND students.campus_id = ?
+//     `;
+
+//     const countParams = [session_id, campus_id];
+
+//     if (from_date && to_date) {
+//       countSql += ` AND students.created_at BETWEEN ? AND ?`;
+//       countParams.push(from_date, to_date);
+//     }
+
+//     if (class_id) {
+//       countSql += ` AND students.class_id = ?`;
+//       countParams.push(class_id);
+//     }
+
+//     if (section_id) {
+//       countSql += ` AND students.section_id = ?`;
+//       countParams.push(section_id);
+//     }
+
+//     if (category_id) {
+//       countSql += ` AND students.category_id = ?`;
+//       countParams.push(category_id);
+//     }
+
+//     if (status) {
+//       countSql += ` AND students.status = ?`;
+//       countParams.push(status);
+//     }
+
+//     if (search) {
+//       countSql += ` AND (
+//                     students.full_name LIKE ? OR
+//                     students.father_name LIKE ? OR
+//                     students.register_no LIKE ? OR
+//                     students.father_cnic LIKE ? OR
+//                     students.mobile_no LIKE ?
+//                   )`;
+//       const searchQuery = `%${search}%`;
+//       countParams.push(searchQuery, searchQuery, searchQuery, searchQuery, searchQuery);
+//     }
+
+//     countSql += `
+//         GROUP BY
+//             school_categories.category
+//         WITH ROLLUP;
+//     `;
+
+//     // Execute both queries in parallel
+//     Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(sql, params, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(countSql, countParams, (countError, countResult) => {
+//           if (countError) {
+//             reject(countError);
+//           } else {
+//             resolve(countResult);
+//           }
+//         });
+//       })
+//     ]).then(([results, countResult]) => {
+//       connection.release(); // Release the connection
+
+//       // Log the count result for debugging
+//       console.log('Count Result:', countResult);
+
+//       // Calculate total pages based on total count and limit
+//       const overallTotalRow = countResult.find(row => row.category === null);
+//       const overallTotal = overallTotalRow ? overallTotalRow.total : 0;
+//       const totalPages = Math.ceil(overallTotal / limit);
+//       const categoryCounts = countResult.filter(row => row.category !== null);
+
+//       // Send paginated results and pagination metadata as JSON
+//       res.json({
+//         overallTotal,
+//         categoryCounts,
+//         currentPage: page,
+//         totalPages,
+//         results
+//       });
+//     }).catch(error => {
+//       console.error('Error executing SQL query: ', error);
+//       res.status(500).json({ error: 'Internal server error' });
+//       connection.release(); // Release the connection
+//     });
+//   });
+// });
+
+app.get("/employee-list", (req, res) => {
+  // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+
+  // Additional filters
+  const from_date = req.query.from_date;
+  const to_date = req.query.to_date;
+  const role_id = req.query.role_id;
+  const post_id = req.query.post_id;
+  const pay_scale_id = req.query.pay_scale_id;
+  const status = req.query.status;
+  const search = req.query.search;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching employee data" });
+      return;
+    }
+
+    let sql = `
+        SELECT 
+            school_employees.*,
+            employee_roles.employee_role,
+            employee_posts.employee_post,
+            pay_scale.pay_scale,
+            pay_scale.job_type
+        FROM 
+            school_employees
+         JOIN 
+            employee_roles ON school_employees.employee_role_id = employee_roles.id 
+         JOIN 
+            employee_posts ON school_employees.employee_post_id = employee_posts.id
+         JOIN 
+            pay_scale ON school_employees.pay_scale_id = pay_scale.id
+         WHERE 
+          school_employees.soft_delete = 'On' AND school_employees.campus_id = ?
+        `;
+
+    const params = [campus_id];
+
+    if (from_date && to_date) {
+      sql += ` AND school_employees.appointment_date BETWEEN ? AND ?`;
+      params.push(from_date, to_date);
+    }
+
+    if (role_id) {
+      sql += ` AND school_employees.employee_role_id = ?`;
+      params.push(role_id);
+    }
+
+    if (post_id) {
+      sql += ` AND school_employees.employee_post_id = ?`;
+      params.push(post_id);
+    }
+
+    if (pay_scale_id) {
+      sql += ` AND school_employees.pay_scale_id = ?`;
+      params.push(pay_scale_id);
+    }
+
+    if (status) {
+      sql += ` AND school_employees.status = ?`;
+      params.push(status);
+    }
+
+    if (search) {
+      sql += ` AND (
+                school_employees.full_name LIKE ? OR 
+                school_employees.father_name LIKE ? OR 
+                school_employees.register_no LIKE ? OR 
+                school_employees.mobile_no LIKE ? OR 
+                school_employees.cnic LIKE ?
+              )`;
+      const searchQuery = `%${search}%`;
+      params.push(
+        searchQuery,
+        searchQuery,
+        searchQuery,
+        searchQuery,
+        searchQuery
+      );
+    }
+
+    sql += `
+        ORDER BY 
+            school_employees.id DESC
+        LIMIT ? 
+        OFFSET ?;
+        `;
+    params.push(limit, offset);
+
+    // New count query for school_employees
+    let countSql = `
+        SELECT 
+            COUNT(*) as total
+        FROM 
+            school_employees
+        WHERE 
+            school_employees.status = 'On' AND school_employees.campus_id = ?
+    `;
+
+    const countParams = [campus_id];
+
+    if (from_date && to_date) {
+      countSql += ` AND school_employees.appointment_date BETWEEN ? AND ?`;
+      countParams.push(from_date, to_date);
+    }
+
+    if (role_id) {
+      countSql += ` AND school_employees.employee_role_id = ?`;
+      countParams.push(role_id);
+    }
+
+    if (post_id) {
+      countSql += ` AND school_employees.employee_post_id = ?`;
+      countParams.push(post_id);
+    }
+
+    if (pay_scale_id) {
+      countSql += ` AND school_employees.pay_scale_id = ?`;
+      countParams.push(pay_scale_id);
+    }
+
+    if (status) {
+      countSql += ` AND school_employees.status = ?`;
+      countParams.push(status);
+    }
+
+    if (search) {
+      countSql += ` AND (
+                    school_employees.full_name LIKE ? OR 
+                    school_employees.father_name LIKE ? OR 
+                    school_employees.register_no LIKE ? OR 
+                    school_employees.mobile_no LIKE ? OR 
+                    school_employees.cnic LIKE ?
+                  )`;
+      const searchQuery = `%${search}%`;
+      countParams.push(
+        searchQuery,
+        searchQuery,
+        searchQuery,
+        searchQuery,
+        searchQuery
+      );
+    }
+
+    // Execute both queries in parallel
+    Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(countSql, countParams, (countError, countResult) => {
+          if (countError) {
+            reject(countError);
+          } else {
+            resolve(countResult);
+          }
+        });
+      }),
+    ])
+      .then(([results, countResult]) => {
+        connection.release(); // Release the connection
+
+        // Log the count result for debugging
+        console.log("Count Result:", countResult);
+
+        // Calculate total pages based on total count and limit
+        const overallTotal = countResult[0] ? countResult[0].total : 0;
+        const totalPages = Math.ceil(overallTotal / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          overallTotal,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      })
+      .catch((error) => {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+      });
+  });
+});
+
+app.get("/student-for-promotion", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching admissions" });
+      return;
+    }
+
+    const sql = `
+        SELECT 
+            students.id,
+            students.shift,
+            students.register_no,
+            students.old_register_no,
+            students.full_name,
+            classes.class,
+            sections.section_name,
+            students.father_name,
+            students.father_cnic,
+            school_categories.category,
+            students.mobile_no,
+            students.status,
+            students.campus_id,
+            students.session_id
+        FROM 
+            students
+        LEFT JOIN 
+            classes ON students.class_id = classes.id 
+        LEFT JOIN 
+            sections ON students.section_id = sections.id
+        LEFT JOIN 
+            school_categories ON students.category_id = school_categories.id
+        WHERE 
+            students.status_on_off = 'On'
+             AND students.class_id = ? 
+              AND students.section_id = ? 
+            AND students.session_id = ? 
+            AND students.campus_id = ?
+        ORDER BY 
+            students.id DESC;
+    `;
+
+    const params = [class_id, section_id, session_id, campus_id];
+
+    connection.query(sql, params, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      res.json(results);
+    });
+  });
+});
+
+
+
+
+
+//DONT REMOVE THIS CODE
+// app.get('/fee-vouchers-report', (req, res) => {
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+
+//   const from_month = req.query.from_month;
+//   const to_month = req.query.to_month;
+//   const class_id = req.query.class_id;
+//   const section_id = req.query.section_id;
+//   const category_id = req.query.category_id;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching reports' });
+//       return;
+//     }
+
+//     let sql1 = `
+//   SELECT
+//     students.class_id,
+//     classes.class as class_name,
+//     students.section_id,
+//     sections.section_name,
+//     school_categories.category,
+//     students.category_id,
+//     fee_vouchers.bus_fee,
+//     fee_vouchers.student_id,
+//     students.full_name,
+//     fee_vouchers.for_the_month,
+//     fee_vouchers.total_amount_data as payable_amount,
+//     fee_vouchers.recieved_payment,
+//     fee_vouchers.arrears as arrears,
+//     fee_vouchers.arrear_gap_from_payable,
+//     fee_vouchers.first_advance_payment as advance_payment,
+//     fee_vouchers.after_due_date_amount,
+//     fee_vouchers.status as fee_status,
+//     fee_vouchers.fee_head,
+//     fee_vouchers.fine,
+//     fee_vouchers.payment_date,
+//     fee_vouchers.due_date,
+//     fee_vouchers.is_arrear,
+//     fee_vouchers.due_date,
+//     fee_vouchers.payment_date,
+//     CASE
+//       WHEN (fee_vouchers.is_arrear != '' OR fee_vouchers.is_arrear IS NULL)
+//            AND fee_vouchers.payment_date IS NOT NULL
+//            AND fee_vouchers.payment_date > fee_vouchers.due_date
+//       THEN fee_vouchers.fine
+//       ELSE 0
+//     END AS calculated_fine
+//   FROM
+//     fee_vouchers
+//   JOIN
+//     students ON students.id = fee_vouchers.student_id
+//   JOIN
+//     classes ON classes.id = students.class_id
+//   JOIN
+//     sections ON students.section_id = sections.id
+//   JOIN
+//     school_categories ON students.category_id = school_categories.id
+//   WHERE
+//     fee_vouchers.campus_id = ?
+//   AND fee_vouchers.session_id = ?
+// `;
+
+//     const params1 = [campus_id, session_id];
+
+//     if (from_month && to_month) {
+//       sql1 += ` AND fee_vouchers.for_the_month BETWEEN ? AND ?`;
+//       params1.push(from_month, to_month);
+//     } else if (from_month) {
+//       sql1 += ` AND fee_vouchers.for_the_month = ?`;
+//       params1.push(from_month);
+//     }
+
+//     if (class_id) {
+//       sql1 += ` AND students.class_id = ?`;
+//       params1.push(class_id);
+//     }
+
+//     if (section_id) {
+//       sql1 += ` AND students.section_id = ?`;
+//       params1.push(section_id);
+//     }
+
+//     if (category_id) {
+//       sql1 += ` AND students.category_id = ?`;
+//       params1.push(category_id);
+//     }
+
+//     sql1 += ` ORDER BY students.id DESC`;
+
+//     let sql2 = `
+//       SELECT fhd.id, h.head_name, sc.category
+//       FROM fee_head_details fhd
+//       JOIN school_categories sc ON fhd.category_id = sc.id
+//       JOIN heads h ON fhd.fee_head_id = h.id
+//       WHERE fhd.campus_id = ?
+//     `;
+
+//     const params2 = [campus_id];
+
+//     Promise.all([
+//       new Promise((resolve, reject) => {
+//         console.log('Executing SQL1:', sql1, params1); // Debugging log
+//         connection.query(sql1, params1, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         console.log('Executing SQL2:', sql2, params2); // Debugging log
+//         connection.query(sql2, params2, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       })
+//     ])
+//       .then(([feeVouchersResults, feeHeadDetailsResults]) => {
+//         connection.release();
+//         res.json({
+//           feeVouchers: feeVouchersResults,
+//           feeHeadDetails: feeHeadDetailsResults
+//         });
+//       })
+//       .catch(error => {
+//         connection.release();
+//         console.error('Error executing SQL queries: ', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//       });
+//   });
+// });
+
+// app.get('/fee-vouchers-report', (req, res) => {
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+
+//   const from_month = req.query.from_month;
+//   const to_month = req.query.to_month;
+//   const class_id = req.query.class_id;
+//   const section_id = req.query.section_id;
+//   const category_id = req.query.category_id;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching reports' });
+//       return;
+//     }
+
+//     let sql1 = `
+//   SELECT
+//     students.class_id,
+//     classes.class as class_name,
+//     students.section_id,
+//     sections.section_name,
+//     school_categories.category,
+//     students.category_id,
+//     fee_vouchers.bus_fee,
+//     fee_vouchers.student_id,
+//     students.full_name,
+//     fee_vouchers.for_the_month,
+//     fee_vouchers.total_amount_data as payable_amount,
+//     fee_vouchers.recieved_payment,
+//     fee_vouchers.arrears as arrears,
+//     fee_vouchers.arrear_gap_from_payable,
+//     fee_vouchers.first_advance_payment as advance_payment,
+//     fee_vouchers.after_due_date_amount,
+//     fee_vouchers.status as fee_status,
+//     fee_vouchers.fee_head,
+//     fee_vouchers.fine,
+//     fee_vouchers.payment_date,
+//     fee_vouchers.due_date,
+//     fee_vouchers.is_arrear,
+//     fee_vouchers.due_date,
+//     fee_vouchers.payment_date,
+//     CASE
+//       WHEN (fee_vouchers.is_arrear != '' OR fee_vouchers.is_arrear IS NULL)
+//            AND fee_vouchers.payment_date IS NOT NULL
+//            AND fee_vouchers.payment_date > fee_vouchers.due_date
+//       THEN fee_vouchers.fine
+//       ELSE 0
+//     END AS calculated_fine,
+//    CASE
+//       WHEN fee_vouchers.status = 'unpaid'
+//       THEN fee_vouchers.fine
+//       ELSE 0
+//     END AS total_unpaid_fine
+//   FROM
+//     fee_vouchers
+//   JOIN
+//     students ON students.id = fee_vouchers.student_id
+//   JOIN
+//     classes ON classes.id = students.class_id
+//   JOIN
+//     sections ON students.section_id = sections.id
+//   JOIN
+//     school_categories ON students.category_id = school_categories.id
+//   WHERE
+//     fee_vouchers.campus_id = ?
+//   AND fee_vouchers.session_id = ?
+// `;
+
+//     const params1 = [campus_id, session_id];
+
+//     if (from_month && to_month) {
+//       sql1 += ` AND fee_vouchers.for_the_month BETWEEN ? AND ?`;
+//       params1.push(from_month, to_month);
+//     } else if (from_month) {
+//       sql1 += ` AND fee_vouchers.for_the_month = ?`;
+//       params1.push(from_month);
+//     }
+
+//     if (class_id) {
+//       sql1 += ` AND students.class_id = ?`;
+//       params1.push(class_id);
+//     }
+
+//     if (section_id) {
+//       sql1 += ` AND students.section_id = ?`;
+//       params1.push(section_id);
+//     }
+
+//     if (category_id) {
+//       sql1 += ` AND students.category_id = ?`;
+//       params1.push(category_id);
+//     }
+
+//     sql1 += ` ORDER BY students.id DESC`;
+
+//     let sql2 = `
+//       SELECT fhd.id, h.head_name, sc.category
+//       FROM fee_head_details fhd
+//       JOIN school_categories sc ON fhd.category_id = sc.id
+//       JOIN heads h ON fhd.fee_head_id = h.id
+//       WHERE fhd.campus_id = ?
+//     `;
+
+//     const params2 = [campus_id];
+
+//     Promise.all([
+//       new Promise((resolve, reject) => {
+//         console.log('Executing SQL1:', sql1, params1); // Debugging log
+//         connection.query(sql1, params1, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         console.log('Executing SQL2:', sql2, params2); // Debugging log
+//         connection.query(sql2, params2, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       })
+//     ])
+//       .then(([feeVouchersResults, feeHeadDetailsResults]) => {
+//         connection.release();
+//         res.json({
+//           feeVouchers: feeVouchersResults,
+//           feeHeadDetails: feeHeadDetailsResults
+//         });
+//       })
+//       .catch(error => {
+//         connection.release();
+//         console.error('Error executing SQL queries: ', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//       });
+//   });
+// });
+
+
+//this is last and correct ...............
+// app.get("/fee-vouchers-report", (req, res) => {
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+
+//   const from_month = req.query.from_month;
+//   const to_month = req.query.to_month;
+//   const class_id = req.query.class_id;
+//   const section_id = req.query.section_id;
+//   const category_id = req.query.category_id;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching reports" });
+//       return;
+//     }
+
+//     let sql1 = `
+//   SELECT 
+//     students.class_id, 
+//     classes.class as class_name, 
+//     students.section_id, 
+//     sections.section_name, 
+//     school_categories.category, 
+//     students.category_id, 
+//     fee_vouchers.bus_fee,
+//     fee_vouchers.student_id, 
+//     students.full_name, 
+//     fee_vouchers.for_the_month, 
+//     fee_vouchers.total_amount_data as payable_amount, 
+//     fee_vouchers.recieved_payment,
+//     fee_vouchers.arrears as arrears,
+//     fee_vouchers.arrear_gap_from_payable,
+//     fee_vouchers.first_advance_payment as advance_payment, 
+//     fee_vouchers.after_due_date_amount, 
+//     fee_vouchers.status as fee_status,  
+//     fee_vouchers.fee_head,
+//     fee_vouchers.fine,
+//     fee_vouchers.payment_date,
+//     fee_vouchers.due_date,
+//     fee_vouchers.is_arrear,
+//     fee_vouchers.due_date,
+//     fee_vouchers.payment_date,
+//     CASE
+//       WHEN (fee_vouchers.is_arrear != '' OR fee_vouchers.is_arrear IS NULL) 
+//            AND fee_vouchers.payment_date IS NOT NULL 
+//            AND fee_vouchers.payment_date > fee_vouchers.due_date 
+//            AND fee_vouchers.voucher_created_form != 'Single'
+//       THEN fee_vouchers.fine
+//       ELSE 0
+//     END AS calculated_fine,
+//    CASE
+//       WHEN fee_vouchers.status = 'unpaid' AND fee_vouchers.voucher_created_form != 'Single'
+//            AND fee_vouchers.for_the_month != (SELECT MAX(fv.for_the_month) FROM fee_vouchers fv WHERE fv.campus_id = fee_vouchers.campus_id AND fv.voucher_created_form != 'Single'  AND fv.session_id = fee_vouchers.session_id)
+//       THEN fee_vouchers.fine
+//       ELSE 0
+//     END AS total_unpaid_fine
+//   FROM 
+//     fee_vouchers
+//   JOIN
+//     students ON students.id = fee_vouchers.student_id 
+//   JOIN 
+//     classes ON classes.id = students.class_id
+//   JOIN 
+//     sections ON students.section_id = sections.id
+//   JOIN 
+//     school_categories ON students.category_id = school_categories.id
+//   WHERE 
+//     fee_vouchers.campus_id = ?
+//   AND fee_vouchers.session_id = ?
+// `;
+
+//     const params1 = [campus_id, session_id];
+
+
+
+
+    
+
+//     if (from_month && to_month) {
+//       sql1 += ` AND fee_vouchers.for_the_month BETWEEN ? AND ?`;
+//       params1.push(from_month, to_month);
+//     } else if (from_month) {
+//       sql1 += ` AND fee_vouchers.for_the_month = ?`;
+//       params1.push(from_month);
+//     }
+
+//     if (class_id) {
+//       sql1 += ` AND students.class_id = ?`;
+//       params1.push(class_id);
+//     }
+
+//     if (section_id) {
+//       sql1 += ` AND students.section_id = ?`;
+//       params1.push(section_id);
+//     }
+
+//     if (category_id) {
+//       sql1 += ` AND students.category_id = ?`;
+//       params1.push(category_id);
+//     }
+
+//     sql1 += ` ORDER BY students.id DESC`;
+
+//     let sql2 = `
+//       SELECT fhd.id, h.head_name, sc.category
+//       FROM fee_head_details fhd
+//       JOIN school_categories sc ON fhd.category_id = sc.id
+//       JOIN heads h ON fhd.fee_head_id = h.id
+//       WHERE fhd.campus_id = ?
+//     `;
+
+//     const params2 = [campus_id];
+
+//     Promise.all([
+//       new Promise((resolve, reject) => {
+//         console.log("Executing SQL1:", sql1, params1); // Debugging log
+//         connection.query(sql1, params1, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         console.log("Executing SQL2:", sql2, params2); // Debugging log
+//         connection.query(sql2, params2, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       }),
+//     ])
+//       .then(([feeVouchersResults, feeHeadDetailsResults]) => {
+//         connection.release();
+//         res.json({
+//           feeVouchers: feeVouchersResults,
+//           feeHeadDetails: feeHeadDetailsResults,
+//         });
+//       })
+//       .catch((error) => {
+//         connection.release();
+//         console.error("Error executing SQL queries: ", error);
+//         res.status(500).json({ error: "Internal server error" });
+//       });
+//   });
+// });
+
+
+
+
+app.get("/fee-vouchers-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+
+  const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const category_id = req.query.category_id;
+
+  const shift = req.query.shift;
+
+
+  const [year, month] = from_month.split("-").map(Number);
+  const previousMonth = month === 1 ? `${year - 1}-12` : `${year}-${String(month - 1).padStart(2, '0')}`;
+
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+    // fee_vouchers.is_arrear != '' OR 
+    // Main report query for fee vouchers
+    let sql1 = `
+    SELECT 
+      students.class_id, 
+      classes.class AS class_name, 
+      students.section_id, 
+      sections.section_name, 
+      school_categories.category, 
+      students.category_id, 
+      fee_vouchers.bus_fee,
+      fee_vouchers.attendance_amount,
+      fee_vouchers.student_id, 
+      students.full_name, 
+      students.status as student_status, 
+      fee_vouchers.for_the_month, 
+      fee_vouchers.total_amount_data AS payable_amount, 
+      fee_vouchers.recieved_payment,
+      fee_vouchers.arrears AS arrears,
+      fee_vouchers.arrear_gap_from_payable,
+      fee_vouchers.first_advance_payment AS advance_payment, 
+      fee_vouchers.after_due_date_amount, 
+      fee_vouchers.status AS fee_status,  
+      fee_vouchers.arrears_fine,  
+      fee_vouchers.fee_head,
+      fee_vouchers.fine,
+      fee_vouchers.payment_date,
+      fee_vouchers.due_date,
+      fee_vouchers.is_arrear,
+      CASE
+        WHEN (fee_vouchers.payment_date > fee_vouchers.due_date ) 
+             AND fee_vouchers.payment_date IS NOT NULL
+        THEN fee_vouchers.fine
+        ELSE 0
+      END AS calculated_fine
+    FROM 
+      fee_vouchers
+    JOIN
+      students ON students.id = fee_vouchers.student_id 
+    JOIN 
+      classes ON classes.id = students.class_id
+    JOIN 
+      sections ON students.section_id = sections.id
+    JOIN 
+      school_categories ON students.category_id = school_categories.id
+    WHERE 
+      fee_vouchers.campus_id = ?
+    AND fee_vouchers.session_id = ?
+    `;
+
+    //  AND voucher_created_form != 'Single'
+
+    const params1 = [campus_id, session_id];
+
+    if (from_month && to_month) {
+      sql1 += ` AND fee_vouchers.for_the_month BETWEEN ? AND ?`;
+      params1.push(from_month, to_month);
+    } else if (from_month) {
+      sql1 += ` AND fee_vouchers.for_the_month = ?`;
+      params1.push(from_month);
+    }
+
+    if (class_id) {
+      sql1 += ` AND students.class_id = ?`;
+      params1.push(class_id);
+    }
+
+    if (shift) {
+      sql1 += `  AND fee_vouchers.shift = ?`;
+      params1.push(shift);
+    }
+
+    if (section_id) {
+      sql1 += ` AND students.section_id = ?`;
+      params1.push(section_id);
+    }
+
+    if (category_id) {
+      sql1 += ` AND students.category_id = ?`;
+      params1.push(category_id);
+    }
+
+    sql1 += ` ORDER BY students.id DESC`;
+
+    // Query to calculate grand total fine for the last month with is_arrear = 'arrears'
+    let sql2 = `
+    SELECT SUM(fine) AS grand_total_fine_last_month
+    FROM fee_vouchers 
+    JOIN students ON students.id = fee_vouchers.student_id 
+    JOIN classes ON classes.id = students.class_id
+    WHERE fee_vouchers.campus_id = ? 
+      AND fee_vouchers.session_id = ? 
+      AND fee_vouchers.is_arrear = 'arrears' 
+      AND fee_vouchers.for_the_month = ?
+  `;
+  
+  const params2 = [campus_id, session_id, previousMonth];
+  
+  // Add class_id conditionally if it exists
+  if (class_id) {
+    sql2 += ` AND students.class_id = ?`;
+    params2.push(class_id);
+  }
+  
+  // Add category_id conditionally if it exists
+  if (category_id) {
+    sql2 += ` AND students.category_id = ?`;
+    params2.push(category_id);
+  }
+  
+
+    // Query for fee head details
+    let sql3 = `
+      SELECT fhd.id, h.head_name, sc.category
+      FROM fee_head_details fhd
+      JOIN school_categories sc ON fhd.category_id = sc.id
+      JOIN heads h ON fhd.fee_head_id = h.id
+      WHERE fhd.campus_id = ?
+    `;
+
+    const params3 = [campus_id];
+
+
+
+    let sql4 = `
+      SELECT 
+        SUM(arrears + first_advance_payment + total_amount_data) AS unpaid_total 
+      FROM 
+        fee_vouchers 
+      WHERE 
+        campus_id = ? 
+        AND session_id = ? 
+        AND status = 'unpaid' 
+        AND (is_arrear = '' OR is_arrear IS NULL) 
+        AND for_the_month = ? 
+        AND for_the_month != (
+          SELECT MAX(for_the_month) 
+          FROM fee_vouchers 
+          WHERE campus_id = ? 
+            AND session_id = ? 
+        )
+    `;
+
+    //  AND voucher_created_form != 'Single'
+    const params4 = [campus_id, session_id, from_month, campus_id, session_id];
+
+
+    // Execute all three queries in parallel
+    Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql1, params1, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(sql2, params2, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results[0].grand_total_fine_last_month);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(sql3, params3, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(sql4, params4, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results[0].unpaid_total);
+          }
+        });
+      })
+    ])
+      .then(([feeVouchersResults, grandTotalFineLastMonth, feeHeadDetailsResults, unpaidTotal]) => {
+        connection.release();
+        res.json({
+          feeVouchers: feeVouchersResults,
+          grandTotalFineLastMonth: grandTotalFineLastMonth,
+          feeHeadDetails: feeHeadDetailsResults,
+          unpaidTotal: unpaidTotal, // New response field for unpaid total
+        });
+      })
+      .catch((error) => {
+        connection.release();
+        console.error("Error executing SQL queries: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      });
+  });
+});
+
+
+
+
+
+// fee_vouchers.is_arrear != '' OR 
+app.get("/student-wise-headwise-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+
+  const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const category_id = req.query.category_id;
+
+  const shift = req.query.shift;
+
+
+  const [year, month] = from_month.split("-").map(Number);
+  const previousMonth = month === 1 ? `${year - 1}-12` : `${year}-${String(month - 1).padStart(2, '0')}`;
+
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Main report query for fee vouchers
+    let sql1 = `
+    SELECT 
+      students.class_id, 
+      classes.class AS class_name, 
+      students.section_id, 
+      students.register_no, 
+      sections.section_name, 
+      school_categories.category, 
+      students.category_id, 
+      fee_vouchers.bus_fee,
+       fee_vouchers.attendance_amount,
+      fee_vouchers.student_id, 
+      students.full_name, 
+      students.father_name, 
+      students.mobile_no, 
+      fee_vouchers.arrears_not_cleared,
+      fee_vouchers.created_at,
+      fee_vouchers.status,  
+      fee_vouchers.payment_date,
+      fee_vouchers.for_the_month, 
+      fee_vouchers.total_amount_data AS payable_amount, 
+      fee_vouchers.recieved_payment,
+      fee_vouchers.arrears AS arrears,
+      fee_vouchers.arrear_gap_from_payable,
+      fee_vouchers.first_advance_payment AS advance_payment, 
+      fee_vouchers.after_due_date_amount, 
+      fee_vouchers.status AS fee_status,  
+      fee_vouchers.arrears_fine,  
+      fee_vouchers.fee_head,
+      fee_vouchers.fine,
+      fee_vouchers.payment_date,
+      fee_vouchers.due_date,
+      fee_vouchers.is_arrear,
+      CASE
+        WHEN (fee_vouchers.payment_date > fee_vouchers.due_date ) 
+             AND fee_vouchers.payment_date IS NOT NULL 
+        THEN fee_vouchers.fine
+        ELSE 0
+      END AS calculated_fine
+    FROM 
+      fee_vouchers
+    JOIN
+      students ON students.id = fee_vouchers.student_id 
+    JOIN 
+      classes ON classes.id = students.class_id
+    JOIN 
+      sections ON students.section_id = sections.id
+    JOIN 
+      school_categories ON students.category_id = school_categories.id
+    WHERE 
+      fee_vouchers.campus_id = ?
+    AND fee_vouchers.session_id = ?
+    `;
+// AND fee_vouchers.voucher_created_form != 'Single'
+    const params1 = [campus_id, session_id];
+
+    if (from_month && to_month) {
+      sql1 += ` AND fee_vouchers.for_the_month BETWEEN ? AND ?`;
+      params1.push(from_month, to_month);
+    } else if (from_month) {
+      sql1 += ` AND fee_vouchers.for_the_month = ?`;
+      params1.push(from_month);
+    }
+
+    if (class_id) {
+      sql1 += ` AND students.class_id = ?`;
+      params1.push(class_id);
+    }
+
+    if (shift) {
+      sql1 += `  AND fee_vouchers.shift = ?`;
+      params1.push(shift);
+    }
+
+    if (section_id) {
+      sql1 += ` AND students.section_id = ?`;
+      params1.push(section_id);
+    }
+
+    if (category_id) {
+      sql1 += ` AND students.category_id = ?`;
+      params1.push(category_id);
+    }
+
+    sql1 += ` ORDER BY students.id DESC`;
+
+    // Query to calculate grand total fine for the last month with is_arrear = 'arrears'
+    let sql2 = `
+    SELECT SUM(fine) AS grand_total_fine_last_month
+    FROM fee_vouchers 
+    JOIN students ON students.id = fee_vouchers.student_id 
+    JOIN classes ON classes.id = students.class_id
+    WHERE fee_vouchers.campus_id = ? 
+      AND fee_vouchers.session_id = ? 
+      AND fee_vouchers.is_arrear = 'arrears' 
+      AND fee_vouchers.for_the_month = ?
+  `;
+  
+  const params2 = [campus_id, session_id, previousMonth];
+  
+  // Add class_id conditionally if it exists
+  if (class_id) {
+    sql2 += ` AND students.class_id = ?`;
+    params2.push(class_id);
+  }
+  
+  // Add category_id conditionally if it exists
+  if (category_id) {
+    sql2 += ` AND students.category_id = ?`;
+    params2.push(category_id);
+  }
+  
+
+    // Query for fee head details
+    let sql3 = `
+      SELECT fhd.id, h.head_name, sc.category
+      FROM fee_head_details fhd
+      JOIN school_categories sc ON fhd.category_id = sc.id
+      JOIN heads h ON fhd.fee_head_id = h.id
+      WHERE fhd.campus_id = ?
+    `;
+
+    const params3 = [campus_id];
+
+
+
+    let sql4 = `
+      SELECT 
+        SUM(arrears + first_advance_payment + total_amount_data) AS unpaid_total 
+      FROM 
+        fee_vouchers 
+      WHERE 
+        campus_id = ? 
+        AND session_id = ? 
+        AND status = 'unpaid' 
+        AND (is_arrear = '' OR is_arrear IS NULL) 
+        AND for_the_month = ? 
+        AND for_the_month != (
+          SELECT MAX(for_the_month) 
+          FROM fee_vouchers 
+          WHERE campus_id = ? 
+            AND session_id = ? 
+        )
+    `;
+
+    //  AND voucher_created_form != 'Single'
+    const params4 = [campus_id, session_id, from_month, campus_id, session_id];
+
+
+    // Execute all three queries in parallel
+    Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql1, params1, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(sql2, params2, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results[0].grand_total_fine_last_month);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(sql3, params3, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(sql4, params4, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results[0].unpaid_total);
+          }
+        });
+      })
+    ])
+      .then(([feeVouchersResults, grandTotalFineLastMonth, feeHeadDetailsResults, unpaidTotal]) => {
+        connection.release();
+        res.json({
+          feeVouchers: feeVouchersResults,
+          grandTotalFineLastMonth: grandTotalFineLastMonth,
+          feeHeadDetails: feeHeadDetailsResults,
+          unpaidTotal: unpaidTotal, // New response field for unpaid total
+        });
+      })
+      .catch((error) => {
+        connection.release();
+        console.error("Error executing SQL queries: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      });
+  });
+});
+
+
+
+app.get("/vouchers-pending-report-classwise", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const from_month = req.query.from_month;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const category_id = req.query.category_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    const getLastEntrySQL = `
+      SELECT for_the_month 
+      FROM fee_vouchers 
+      WHERE campus_id = ? AND session_id = ?
+      ORDER BY id DESC 
+      LIMIT 1
+    `;
+
+    const paramsGetLastEntry = [campus_id, session_id];
+
+    connection.query(getLastEntrySQL, paramsGetLastEntry, (error, lastEntryResult) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release();
+        return;
+      }
+
+      if (lastEntryResult.length === 0) {
+        res.status(404).json({
+          error: 'No entries found for voucher_created_form = "Multiple"',
+        });
+        connection.release();
+        return;
+      }
+
+      const lastForTheMonth = lastEntryResult[0].for_the_month;
+
+      let sql1 = `
+        SELECT
+            students.class_id,
+            classes.class AS class_name,
+            students.section_id,
+            students.register_no,
+            students.father_mobile_no,
+            sections.section_name,
+            school_categories.category,
+            students.category_id,
+            fee_vouchers.bus_fee,
+            fee_vouchers.status,
+            fee_vouchers.student_id,
+            students.full_name,
+            COUNT(fee_vouchers.id) AS unpaid_vouchers_count,
+            GROUP_CONCAT(fee_vouchers.for_the_month ORDER BY fee_vouchers.for_the_month ASC) AS months, `;
+
+            // add it
+            // fee_vouchers.status = 'unpaid' || fee_vouchers.is_arrear = 'arrears' || 
+          if (from_month) {
+            sql1 += ` SUM(
+              CASE 
+                  WHEN fee_vouchers.for_the_month < ? AND (fee_vouchers.payment_date > fee_vouchers.due_date)
+                  THEN fee_vouchers.total_amount_data + fee_vouchers.fine  + fee_vouchers.first_advance_payment + fee_vouchers.arrears
+                  ELSE fee_vouchers.total_amount_data + fee_vouchers.first_advance_payment + fee_vouchers.arrears
+              END `; 
+
+          }else{
+            sql1 += ` SUM(
+              CASE 
+                  WHEN fee_vouchers.for_the_month < ? AND (fee_vouchers.status = 'unpaid' || fee_vouchers.is_arrear = 'arrears' || fee_vouchers.payment_date > fee_vouchers.due_date)
+                  THEN fee_vouchers.total_amount_data + fee_vouchers.fine  + fee_vouchers.first_advance_payment 
+                  + (CASE WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears ELSE 0 END) 
+                  ELSE fee_vouchers.total_amount_data + fee_vouchers.first_advance_payment
+                  + (CASE WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears ELSE 0 END)
+              END `; 
+          }
+          
+      sql1 += `) AS payable_amount_after_due_date,
+            SUM(fee_vouchers.arrears_not_cleared) AS total_arrears_not_cleared,
+            fee_vouchers.status
+        FROM
+            fee_vouchers
+        JOIN
+            students ON students.id = fee_vouchers.student_id
+        JOIN
+            classes ON classes.id = students.class_id
+        JOIN
+            sections ON students.section_id = sections.id
+        JOIN
+            school_categories ON students.category_id = school_categories.id
+        WHERE
+            fee_vouchers.campus_id = ? 
+            AND fee_vouchers.session_id = ? 
+            AND (fee_vouchers.status = 'unpaid')
+            AND students.status NOT IN ("Struck off", "SLC")`;
+
+              // AND (fee_vouchers.status = 'unpaid' || fee_vouchers.is_arrear = 'arrears')
+
+      const params1 = [lastForTheMonth, campus_id, session_id];
+
+      if (from_month) {
+        sql1 += ` AND fee_vouchers.for_the_month = ?`;
+        params1.push(from_month);
+      }
+
+      if (class_id) {
+        sql1 += ` AND students.class_id = ?`;
+        params1.push(class_id);
+      }
+
+      if (section_id) {
+        sql1 += ` AND students.section_id = ?`;
+        params1.push(section_id);
+      }
+
+      if (category_id) {
+        sql1 += ` AND students.category_id = ?`;
+        params1.push(category_id);
+      }
+
+
+      sql1 += ` GROUP BY fee_vouchers.student_id ORDER BY students.class_id ASC`;
+
+      // Execute the main query
+      connection.query(sql1, params1, (error, mainResults) => {
+        if (error) {
+          console.error("Error executing SQL query: ", error);
+          res.status(500).json({ error: "Internal server error" });
+        } else {
+          res.json({
+            feeVouchers: mainResults,
+          });
+        }
+        connection.release();
+      });
+    });
+  }); 
+});
+
+
+
+
+
+app.get("/recievable-and-payable-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const category_id = req.query.category_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    let sql1 = `
+      SELECT
+        students.class_id,
+        classes.class AS class_name,
+        students.section_id,
+        students.register_no,
+        students.father_mobile_no,
+        sections.section_name,
+        school_categories.category,
+        students.full_name,
+        COUNT(fee_vouchers.id) AS total_vouchers_count,
+        GROUP_CONCAT(fee_vouchers.for_the_month ORDER BY fee_vouchers.for_the_month ASC) AS months,
+        SUM(
+          CASE 
+            WHEN (fee_vouchers.is_arrear = 'arrears' OR payment_date > due_date)
+              THEN fee_vouchers.after_due_date_amount + fee_vouchers.first_advance_payment
+            WHEN ((fee_vouchers.is_arrear IS NULL OR fee_vouchers.is_arrear = '') OR payment_date <= due_date)
+              THEN fee_vouchers.total_amount_data + fee_vouchers.first_advance_payment
+            ELSE 0
+          END
+        ) AS payable_amount,
+        SUM(
+          CASE 
+            WHEN fee_vouchers.status = 'paid'
+              THEN fee_vouchers.recieved_payment
+            ELSE 0
+          END
+        ) AS received_amount
+      FROM
+        fee_vouchers
+      JOIN
+        students ON students.id = fee_vouchers.student_id
+      JOIN
+        classes ON classes.id = students.class_id
+      JOIN
+        sections ON students.section_id = sections.id
+      JOIN
+        school_categories ON students.category_id = school_categories.id
+      WHERE
+        fee_vouchers.campus_id = ?
+        AND fee_vouchers.session_id = ?
+    `;
+
+    const params1 = [campus_id, session_id];
+
+    if (class_id) {
+      sql1 += ` AND students.class_id = ?`;
+      params1.push(class_id);
+    }
+
+    if (section_id) {
+      sql1 += ` AND students.section_id = ?`;
+      params1.push(section_id);
+    }
+
+    if (category_id) {
+      sql1 += ` AND students.category_id = ?`;
+      params1.push(category_id);
+    }
+
+    sql1 += ` GROUP BY fee_vouchers.student_id ORDER BY students.class_id ASC`;
+
+    // Execute the main query
+    connection.query(sql1, params1, (error, mainResults) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          feeVouchers: mainResults,
+        });
+      }
+      connection.release();
+    });
+  }); 
+});
+
+
+
+
+
+
+app.get("/all-voucher-pending-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const category_id = req.query.category_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+//     let sql1 = `SELECT 
+//     students.class_id,
+//     classes.class AS class_name,
+//     sections.section_name,
+//     students.section_id,
+//     students.register_no,
+//     students.father_mobile_no,
+//     students.category_id,
+//     MAX(fee_vouchers.bus_fee) AS bus_fee, -- Use MAX or similar aggregate for non-grouped columns
+//     fee_vouchers.status,
+//     fee_vouchers.student_id,
+//     students.full_name,
+//     school_categories.category,
+//     COUNT(fee_vouchers.id) AS unpaid_vouchers_count,
+//     GROUP_CONCAT(
+//         DISTINCT DATE_FORMAT(STR_TO_DATE(fee_vouchers.for_the_month, '%Y-%m'), '%b-%Y') 
+//         ORDER BY STR_TO_DATE(fee_vouchers.for_the_month, '%Y-%m') ASC
+//     ) AS months,
+//     SUM(
+//         CASE
+//             WHEN (payment_date > due_date OR is_arrear = 'arrears') THEN total_amount_data + fine + first_advance_payment 
+//             ELSE total_amount_data + first_advance_payment 
+//         END
+//         + CASE 
+//             WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears
+//             ELSE 0
+//         END
+//     ) AS payable_amount_after_due_date
+// FROM fee_vouchers
+// JOIN
+// students ON students.id = fee_vouchers.student_id
+// JOIN
+// classes ON classes.id = fee_vouchers.class_id
+// JOIN
+// sections ON students.section_id = sections.id
+// JOIN
+// school_categories ON students.category_id = school_categories.id
+// WHERE fee_vouchers.campus_id = ?
+//   AND fee_vouchers.session_id = ?
+//   AND fee_vouchers.status = 'unpaid'
+//   AND students.status NOT IN ("Struck off", "SLC")
+// `;
+
+
+
+let sql1 = `SELECT 
+MAX(students.class_id) AS class_id,
+MAX(classes.class) AS class_name,
+MAX(sections.section_name) AS section_name,
+MAX(students.section_id) AS section_id,
+MAX(students.register_no) AS register_no,
+MAX(students.father_mobile_no) AS father_mobile_no,
+MAX(students.category_id) AS category_id,
+MAX(fee_vouchers.bus_fee) AS bus_fee, -- Aggregate to avoid violation
+MAX(fee_vouchers.status) AS status,
+fee_vouchers.student_id,
+MAX(students.full_name) AS full_name,
+MAX(school_categories.category) AS category,
+COUNT(fee_vouchers.id) AS unpaid_vouchers_count,
+GROUP_CONCAT(
+    DISTINCT DATE_FORMAT(STR_TO_DATE(fee_vouchers.for_the_month, '%Y-%m'), '%b-%Y') 
+    ORDER BY STR_TO_DATE(fee_vouchers.for_the_month, '%Y-%m') ASC
+) AS months,
+SUM(
+    CASE
+        WHEN (payment_date > due_date OR is_arrear = 'arrears') THEN total_amount_data + fine + first_advance_payment
+        ELSE total_amount_data + first_advance_payment
+    END
+    + CASE 
+        WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears
+        ELSE 0
+    END
+) AS payable_amount_after_due_date
+FROM fee_vouchers
+JOIN
+students ON students.id = fee_vouchers.student_id
+JOIN
+classes ON classes.id = fee_vouchers.class_id
+JOIN
+sections ON students.section_id = sections.id
+JOIN
+school_categories ON students.category_id = school_categories.id
+WHERE fee_vouchers.campus_id = ?
+AND fee_vouchers.session_id = ?
+AND fee_vouchers.status = 'unpaid'
+AND students.status NOT IN ("Struck off", "SLC")
+`;
+
+
+    const params1 = [campus_id, session_id];
+
+    if (class_id) {
+      sql1 += ` AND students.class_id = ?`;
+      params1.push(class_id);
+    }
+
+    if (section_id) {
+      sql1 += ` AND students.section_id = ?`;
+      params1.push(section_id);
+    }
+
+    if (category_id) {
+      sql1 += ` AND students.category_id = ?`;
+      params1.push(category_id);
+    }
+
+    sql1 += ` GROUP BY fee_vouchers.student_id ORDER BY MAX(fee_vouchers.class_id) ASC`;
+
+    // Execute the main query
+    connection.query(sql1, params1, (error, mainResults) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          feeVouchers: mainResults,
+        });
+      }
+      connection.release();
+    });
+  }); 
+});
+
+
+app.get("/pendency-excel-report", async (req, res) => {
+  try {
+    const campus_id = connection.escape(req.query.campus_id);
+    const session_id = connection.escape(req.query.session_id);
+    const from_month = req.query.from_month ? connection.escape(req.query.from_month) : null;
+    const class_id = req.query.class_id ? connection.escape(req.query.class_id) : null;
+    const section_id = req.query.section_id ? connection.escape(req.query.section_id) : null;
+    const category_id = req.query.category_id ? connection.escape(req.query.category_id) : null;
+    const search = req.query.search ? connection.escape(`%${req.query.search}%`) : null;
+
+    let sql1 = `SELECT 
+      MAX(students.class_id) AS class_id,
+      MAX(classes.class) AS class_name,
+      MAX(sections.section_name) AS section_name,
+      MAX(students.section_id) AS section_id,
+      MAX(students.register_no) AS register_no,
+      MAX(students.father_mobile_no) AS father_mobile_no,
+      MAX(students.category_id) AS category_id,
+      MAX(fee_vouchers.bus_fee) AS bus_fee,
+      MAX(fee_vouchers.status) AS status,
+      fee_vouchers.student_id,
+      MAX(students.full_name) AS full_name,
+      MAX(school_categories.category) AS category,
+      COUNT(fee_vouchers.id) AS unpaid_vouchers_count,
+      GROUP_CONCAT(
+          DISTINCT DATE_FORMAT(STR_TO_DATE(fee_vouchers.for_the_month, '%Y-%m'), ' %b-%Y') 
+          ORDER BY STR_TO_DATE(fee_vouchers.for_the_month, '%Y-%m') ASC
+      ) AS months,
+      SUM(
+          CASE
+              WHEN (payment_date > due_date OR is_arrear = 'arrears') THEN total_amount_data + fine + first_advance_payment
+              ELSE total_amount_data + first_advance_payment
+          END
+          + CASE 
+              WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears
+              ELSE 0
+          END
+      ) AS payable_amount_after_due_date
+      FROM fee_vouchers
+      JOIN students ON students.id = fee_vouchers.student_id
+      JOIN classes ON classes.id = fee_vouchers.class_id
+      JOIN sections ON students.section_id = sections.id
+      JOIN school_categories ON students.category_id = school_categories.id
+      WHERE fee_vouchers.campus_id = ${campus_id}
+      AND fee_vouchers.session_id = ${session_id}
+      AND fee_vouchers.status = 'unpaid'
+      AND students.status NOT IN ("Struck off", "SLC")`;
+
+    if (class_id) {
+      sql1 += ` AND students.class_id = ${class_id}`;
+    }
+
+    if (section_id) {
+      sql1 += ` AND students.section_id = ${section_id}`;
+    }
+
+    if (category_id) {
+      sql1 += ` AND students.category_id = ${category_id}`;
+    }
+
+    sql1 += ` GROUP BY fee_vouchers.student_id ORDER BY MAX(fee_vouchers.class_id) ASC`;
+
+    connection.query(sql1, async (error, mainResults) => {
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      if (mainResults.length === 0) {
+        res.json({ message: "Data not exist" });
+        return;
+      }
+
+      await generateExcelReport(res, sql1);
+    });
+  } catch (error) {
+    console.error("Error handling request:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+app.get("/vouchers-scrollwise-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const from_date = req.query.from_date;
+  const to_date = req.query.to_date;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Main query to fetch sum of recieved_payment grouped by payment_date and scroll_no
+    const sql1 = `
+     SELECT 
+      fv.payment_date, 
+      fv.scroll_no, 
+      SUM(fv.recieved_payment) AS total_recieved_payment,
+      bk.bank_name,
+      bd.account_title,
+      bd.account_no
+    FROM 
+      fee_vouchers fv
+    LEFT JOIN 
+      bank_details bd ON fv.payment_received_through_bank = bd.id
+    LEFT JOIN 
+      banks bk ON bd.bank_id = bk.id
+    WHERE 
+      fv.campus_id = ? 
+      AND fv.session_id = ?
+      AND fv.status = 'paid'
+      AND fv.payment_date BETWEEN ? AND ?
+    GROUP BY 
+      fv.payment_date, 
+      fv.scroll_no, 
+      bk.bank_name
+    ORDER BY 
+      fv.payment_date DESC`;
+
+    const params1 = [campus_id, session_id, from_date, to_date];
+
+    const mainQueryPromise = new Promise((resolve, reject) => {
+      connection.query(sql1, params1, (error, results) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve(results);
+        }
+      });
+    });
+
+    mainQueryPromise
+      .then((mainResults) => {
+        const totalRecords = mainResults.length; // Get the total number of records
+        const totalPages = 1; // Since no pagination is used, set totalPages to 1
+
+        res.json({
+          feeVouchers: mainResults,
+          totalPages: totalPages,
+          currentPage: 1, // Since pagination is removed, set currentPage to 1
+          totalRecords: totalRecords,
+        });
+      })
+      .catch((error) => {
+        console.error("Error executing SQL queries: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      })
+      .finally(() => {
+        connection.release();
+      });
+  });
+});
+
+
+
+
+app.get("/total-fee-allocate", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const from_date = req.query.from_date;
+  const to_date = req.query.to_date;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query
+    let sql1 = `
+      SELECT 
+        cl.class, 
+        sec.section_name,
+        SUM(fv.total_amount_data + fv.arrears + fv.first_advance_payment) AS total_amount,
+        fv.for_the_month,
+        fv.created_at,
+        fv.due_date,
+        fv.payment_date
+      FROM 
+        fee_vouchers fv
+      INNER JOIN 
+        classes cl ON cl.id = fv.class_id
+      INNER JOIN 
+        sections sec ON sec.id = fv.section_id
+      WHERE 
+        fv.campus_id = ? 
+        AND fv.session_id = ?`;
+
+    const params = [campus_id, session_id];
+
+    // Check if both from_date and to_date are provided
+    if (from_date && to_date) {
+      // Extend to_date to the next day
+      let adjusted_to_date = new Date(to_date);
+      adjusted_to_date.setDate(adjusted_to_date.getDate() + 1);
+    
+      sql1 += ` AND fv.created_at >= ? AND fv.created_at < ?`;
+      params.push(from_date, adjusted_to_date.toISOString().slice(0, 19).replace('T', ' '));
+    } else if (from_date) {
+      sql1 += ` AND fv.created_at >= ?`;
+      params.push(from_date);
+    } else if (to_date) {
+      let adjusted_to_date = new Date(to_date);
+      adjusted_to_date.setDate(adjusted_to_date.getDate() + 1);
+    
+      sql1 += ` AND fv.created_at < ?`;
+      params.push(adjusted_to_date.toISOString().slice(0, 19).replace('T', ' '));
+    }
+    
+
+    // Continue with the grouping and ordering
+    sql1 += `
+      GROUP BY 
+        fv.class_id, 
+        fv.section_id,
+        fv.created_at
+      ORDER BY 
+        fv.class_id ASC`;
+
+    const mainQueryPromise = new Promise((resolve, reject) => {
+      connection.query(sql1, params, (error, results) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve(results);
+        }
+      });
+    });
+
+    mainQueryPromise
+      .then((mainResults) => {
+        const totalRecords = mainResults.length; // Get the total number of records
+        const totalPages = 1; // Since no pagination is used, set totalPages to 1
+
+        res.json({
+          feeVouchers: mainResults,
+          totalPages: totalPages,
+          currentPage: 1, // Since pagination is removed, set currentPage to 1
+          totalRecords: totalRecords,
+        });
+      })
+      .catch((error) => {
+        console.error("Error executing SQL queries: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      })
+      .finally(() => {
+        connection.release();
+      });
+  });
+});
+
+
+
+app.get("/total-fee-campus-wise", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const for_the_month = req.query.from_month;
+  const class_id = req.query.class_id;
+  const category_id = req.query.category_id;
+  const shift = req.query.shift;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query
+    // let sql1 = `
+    //   SELECT 
+    //     cl.class, 
+    //     SUM(fv.total_amount_data + fv.arrears + fv.first_advance_payment) AS total_recievable,
+    //     SUM(fv.recieved_payment) AS total_received,
+    //     fv.for_the_month
+    //   FROM 
+    //     fee_vouchers fv
+    //   INNER JOIN 
+    //     classes cl ON cl.id = fv.class_id
+    //   INNER JOIN 
+    //     sections sec ON sec.id = fv.section_id
+    //   WHERE 
+    //     fv.campus_id = ? 
+    //     AND fv.session_id = ? 
+    //     AND fv.for_the_month = ?`;
+
+// OR fv.is_arrear = 'arrears'
+
+
+    let sql1 = `
+      SELECT 
+        cl.class,
+        sec.section_name,
+       SUM(
+          CASE
+            WHEN (fv.payment_date > fv.due_date) THEN fv.total_amount_data + fv.arrears + fv.first_advance_payment + fv.fine
+            ELSE fv.total_amount_data + fv.arrears + fv.first_advance_payment 
+          END) AS total_recievable,
+        SUM(fv.recieved_payment) AS total_received,
+        fv.for_the_month
+      FROM 
+        fee_vouchers fv
+      INNER JOIN 
+        classes cl ON cl.id = fv.class_id
+      INNER JOIN 
+        sections sec ON sec.id = fv.section_id
+      WHERE 
+        fv.campus_id = ? 
+        AND fv.session_id = ? 
+        AND fv.for_the_month=?`;
+        
+    // Parameters for the base query
+    const params = [campus_id, session_id, for_the_month];
+
+    // Add class_id condition if provided
+    if (class_id) {
+      sql1 += ` AND fv.class_id = ?`;
+      params.push(class_id);
+    }
+
+
+    if (shift) {
+      sql1 += `  AND fv.shift = ?`;
+      params.push(shift);
+    }
+
+    if (category_id) {
+      sql1 += ` AND fv.category_id = ?`;
+      params.push(category_id);
+    }
+
+    // Continue with the GROUP BY and ORDER BY clauses
+    sql1 += `
+      GROUP BY fv.class_id, fv.section_id,  fv.for_the_month
+      ORDER BY fv.class_id ASC`;
+
+    const mainQueryPromise = new Promise((resolve, reject) => {
+      connection.query(sql1, params, (error, results) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve(results);
+        }
+      });
+    });
+
+    mainQueryPromise
+      .then((mainResults) => {
+        res.json({
+          feeVouchers: mainResults,
+        });
+      })
+      .catch((error) => {
+        console.error("Error executing SQL queries: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      })
+      .finally(() => {
+        connection.release();
+      });
+  });
+});
+
+
+
+
+app.get("/bus-fee-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const for_the_month = req.query.from_month;
+  const class_id = req.query.class_id;
+  const category_id = req.query.category_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query
+    let sql1 = `
+      SELECT 
+        cl.class, 
+        SUM(fv.bus_fee) AS sum_of_bus_fee,
+        fv.for_the_month,
+        cat.category
+      FROM 
+        fee_vouchers fv
+      INNER JOIN 
+        classes cl ON cl.id = fv.class_id
+      INNER JOIN 
+        sections sec ON sec.id = fv.section_id
+      INNER JOIN 
+        school_categories cat ON cat.id = fv.category_id
+      WHERE 
+        fv.campus_id = ? 
+        AND fv.session_id = ? 
+        AND fv.for_the_month = ?`;
+
+    // Parameters for the base query
+    const params = [campus_id, session_id, for_the_month];
+
+    // Add class_id condition if provided
+    if (class_id) {
+      sql1 += ` AND fv.class_id = ?`;
+      params.push(class_id);
+    }
+
+    if (category_id) {
+      sql1 += ` AND fv.category_id = ?`;
+      params.push(category_id);
+    }
+
+    // Continue with the GROUP BY and ORDER BY clauses
+    sql1 += `
+      GROUP BY fv.class_id, fv.for_the_month, cat.category
+      ORDER BY fv.class_id ASC`;
+
+    const mainQueryPromise = new Promise((resolve, reject) => {
+      connection.query(sql1, params, (error, results) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve(results);
+        }
+      });
+    });
+
+    mainQueryPromise
+      .then((mainResults) => {
+        res.json({
+          feeVouchers: mainResults,
+        });
+      })
+      .catch((error) => {
+        console.error("Error executing SQL queries: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      })
+      .finally(() => {
+        connection.release();
+      });
+  });
+});
+
+
+
+
+
+
+app.get("/bad-debits-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const category_id = req.query.category_id;
+  const from_month = req.query.from_month;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+      let sql1 = `SELECT 
+      MAX(students.class_id) AS class_id,
+      MAX(classes.class) AS class_name,
+      MAX(sections.section_name) AS section_name,
+      MAX(students.section_id) AS section_id,
+      MAX(students.register_no) AS register_no,
+      MAX(students.father_mobile_no) AS father_mobile_no,
+      MAX(students.category_id) AS category_id,
+      MAX(fee_vouchers.bus_fee) AS bus_fee, -- Aggregate to avoid violation
+      MAX(fee_vouchers.status) AS status,
+      fee_vouchers.student_id,
+      MAX(students.full_name) AS full_name,
+      MAX(school_categories.category) AS category,
+      COUNT(fee_vouchers.id) AS unpaid_vouchers_count,
+      GROUP_CONCAT(
+          DISTINCT DATE_FORMAT(STR_TO_DATE(fee_vouchers.for_the_month, '%Y-%m'), '%b-%Y') 
+          ORDER BY STR_TO_DATE(fee_vouchers.for_the_month, '%Y-%m') ASC
+      ) AS months,
+      SUM(
+          CASE
+              WHEN (payment_date > due_date OR is_arrear = 'arrears') THEN total_amount_data + fine + first_advance_payment
+              ELSE total_amount_data + first_advance_payment
+          END
+          + CASE 
+              WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears
+              ELSE 0
+          END
+      ) AS payable_amount_after_due_date
+      FROM fee_vouchers
+      JOIN
+      students ON students.id = fee_vouchers.student_id
+      JOIN
+      classes ON classes.id = fee_vouchers.class_id
+      JOIN
+      sections ON students.section_id = sections.id
+      JOIN
+      school_categories ON students.category_id = school_categories.id
+      WHERE fee_vouchers.campus_id = ?
+      AND fee_vouchers.session_id = ?
+      AND fee_vouchers.status = 'unpaid'
+      AND students.status IN ("Struck off", "SLC")
+      `;
+
+
+    const params1 = [campus_id, session_id];
+
+    if (class_id) {
+      sql1 += ` AND students.class_id = ?`;
+      params1.push(class_id);
+    }
+
+    if (section_id) {
+      sql1 += ` AND students.section_id = ?`;
+      params1.push(section_id);
+    }
+
+    if (category_id) {
+      sql1 += ` AND students.category_id = ?`;
+      params1.push(category_id);
+    }
+
+     if (from_month) {
+      sql1 += ` AND fee_vouchers.for_the_month = ?`;
+      params1.push(from_month);
+    }
+
+
+    sql1 += ` GROUP BY fee_vouchers.student_id ORDER BY MAX(fee_vouchers.class_id) ASC`;
+
+    // Execute the main query
+    connection.query(sql1, params1, (error, mainResults) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          feeVouchers: mainResults,
+        });
+      }
+      connection.release();
+    });
+  }); 
+});
+
+
+
+app.get("/classwise-voucher-summary-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const from_month = req.query.from_month;
+  const shift = req.query.shift;
+  // const to_date = req.query.to_date;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query with additional counts
+    let sql1 = `
+      SELECT 
+        cl.class, 
+        COUNT(fv.id) AS total_generated_voucher,  -- Count of total vouchers generated
+        SUM(CASE WHEN fv.status = 'unpaid' THEN 1 ELSE 0 END) AS total_unpaid_voucher,  -- Count of unpaid vouchers
+        SUM(CASE WHEN fv.status = 'paid' THEN 1 ELSE 0 END) AS total_paid_voucher,  -- Count of paid vouchers
+        COUNT(DISTINCT st.id) AS total_students  -- Count of distinct students in the class
+      FROM 
+        fee_vouchers fv
+      INNER JOIN 
+        students st ON st.id = fv.student_id
+      INNER JOIN 
+        classes cl ON cl.id = fv.class_id
+      INNER JOIN 
+        sections sec ON sec.id = fv.section_id
+      WHERE 
+        fv.campus_id = ? 
+        AND fv.session_id = ?`;
+
+    // Parameters for the base query
+    const params = [campus_id, session_id];
+
+    // Add date filtering if applicable
+    if (from_month) {
+      sql1 += ` AND fv.for_the_month = ?`;
+      params.push(from_month);
+    }
+
+    if (shift) {
+      sql1 += `  AND fv.shift = ?`;
+      params.push(shift);
+    }
+    // Continue with the GROUP BY and ORDER BY clauses
+    sql1 += `
+      GROUP BY fv.class_id
+      ORDER BY fv.class_id ASC`;
+
+    const mainQueryPromise = new Promise((resolve, reject) => {
+      connection.query(sql1, params, (error, results) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve(results);
+        }
+      });
+    });
+
+    mainQueryPromise
+      .then((mainResults) => {
+        res.json({
+          feeVouchers: mainResults,
+        });
+      })
+      .catch((error) => {
+        console.error("Error executing SQL queries: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      })
+      .finally(() => {
+        connection.release();
+      });
+  });
+});
+
+
+
+
+
+app.get("/income-tax-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query with sum calculation
+    let sql1 = `
+      SELECT 
+        SUM(employee_salary_records.income_tax) AS total_income_tax, 
+        school_employees.full_name,  
+        employee_posts.employee_post, 
+        employee_roles.employee_role, 
+        pay_scale.pay_scale,  
+        pay_scale.job_type
+      FROM employee_salary_records
+      INNER JOIN school_employees ON school_employees.id = employee_salary_records.employee_id
+      INNER JOIN employee_posts ON employee_posts.id = employee_salary_records.employee_post_id
+      INNER JOIN employee_roles ON employee_roles.id = employee_salary_records.employee_role_id
+      INNER JOIN pay_scale ON pay_scale.id = employee_salary_records.pay_scale_id
+      WHERE employee_salary_records.campus_id = ?
+    `;
+
+    // Parameters for the query
+    const params = [campus_id];
+
+    // Add date filtering if applicable
+    if (from_month && to_month) {
+      sql1 += ` AND employee_salary_records.for_the_month BETWEEN ? AND ?`;
+      params.push(from_month, to_month);
+    } else if (from_month) {
+      sql1 += ` AND employee_salary_records.for_the_month = ?`;
+      params.push(from_month);
+    }
+
+    // Group by and order by clauses
+    sql1 += `
+      GROUP BY employee_salary_records.employee_id
+      ORDER BY employee_salary_records.employee_id ASC`;
+
+    connection.query(sql1, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          salaryResults: results,
+        });
+      }
+      connection.release();
+    });
+  });
+});
+
+
+
+
+
+
+// app.get("/general-ledger-report", (req, res) => {
+//   const campus_id = req.query.campus_id;
+//   const from_month = req.query.from_month; // Expected format: "yyyy-mm"
+//   const to_month = req.query.to_month; // Expected format: "yyyy-mm"
+
+//   if (!from_month || !to_month) {
+//     return res.status(400).json({ error: "from_month and to_month are required" });
+//   }
+
+//   // Convert to full date range
+//   const from_month_date = `${from_month}-01`; // First day of the month
+//   const to_month_date = new Date(to_month + "-01"); 
+//   to_month_date.setMonth(to_month_date.getMonth() + 1); 
+//   to_month_date.setDate(0); // Last day of the given month
+//   const to_month_date_str = to_month_date.toISOString().split("T")[0];
+
+//   console.log(from_month_date, to_month_date_str);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching reports" });
+//       return;
+//     }
+
+//     let sql1 = `
+//       SELECT cfv.voucher_date, main_head_coa.main_head_name, sub_head_coa.code, sub_head_coa.name, cfv.voucher_invoice_no, cfv.description,
+//       cfv.debit, cfv.credit
+//       FROM create_voucher_finanace AS cfv
+//       INNER JOIN sub_head_coa ON sub_head_coa.id = cfv.sub_head_id
+//       INNER JOIN main_head_coa ON main_head_coa.id = cfv.main_head_id
+//       WHERE cfv.campus_id = ? 
+//       AND cfv.voucher_date BETWEEN ? AND ?
+//      ORDER BY cfv.voucher_date DESC, sub_head_coa.code ASC
+//     `;
+
+//     const params = [campus_id, from_month_date, to_month_date_str];
+
+//     connection.query(sql1, params, (error, results) => {
+//       if (error) {
+//         console.error("Error executing SQL query: ", error);
+//         res.status(500).json({ error: "Internal server error" });
+//       } else {
+//         res.json({ results });
+//       }
+//       connection.release();
+//     });
+//   });
+// });
+
+
+app.get("/general-ledger-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const from_month = req.query.from_month; // Expected format: "yyyy-mm"
+  const to_month = req.query.to_month; // Expected format: "yyyy-mm"
+
+  if (!from_month || !to_month) {
+    return res.status(400).json({ error: "from_month and to_month are required" });
+  }
+
+  // Convert to full date range
+  const from_month_date = `${from_month}-01`; // First day of the month
+  const to_month_date = new Date(to_month + "-01"); 
+  to_month_date.setMonth(to_month_date.getMonth() + 1); 
+  to_month_date.setDate(0); // Last day of the given month
+  const to_month_date_str = to_month_date.toISOString().split("T")[0];
+
+  console.log(from_month_date, to_month_date_str);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Query to fetch current period data (from `from_month_date` to `to_month_date_str`)
+    let sql1 = `
+      SELECT cfv.voucher_date, main_head_coa.main_head_name, sub_head_coa.code, sub_head_coa.name, cfv.voucher_invoice_no, cfv.description,
+             cfv.debit, cfv.credit
+      FROM create_voucher_finanace AS cfv
+      INNER JOIN sub_head_coa ON sub_head_coa.id = cfv.sub_head_id
+      INNER JOIN main_head_coa ON main_head_coa.id = cfv.main_head_id
+      WHERE cfv.campus_id = ? 
+      AND cfv.voucher_date BETWEEN ? AND ?
+      ORDER BY cfv.voucher_date DESC, sub_head_coa.code ASC`;
+
+    const params1 = [campus_id, from_month_date, to_month_date_str];
+
+    // Query to fetch previous period data (before `from_month_date`)
+    let sql2 = `
+      SELECT SUM(cfv.debit) AS total_debit, SUM(cfv.credit) AS total_credit
+      FROM create_voucher_finanace AS cfv
+      WHERE cfv.campus_id = ? 
+      AND cfv.voucher_date < ?
+    `;
+
+    const params2 = [campus_id, from_month_date];
+
+    // Execute both queries
+    connection.query(sql2, params2, (error, prevResults) => {
+      if (error) {
+        console.error("Error executing SQL query for previous totals: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release();
+        return;
+      }
+
+      // Get previous totals
+      const previousTotalDebit = prevResults[0].total_debit || 0;
+      const previousTotalCredit = prevResults[0].total_credit || 0;
+
+      // Now, execute the main query for the current period
+      connection.query(sql1, params1, (error, currentResults) => {
+        if (error) {
+          console.error("Error executing SQL query: ", error);
+          res.status(500).json({ error: "Internal server error" });
+        } else {
+          // Return both previous and current totals in the response
+          res.json({
+            previousTotals: {
+              debit: previousTotalDebit,
+              credit: previousTotalCredit
+            },
+            results: currentResults
+          });
+        }
+        connection.release();
+      });
+    });
+  });
+});
+
+
+app.get("/get-trial-list/:code/:from/:to/:campus_id/:session_id", (req, res) => {
+  const code = req.params.code;
+  const campus_id = req.params.campus_id;
+  const from_month = req.params.from; // Expected format: "yyyy-mm"
+  const to_month = req.params.to; // Expected format: "yyyy-mm"
+
+  if (!from_month || !to_month) {
+    return res.status(400).json({ error: "from_month and to_month are required" });
+  }
+
+  // Convert to full date range
+  const from_month_date = `${from_month}-01`; // First day of the month
+  const to_month_date = new Date(to_month + "-01"); 
+  to_month_date.setMonth(to_month_date.getMonth() + 1); 
+  to_month_date.setDate(0); // Last day of the given month
+  const to_month_date_str = to_month_date.toISOString().split("T")[0];
+
+  console.log(from_month_date, to_month_date_str);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Query to fetch current period data (from `from_month_date` to `to_month_date_str`)
+    let sql1 = `
+      SELECT cfv.voucher_date, main_head_coa.main_head_name, sub_head_coa.code, sub_head_coa.name, cfv.voucher_invoice_no, cfv.description,
+             cfv.debit, cfv.credit
+      FROM create_voucher_finanace AS cfv
+      INNER JOIN sub_head_coa ON sub_head_coa.id = cfv.sub_head_id
+      INNER JOIN main_head_coa ON main_head_coa.id = cfv.main_head_id
+
+      WHERE
+      sub_head_coa.code = ? AND cfv.campus_id = ? 
+      AND cfv.voucher_date BETWEEN ? AND ?
+      ORDER BY cfv.voucher_date DESC, sub_head_coa.code ASC`;
+
+    const params1 = [code, campus_id, from_month_date, to_month_date_str];
+
+    // Execute the query for the current period
+    connection.query(sql1, params1, (error, currentResults) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        // Return only the current results in the response
+        res.json({
+          results: currentResults
+        });
+      }
+      connection.release();
+    });
+  });
+});
+
+
+app.get("/over-time-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query with sum calculation
+    let sql1 = `
+      SELECT 
+        SUM(employee_salary_records.overtime) AS total_hours, 
+        SUM(employee_salary_records.overtime_amount) AS total_overtime_amount, 
+        school_employees.full_name, 
+        employee_salary_records.for_the_month, 
+        employee_posts.employee_post, 
+        employee_roles.employee_role, 
+        pay_scale.pay_scale,  
+        pay_scale.job_type
+    FROM employee_salary_records
+    JOIN school_employees ON school_employees.id = employee_salary_records.employee_id
+    JOIN employee_posts ON employee_posts.id = employee_salary_records.employee_post_id
+    JOIN employee_roles ON employee_roles.id = employee_salary_records.employee_role_id
+    JOIN pay_scale ON pay_scale.id = employee_salary_records.pay_scale_id
+    WHERE employee_salary_records.campus_id = ?`;
+
+    // AND employee_salary_records.overtime IS NOT NULL
+
+    // Parameters for the query
+    const params = [campus_id];
+
+    // Add date filtering if applicable
+    if (from_month && to_month) {
+      sql1 += ` AND employee_salary_records.for_the_month BETWEEN ? AND ?`;
+      params.push(from_month, to_month);
+    } else if (from_month) {
+      sql1 += ` AND employee_salary_records.for_the_month = ?`;
+      params.push(from_month);
+    }
+
+    // Group by and order by clauses
+    sql1 += `
+      GROUP BY employee_salary_records.employee_id
+      ORDER BY employee_salary_records.employee_id ASC`;
+
+    connection.query(sql1, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          salaryResults: results,
+        });
+      }
+      connection.release();
+    });
+  });
+});
+
+
+
+
+
+app.get("/second-shift-honorarium-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query with sum calculation
+    let sql1 = `
+      SELECT 
+    SUM(employee_salary_records.second_shift_honorarium) AS total_second_shift_honorarium, 
+    school_employees.full_name, 
+    employee_salary_records.for_the_month, 
+    employee_posts.employee_post, 
+    employee_roles.employee_role, 
+    pay_scale.pay_scale,  
+    pay_scale.job_type
+    FROM employee_salary_records
+    JOIN school_employees ON school_employees.id = employee_salary_records.employee_id
+    JOIN employee_posts ON employee_posts.id = employee_salary_records.employee_post_id
+    JOIN employee_roles ON employee_roles.id = employee_salary_records.employee_role_id
+    JOIN pay_scale ON pay_scale.id = employee_salary_records.pay_scale_id
+    WHERE employee_salary_records.campus_id = ?
+      AND employee_salary_records.second_shift_honorarium IS NOT NULL
+      AND employee_salary_records.second_shift_honorarium != 0`;
+
+        // Parameters for the query
+    const params = [campus_id];
+
+    // Add date filtering if applicable
+    if (from_month && to_month) {
+      sql1 += ` AND employee_salary_records.for_the_month BETWEEN ? AND ?`;
+      params.push(from_month, to_month);
+    } else if (from_month) {
+      sql1 += ` AND employee_salary_records.for_the_month = ?`;
+      params.push(from_month);
+    }
+
+    // Group by and order by clauses
+    sql1 += `
+      GROUP BY employee_salary_records.employee_id
+      ORDER BY employee_salary_records.employee_id ASC`;
+
+    connection.query(sql1, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          salaryResults: results,
+        });
+      }
+      connection.release();
+    });
+  });
+});
+
+
+
+
+app.get("/security-deduction-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query with sum calculation
+    let sql1 = `
+      SELECT 
+    SUM(employee_salary_records.security_deduct) AS total_security_deduct, 
+    school_employees.full_name, 
+    employee_salary_records.for_the_month, 
+    employee_posts.employee_post, 
+    employee_roles.employee_role, 
+    pay_scale.pay_scale,  
+    pay_scale.job_type
+    FROM employee_salary_records
+    JOIN school_employees ON school_employees.id = employee_salary_records.employee_id
+    JOIN employee_posts ON employee_posts.id = employee_salary_records.employee_post_id
+    JOIN employee_roles ON employee_roles.id = employee_salary_records.employee_role_id
+    JOIN pay_scale ON pay_scale.id = employee_salary_records.pay_scale_id
+    WHERE employee_salary_records.campus_id = ?
+      AND employee_salary_records.security_deduct IS NOT NULL
+      AND employee_salary_records.security_deduct != 0`;
+
+        // Parameters for the query
+    const params = [campus_id];
+
+    // Add date filtering if applicable
+    if (from_month && to_month) {
+      sql1 += ` AND employee_salary_records.for_the_month BETWEEN ? AND ?`;
+      params.push(from_month, to_month);
+    } else if (from_month) {
+      sql1 += ` AND employee_salary_records.for_the_month = ?`;
+      params.push(from_month);
+    }
+
+    // Group by and order by clauses
+    sql1 += `
+      GROUP BY employee_salary_records.employee_id
+      ORDER BY employee_salary_records.employee_id ASC`;
+
+    connection.query(sql1, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          salaryResults: results,
+        });
+      }
+      connection.release();
+    });
+  });
+});
+
+
+
+
+
+app.get("/cpf-loan-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query with sum calculation
+    let sql1 = `
+      SELECT 
+    SUM(employee_salary_records.loan_deduct) AS total_loan_deduct, 
+    school_employees.full_name, 
+    employee_salary_records.for_the_month, 
+    employee_posts.employee_post, 
+    employee_roles.employee_role, 
+    pay_scale.pay_scale,  
+    pay_scale.job_type
+    FROM employee_salary_records
+    JOIN school_employees ON school_employees.id = employee_salary_records.employee_id
+    JOIN employee_posts ON employee_posts.id = employee_salary_records.employee_post_id
+    JOIN employee_roles ON employee_roles.id = employee_salary_records.employee_role_id
+    JOIN pay_scale ON pay_scale.id = employee_salary_records.pay_scale_id
+    WHERE employee_salary_records.campus_id = ?
+      AND employee_salary_records.loan_deduct IS NOT NULL
+      AND employee_salary_records.loan_deduct != 0`;
+
+        // Parameters for the query
+    const params = [campus_id];
+
+    // Add date filtering if applicable
+    if (from_month && to_month) {
+      sql1 += ` AND employee_salary_records.for_the_month BETWEEN ? AND ?`;
+      params.push(from_month, to_month);
+    } else if (from_month) {
+      sql1 += ` AND employee_salary_records.for_the_month = ?`;
+      params.push(from_month);
+    }
+
+    // Group by and order by clauses
+    sql1 += `
+      GROUP BY employee_salary_records.employee_id
+      ORDER BY employee_salary_records.employee_id ASC`;
+
+    connection.query(sql1, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          salaryResults: results,
+        });
+      }
+      connection.release();
+    });
+  });
+});
+
+
+
+
+
+app.get("/cpf-deduction-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Base query with sum calculation
+    let sql1 = `
+      SELECT 
+    SUM(employee_salary_records.cpf) AS total_cpf, 
+    school_employees.full_name, 
+    employee_salary_records.for_the_month, 
+    employee_posts.employee_post, 
+    employee_roles.employee_role, 
+    pay_scale.pay_scale,  
+    pay_scale.job_type
+    FROM employee_salary_records
+    JOIN school_employees ON school_employees.id = employee_salary_records.employee_id
+    JOIN employee_posts ON employee_posts.id = employee_salary_records.employee_post_id
+    JOIN employee_roles ON employee_roles.id = employee_salary_records.employee_role_id
+    JOIN pay_scale ON pay_scale.id = employee_salary_records.pay_scale_id
+    WHERE employee_salary_records.campus_id = ?
+      AND employee_salary_records.cpf IS NOT NULL
+      AND employee_salary_records.cpf != 0`;
+
+        // Parameters for the query
+    const params = [campus_id];
+
+    // Add date filtering if applicable
+    if (from_month && to_month) {
+      sql1 += ` AND employee_salary_records.for_the_month BETWEEN ? AND ?`;
+      params.push(from_month, to_month);
+    } else if (from_month) {
+      sql1 += ` AND employee_salary_records.for_the_month = ?`;
+      params.push(from_month);
+    }
+
+    // Group by and order by clauses
+    sql1 += `
+      GROUP BY employee_salary_records.employee_id
+      ORDER BY employee_salary_records.employee_id ASC`;
+
+    connection.query(sql1, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          salaryResults: results,
+        });
+      }
+      connection.release();
+    });
+  });
+});
+
+
+// app.get("/income-tax-report", (req, res) => {
+//   const campus_id = req.query.campus_id;
+//   const from_month = req.query.from_month;
+//   const to_month = req.query.to_month;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching reports" });
+//       return;
+//     }
+
+//     // Base query with additional counts
+//     let sql1 = `
+//       SELECT employee_salary_records.income_tax, 
+//              school_employees.full_name, 
+//              employee_posts.employee_post, 
+//              employee_roles.employee_role, 
+//              pay_scale.pay_scale,  pay_scale.job_type
+//       FROM employee_salary_records
+//       INNER JOIN school_employees ON school_employees.id = employee_salary_records.employee_id
+//       INNER JOIN employee_posts ON employee_posts.id = employee_salary_records.employee_post_id
+//       INNER JOIN employee_roles ON employee_roles.id = employee_salary_records.employee_role_id
+//       INNER JOIN pay_scale ON pay_scale.id = employee_salary_records.pay_scale_id
+//       WHERE employee_salary_records.campus_id = ?
+//     `;
+
+//     // Parameters for the base query
+//     const params = [campus_id, session_id];
+
+//     // Add date filtering if applicable
+//     if (from_month && to_month) {
+//       sql1 += ` AND employee_salary_records.for_the_month BETWEEN ? AND ?`;
+//       params.push(from_month, to_month);
+//     } else if (from_month) {
+//       sql1 += ` AND employee_salary_records.for_the_month = ?`;
+//       params.push(from_month);
+//     }
+
+//     // Continue with the GROUP BY and ORDER BY clauses
+//     sql1 += `
+//       GROUP BY employee_salary_records.employee_id
+//       ORDER BY employee_salary_records.employee_id ASC`;
+
+//     const mainQueryPromise = new Promise((resolve, reject) => {
+//       connection.query(sql1, params, (error, results) => {
+//         if (error) {
+//           reject(error);
+//         } else {
+//           resolve(results);
+//         }
+//       });
+//     });
+
+//     mainQueryPromise
+//       .then((mainResults) => {
+//         res.json({
+//           feeVouchers: mainResults,
+//         });
+//       })
+//       .catch((error) => {
+//         console.error("Error executing SQL queries: ", error);
+//         res.status(500).json({ error: "Internal server error" });
+//       })
+//       .finally(() => {
+//         connection.release();
+//       });
+//   });
+// });
+
+
+
+
+app.get("/bankwise-summary-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const from_date = req.query.from_date;
+  const to_date = req.query.to_date;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Main query to fetch sum of recieved_payment grouped by payment_date and scroll_no
+    const sql1 = `
+     SELECT 
+      fv.payment_date, 
+      SUM(fv.recieved_payment) AS total_recieved_payment,
+      bk.bank_name,
+      bd.account_title,
+      bd.account_no
+    FROM 
+      fee_vouchers fv
+    INNER JOIN 
+      bank_details bd ON fv.payment_received_through_bank = bd.id
+    INNER JOIN 
+      banks bk ON bd.bank_id = bk.id
+    WHERE 
+      fv.campus_id = ? 
+      AND fv.session_id = ?
+      AND fv.status = 'paid'
+      AND fv.payment_date BETWEEN ? AND ?
+    GROUP BY 
+      fv.payment_date, 
+      bk.bank_name
+    ORDER BY 
+      fv.payment_date DESC`;
+
+    const params1 = [campus_id, session_id, from_date, to_date];
+
+    const mainQueryPromise = new Promise((resolve, reject) => {
+      connection.query(sql1, params1, (error, results) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve(results);
+        }
+      });
+    });
+
+    mainQueryPromise
+      .then((mainResults) => {
+        const totalRecords = mainResults.length; // Get the total number of records
+        const totalPages = 1; // Since no pagination is used, set totalPages to 1
+
+        res.json({
+          feeVouchers: mainResults,
+          totalPages: totalPages,
+          currentPage: 1, // Since pagination is removed, set currentPage to 1
+          totalRecords: totalRecords,
+        });
+      })
+      .catch((error) => {
+        console.error("Error executing SQL queries: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      })
+      .finally(() => {
+        connection.release();
+      });
+  });
+});
+
+
+
+
+
+app.get("/get-payable-and-recievable-fee-vouchers", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const category_id = req.query.category_id;
+  const search = req.query.search || ""; // Get the search query
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 100;
+  const offset = (page - 1) * limit;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Calculate the month count between from_month and to_month
+    const monthCountQuery = `SELECT TIMESTAMPDIFF(MONTH, ?, ?) + 1 AS month_count`;
+    connection.query(
+      monthCountQuery,
+      [from_month + "-01", to_month + "-01"],
+      (error, monthCountResult) => {
+        if (error) {
+          console.error("Error calculating month count: ", error);
+          res.status(500).json({ error: "Internal server error" });
+          connection.release();
+          return;
+        }
+
+        const monthCount = monthCountResult[0].month_count;
+
+        // console.log(monthCountResult);
+
+        let arrearsCondition = "";
+        let firstArrearCondition = "";
+
+        if (monthCount == 1) {
+          arrearsCondition = " + fee_vouchers.arrears";
+        }
+
+        firstArrearCondition = `
+        CASE 
+          WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears
+          ELSE 0
+        END
+      `;
+
+        let sql1 = `
+      SELECT
+          students.class_id, 
+          classes.class AS class_name, 
+          students.section_id, 
+          students.register_no, 
+          students.father_mobile_no, 
+          sections.section_name, 
+          school_categories.category, 
+          students.category_id, 
+          fee_vouchers.bus_fee,
+          fee_vouchers.student_id, 
+          students.full_name, 
+          COUNT(fee_vouchers.id) AS total_vouchers_count,
+          SUM(
+              CASE 
+                  WHEN fee_vouchers.payment_date > fee_vouchers.due_date OR fee_vouchers.is_arrear = 'arrears' THEN
+                      fee_vouchers.total_amount_data + fee_vouchers.fine ${arrearsCondition} + ${firstArrearCondition} + COALESCE(fee_vouchers.first_advance_payment, 0)
+                  ELSE
+                      fee_vouchers.total_amount_data ${arrearsCondition} + ${firstArrearCondition} + COALESCE(fee_vouchers.first_advance_payment, 0)
+              END
+          ) AS total_payable_amount,
+          SUM(fee_vouchers.recieved_payment) AS total_received_payment,
+          SUM(fee_vouchers.arrears_gap) AS total_arrears_gap, 
+          SUM(fee_vouchers.arrears_not_cleared) AS total_arrears_not_cleared
+      FROM 
+          fee_vouchers
+      JOIN
+          students ON students.id = fee_vouchers.student_id 
+      JOIN 
+          classes ON classes.id = students.class_id
+      JOIN 
+          sections ON students.section_id = sections.id
+      JOIN 
+          school_categories ON students.category_id = school_categories.id
+      WHERE 
+          fee_vouchers.campus_id = ?
+          AND fee_vouchers.session_id = ?`;
+
+        const params1 = [campus_id, session_id];
+
+        if (from_month && to_month) {
+          sql1 += ` AND fee_vouchers.for_the_month BETWEEN ? AND ?`;
+          params1.push(from_month, to_month);
+        } else if (from_month) {
+          sql1 += ` AND fee_vouchers.for_the_month = ?`;
+          params1.push(from_month);
+        }
+
+        if (class_id) {
+          sql1 += ` AND students.class_id = ?`;
+          params1.push(class_id);
+        }
+
+        if (section_id) {
+          sql1 += ` AND students.section_id = ?`;
+          params1.push(section_id);
+        }
+
+        if (category_id) {
+          sql1 += ` AND students.category_id = ?`;
+          params1.push(category_id);
+        }
+
+        // Add search condition for student name or other fields
+        if (search) {
+          sql1 += ` AND (LOWER(students.full_name) LIKE LOWER(?) OR LOWER(students.register_no) LIKE LOWER(?) OR LOWER(students.father_mobile_no) LIKE LOWER(?) OR LOWER(classes.class) LIKE LOWER(?) OR LOWER(sections.section_name) LIKE LOWER(?))`;
+          const searchPattern = `%${search}%`;
+          params1.push(
+            searchPattern,
+            searchPattern,
+            searchPattern,
+            searchPattern,
+            searchPattern
+          );
+        }
+
+        sql1 += `
+      GROUP BY 
+          students.class_id, 
+          classes.class, 
+          students.section_id, 
+          students.register_no, 
+          students.father_mobile_no, 
+          sections.section_name, 
+          school_categories.category, 
+          students.category_id, 
+          fee_vouchers.bus_fee,
+          fee_vouchers.student_id, 
+          students.full_name
+      ORDER BY 
+          students.id 
+      LIMIT ? OFFSET ?`;
+
+        params1.push(limit, offset);
+
+        // Manually construct and log the final SQL query string
+        // const formattedSql1 = connection.format(sql1, params1);
+        // console.log("SQL Query:", formattedSql1);
+
+        connection.query(sql1, params1, (error, results) => {
+          if (error) {
+            console.error("Error executing SQL query: ", error);
+            res.status(500).json({ error: "Internal server error" });
+            connection.release();
+            return;
+          }
+
+          let countQuery = `
+          SELECT COUNT(DISTINCT fee_vouchers.student_id) AS totalRecords
+          FROM fee_vouchers
+          JOIN students ON students.id = fee_vouchers.student_id 
+          WHERE fee_vouchers.campus_id = ?
+          AND fee_vouchers.session_id = ?`;
+
+          const countParams = [campus_id, session_id];
+
+          if (search) {
+            countQuery += ` AND (students.full_name LIKE ? OR students.register_no LIKE ? OR students.father_mobile_no LIKE ?)`;
+            countParams.push(`%${search}%`, `%${search}%`, `%${search}%`);
+          }
+
+          connection.query(countQuery, countParams, (error, countResult) => {
+            if (error) {
+              console.error("Error executing count query: ", error);
+              res.status(500).json({ error: "Internal server error" });
+              return;
+            }
+
+            // Total Query with the same logic as sql1
+            let totalQuery = `
+          SELECT
+              SUM(
+                  CASE 
+                      WHEN fee_vouchers.payment_date > fee_vouchers.due_date OR fee_vouchers.is_arrear = 'arrears' THEN
+                          fee_vouchers.total_amount_data + fee_vouchers.fine ${arrearsCondition} + ${firstArrearCondition} + COALESCE(fee_vouchers.first_advance_payment, 0)
+                      ELSE
+                          fee_vouchers.total_amount_data ${arrearsCondition} + ${firstArrearCondition} + COALESCE(fee_vouchers.first_advance_payment, 0)
+                  END
+              ) AS grand_total_payable_amount,
+              SUM(fee_vouchers.recieved_payment) AS grand_total_received_payment
+          FROM 
+              fee_vouchers
+          JOIN
+              students ON students.id = fee_vouchers.student_id 
+          JOIN 
+              classes ON classes.id = students.class_id
+          JOIN 
+              sections ON students.section_id = sections.id
+          JOIN 
+              school_categories ON students.category_id = school_categories.id
+          WHERE 
+              fee_vouchers.campus_id = ?
+              AND fee_vouchers.session_id = ?`;
+
+            const totalParams = [campus_id, session_id];
+
+            if (from_month && to_month) {
+              totalQuery += ` AND fee_vouchers.for_the_month BETWEEN ? AND ?`;
+              totalParams.push(from_month, to_month);
+            } else if (from_month) {
+              totalQuery += ` AND fee_vouchers.for_the_month = ?`;
+              totalParams.push(from_month);
+            }
+
+            if (class_id) {
+              totalQuery += ` AND students.class_id = ?`;
+              totalParams.push(class_id);
+            }
+
+            if (section_id) {
+              totalQuery += ` AND students.section_id = ?`;
+              totalParams.push(section_id);
+            }
+
+            if (category_id) {
+              totalQuery += ` AND students.category_id = ?`;
+              totalParams.push(category_id);
+            }
+
+            if (search) {
+              totalQuery += ` AND (students.full_name LIKE ? OR students.register_no LIKE ? OR students.father_mobile_no LIKE ?)`;
+              totalParams.push(`%${search}%`, `%${search}%`, `%${search}%`);
+            }
+
+            // Manually construct and log the final total SQL query string
+            const formattedTotalQuery = connection.format(
+              totalQuery,
+              totalParams
+            );
+            // console.log("Total SQL Query:", formattedTotalQuery);
+
+            connection.query(totalQuery, totalParams, (error, totalResult) => {
+              connection.release();
+              if (error) {
+                console.error("Error executing total query: ", error);
+                res.status(500).json({ error: "Internal server error" });
+                return;
+              }
+
+              const totalRecords = countResult[0].totalRecords;
+              const totalPages = Math.ceil(totalRecords / limit);
+
+              res.json({
+                feeVouchers: results,
+                grandTotalPayableAmount:
+                  totalResult[0].grand_total_payable_amount,
+                grandTotalReceivedAmount:
+                  totalResult[0].grand_total_received_payment,
+                totalPages: totalPages,
+                currentPage: page,
+                totalRecords: totalRecords,
+              });
+            });
+          });
+        });
+      }
+    );
+  });
+});
+
+
+
+app.get("/employee-excel-report", async (req, res) => {
+  try {
+    // Extract parameters from query string
+    const campus_id = req.query.campus_id;
+
+    let sql = `
+        SELECT 
+        school_employees.id,
+        school_employees.register_no,
+        school_employees.appointment_date,
+        employee_roles.employee_role,
+        employee_posts.employee_post,
+        pay_scale.pay_scale,
+        school_employees.full_name,
+        school_employees.father_name,
+        school_employees.mother_name,
+        school_employees.mobile_no,
+        school_employees.gender,
+        school_employees.dob,
+        school_employees.cnic,
+        school_employees.marital_status,
+        school_employees.current_address,
+        school_employees.permanent_address,
+        school_employees.qualification,
+        school_employees.experience,
+        school_employees.work_shift,
+        school_employees.second_shift_honorarium,
+        school_employees.employee_campus_id,
+        school_employees.status,
+        school_employees.profile_image,
+        school_employees.soft_delete,
+        school_employees.account_no,
+        school_employees.security_deduction,
+        school_employees.security_no_of_installment,
+        school_employees.total_security_deduction,
+        school_employees.campus_id,
+        school_employees.user_id,
+        school_employees.basic_salary,
+        school_employees.house_rent,
+        school_employees.additional_increments,
+        school_employees.total_security_deduct_from_salary,
+        school_employees.loan_deduction,
+        school_employees.loan_no_of_installment,
+        school_employees.total_loan_deduction,
+        school_employees.total_loan_deduct_from_salary,
+        school_employees.bus_charges,
+        school_employees.bus_status
+        FROM 
+            school_employees
+        JOIN 
+            employee_roles ON school_employees.employee_role_id = employee_roles.id 
+        JOIN 
+            employee_posts ON school_employees.employee_post_id = employee_posts.id
+        JOIN 
+            pay_scale ON school_employees.pay_scale_id = pay_scale.id
+        WHERE 
+            school_employees.soft_delete = 'On' 
+            AND school_employees.campus_id = ${connection.escape(campus_id)}
+        ORDER BY 
+            school_employees.id DESC
+        `;
+    // Execute the query
+    connection.query(sql, async (error, results) => {
+      if (error) {
+        console.error("Error executing query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+      if (results.length === 0) {
+        res.json({ message: "Data not exist" });
+        return;
+      }
+      // Generate Excel report using the function
+      await generateExcelReport(res, sql);
+    });
+  } catch (error) {
+    console.error("Error handling request:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+// app.get("/pendency-excel-report", async (req, res) => {
+//   try {
+//     const campus_id = connection.escape(req.query.campus_id);
+//     const session_id = connection.escape(req.query.session_id);
+//     const from_month = req.query.from_month ? connection.escape(req.query.from_month) : null;
+//     const class_id = req.query.class_id ? connection.escape(req.query.class_id) : null;
+//     const section_id = req.query.section_id ? connection.escape(req.query.section_id) : null;
+//     const category_id = req.query.category_id ? connection.escape(req.query.category_id) : null;
+//     const search = req.query.search ? connection.escape(`%${req.query.search}%`) : null;
+
+//     const getLastEntrySQL = `
+//       SELECT for_the_month 
+//       FROM fee_vouchers 
+//       WHERE voucher_created_form = 'Multiple' AND campus_id = ${campus_id} AND session_id = ${session_id}
+//       ORDER BY id DESC 
+//       LIMIT 1
+//     `;
+
+//     connection.query(getLastEntrySQL, (error, lastEntryResult) => {
+//       if (error) {
+//         console.error("Error executing SQL query:", error);
+//         res.status(500).json({ error: "Internal server error" });
+//         return;
+//       }
+
+//       if (lastEntryResult.length === 0) {
+//         res.status(404).json({ error: 'No entries found for voucher_created_form = "Multiple"' });
+//         return;
+//       }
+
+//       const lastForTheMonth = connection.escape(lastEntryResult[0].for_the_month);
+
+//       let sql1 = `
+//         SELECT
+//             students.class_id,
+//             classes.class AS class_name,
+//             students.section_id,
+//             students.register_no,
+//             students.father_mobile_no,
+//             sections.section_name,
+//             school_categories.category,
+//             students.category_id,
+//             fee_vouchers.bus_fee,
+//             fee_vouchers.student_id,
+//             students.full_name,
+//             COUNT(fee_vouchers.id) AS unpaid_vouchers_count,
+//             GROUP_CONCAT(fee_vouchers.for_the_month ORDER BY fee_vouchers.for_the_month ASC) AS months,
+//            SUM(
+//                 CASE 
+//                     WHEN fee_vouchers.for_the_month < ${lastForTheMonth} AND (fee_vouchers.status = 'unpaid' || fee_vouchers.is_arrear = 'arrears' || fee_vouchers.payment_date > fee_vouchers.due_date)
+//                     THEN fee_vouchers.total_amount_data + fee_vouchers.fine  + fee_vouchers.first_advance_payment 
+//                      + (CASE WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears ELSE 0 END)
+//                     ELSE fee_vouchers.total_amount_data + fee_vouchers.first_advance_payment
+//                     + (CASE WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears ELSE 0 END)
+//                 END
+//             `;
+
+//         if (from_month) {
+//               sql1 += ` + (CASE WHEN fee_vouchers.first_arrear != 'yes' THEN fee_vouchers.arrears ELSE 0 END)`;
+//         }
+
+//       sql1 += `) AS payable_amount_after_due_date,
+//             SUM(IFNULL(fee_vouchers.arrears_not_cleared, 0)) AS total_arrears_not_cleared,
+//             fee_vouchers.status
+//         FROM
+//             fee_vouchers
+//         JOIN
+//             students ON students.id = fee_vouchers.student_id
+//         JOIN
+//             classes ON classes.id = students.class_id
+//         JOIN
+//             sections ON students.section_id = sections.id
+//         JOIN
+//             school_categories ON students.category_id = school_categories.id
+//         WHERE
+//             fee_vouchers.campus_id = ${campus_id} 
+//             AND fee_vouchers.session_id = ${session_id} 
+//             AND fee_vouchers.status = 'unpaid'
+//             AND students.status != 'Struck Off'`;
+
+//       if (from_month) {
+//         sql1 += ` AND fee_vouchers.for_the_month = ${from_month}`;
+//       }
+//       if (class_id) {
+//         sql1 += ` AND students.class_id = ${class_id}`;
+//       }
+//       if (section_id) {
+//         sql1 += ` AND students.section_id = ${section_id}`;
+//       }
+//       if (category_id) {
+//         sql1 += ` AND students.category_id = ${category_id}`;
+//       }
+//       if (search) {
+//         sql1 += ` AND (students.full_name LIKE ${search} OR students.register_no LIKE ${search})`;
+//       }
+
+//       sql1 += ` GROUP BY fee_vouchers.student_id ORDER BY students.class_id ASC`;
+
+//       connection.query(sql1, async (error, mainResults) => {
+//         if (error) {
+//           console.error("Error executing SQL query:", error);
+//           res.status(500).json({ error: "Internal server error" });
+//           return;
+//         }
+
+//         if (mainResults.length === 0) {
+//           res.json({ message: "Data not exist" });
+//           return;
+//         }
+
+//         await generateExcelReport(res, sql1);
+//       });
+//     });
+//   } catch (error) {
+//     console.error("Error handling request:", error);
+//     res.status(500).json({ error: "Internal server error" });
+//   }
+// });
+
+
+
+
+app.get("/recievable-and-payable-excel-report", async (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const from_month = req.query.from_month;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const category_id = req.query.category_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    // Building the main SQL query
+    let sql1 = `
+      SELECT
+        students.full_name,
+        classes.class AS class_name,
+        sections.section_name,
+        students.register_no,
+        students.father_mobile_no,
+        school_categories.category,
+        COUNT(fee_vouchers.id) AS total_vouchers_count,
+        GROUP_CONCAT(fee_vouchers.for_the_month ORDER BY fee_vouchers.for_the_month ASC) AS months,
+        SUM(
+          CASE 
+            WHEN (fee_vouchers.is_arrear = 'arrears' OR payment_date > due_date)
+              THEN fee_vouchers.after_due_date_amount + fee_vouchers.first_advance_payment
+            WHEN ((fee_vouchers.is_arrear IS NULL OR fee_vouchers.is_arrear = '') OR payment_date <= due_date)
+              THEN fee_vouchers.total_amount_data + fee_vouchers.first_advance_payment
+            ELSE 0
+          END
+        ) AS payable_amount,
+        SUM(
+          CASE 
+            WHEN fee_vouchers.status = 'paid'
+              THEN fee_vouchers.recieved_payment
+            ELSE 0
+          END
+        ) AS received_amount
+      FROM
+        fee_vouchers
+      JOIN
+        students ON students.id = fee_vouchers.student_id
+      JOIN
+        classes ON classes.id = students.class_id
+      JOIN
+        sections ON students.section_id = sections.id
+      JOIN
+        school_categories ON students.category_id = school_categories.id
+      WHERE
+        fee_vouchers.campus_id = ${campus_id} 
+        AND fee_vouchers.session_id = ${session_id} 
+    `;
+
+    // Adding conditional filters based on query parameters
+    if (from_month) {
+      sql1 += ` AND fee_vouchers.for_the_month = ${from_month}`;
+    }
+    if (class_id) {
+      sql1 += ` AND students.class_id = ${class_id}`;
+    }
+    if (section_id) {
+      sql1 += ` AND students.section_id = ${section_id}`;
+    }
+    if (category_id) {
+      sql1 += ` AND students.category_id = ${category_id}`;
+    }
+
+    sql1 += ` GROUP BY fee_vouchers.student_id ORDER BY students.class_id ASC`;
+
+    // Execute the main query
+    connection.query(sql1, async (error, mainResults) => {
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release();
+        return;
+      }
+
+      if (mainResults.length === 0) {
+        res.json({ message: "Data not exist" });
+        connection.release();
+        return;
+      }
+
+      try {
+        // Generate the Excel report
+        await generateExcelReport(res, sql1);
+      } catch (error) {
+        console.error("Error generating Excel report:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } finally {
+        connection.release();
+      }
+    });
+  });
+});
+
+
+
+
+
+
+app.get("/admission-excel-report", async (req, res) => {
+  try {
+    // Extract parameters from query string
+    const campus_id = req.query.campus_id;
+    const session_id = req.query.session_id;
+    const from_date = req.query.from_date;
+    const to_date = req.query.to_date;
+    const class_id = req.query.class_id;
+    const section_id = req.query.section_id;
+    const category_id = req.query.category_id;
+    const status = req.query.status;
+    const search = req.query.search;
+
+    let sql = `
+        SELECT 
+        students.register_no,
+        students.old_register_no,
+        students.shift,
+        students.admission_date,
+        students.full_name,
+         classes.class,
+        sections.section_name,
+        school_categories.category,
+        students.gender,
+        students.dob,
+        students.religion,
+        students.cast,
+        students.blood_group,
+        students.mother_tongue,
+        students.current_address,
+        students.permanent_address,
+        students.mobile_no,
+        students.student_cnic,
+        students.house_id,
+        students.club_id,
+        students.guardian_name,
+        students.relation,
+        students.occupation,
+        students.guardian_mobile_no,
+        students.guardian_address,
+        students.guardian_cnic,
+        students.pl_no,
+        students.designation,
+        students.department,
+        students.student_image,
+        students.created_at,
+        students.status,
+        students.father_cnic,
+        students.father_mobile_no,
+        students.father_name,
+        students.status_date,
+        students.bus_status,
+        students.bus_Fee
+        FROM 
+            students
+        LEFT JOIN 
+            classes ON students.class_id = classes.id 
+        LEFT JOIN 
+            sections ON students.section_id = sections.id
+        LEFT JOIN 
+            school_categories ON students.category_id = school_categories.id
+        WHERE 
+            students.session_id = ${connection.escape(
+              session_id
+            )} AND students.campus_id = ${connection.escape(campus_id)}
+        `;
+
+    if (from_date && to_date && (status == 'New Admission' || status == 'Promoted')) {
+      sql += ` AND students.admission_date BETWEEN ${connection.escape(
+        from_date
+      )} AND ${connection.escape(to_date)}`;
+    } else if (from_date && to_date && (status == 'Struck Off' || status == 'SLC')){
+       sql += ` AND students.status_date BETWEEN ${connection.escape(
+        from_date
+      )} AND ${connection.escape(to_date)}`;
+     } else if (from_date && to_date){
+       sql += ` AND students.admission_date BETWEEN ${connection.escape(
+        from_date
+      )} AND ${connection.escape(to_date)}`;
+     }
+
+
+    if (class_id) {
+      sql += ` AND students.class_id = ${connection.escape(class_id)}`;
+    }
+
+    if (section_id) {
+      sql += ` AND students.section_id = ${connection.escape(section_id)}`;
+    }
+
+    if (category_id) {
+      sql += ` AND students.category_id = ${connection.escape(category_id)}`;
+    }
+
+    if (status) {
+      sql += ` AND students.status = ${connection.escape(status)}`;
+    }
+
+    if (search) {
+      const searchQuery = `%${search}%`;
+      sql += ` AND (
+                students.full_name LIKE ${connection.escape(searchQuery)} OR 
+                students.father_name LIKE ${connection.escape(searchQuery)} OR 
+                students.register_no LIKE ${connection.escape(searchQuery)} OR 
+                students.father_cnic LIKE ${connection.escape(searchQuery)} OR 
+                students.mobile_no LIKE ${connection.escape(searchQuery)}
+              )`;
+    }
+
+    sql += `
+        ORDER BY 
+            students.id DESC`;
+
+    // Execute the query
+    connection.query(sql, async (error, results) => {
+      if (error) {
+        console.error("Error executing query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      if (results.length === 0) {
+        res.json({ message: "Data not exist" });
+        return;
+      }
+
+      // Generate Excel report using the function
+      await generateExcelReport(res, sql);
+    });
+  } catch (error) {
+    console.error("Error handling request:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+app.get("/get-campuses", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching campuses" });
+      return;
+    }
+
+    const sql = "SELECT * FROM campuses";
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching campuses" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+app.get("/employee-scale", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching scale" });
+      return;
+    }
+
+    const sql = "SELECT * FROM pay_scale";
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching scale" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+// app.post('/insert-school-employee', upload.single('profile_image'), (req, res) => {
+//   const {
+//     hidden_id, register_no, appointment_date, job_type, employee_role, employee_post, pay_scale,
+//     full_name, father_name, mother_name, mobile_no, gender, dob, cnic, marital_status,
+//     current_address, permanent_address, qualification, experience, work_shift,
+//     employee_campus_id, status, basic_salary, annual_increment, house_rent,
+//     additional_increment, pessi, eobi, old_adhoc, current_adhoc, total_adhoc, total_no_of_increments,
+//     grand_total_increments, total_basic_salary, total_net_salary, security_deduction
+//   } = req.body;
+
+//   let profile_image = req.file ? req.file.filename : '';
+
+//   // Check for uniqueness of register_no
+//   let checkQuery = 'SELECT id FROM school_employees WHERE register_no = ? AND soft_delete != "Off"';
+//   let checkValues = [register_no];
+
+//   if (hidden_id) {
+//     // Exclude current employee from check if updating
+//     checkQuery += ' AND id != ?';
+//     checkValues.push(hidden_id);
+//   }
+
+//   connection.query(checkQuery, checkValues, (err, results) => {
+//     if (err) {
+//       console.error('Error checking register_no uniqueness:', err);
+//       return res.status(500).json({ error: 'Error checking register_no uniqueness' });
+//     }
+
+//     if (results.length > 0) {
+//       // register_no already exists
+//       return res.status(400).json({ error: 'register_no must be unique' });
+//     }
+
+//     if (hidden_id) {
+//       // Update existing employee
+//       let updateEmployeeQuery = `
+//         UPDATE school_employees
+//         SET register_no = ?, appointment_date = ?, job_type= ?, employee_role_id = ?, employee_post_id = ?, pay_scale_id = ?,
+//             full_name = ?, father_name = ?, mother_name = ?, mobile_no = ?, gender = ?, dob = ?, cnic = ?,
+//             marital_status = ?, current_address = ?, permanent_address = ?, qualification = ?,
+//             experience = ?, work_shift = ?, employee_campus_id = ?, status = ?
+//       `;
+
+//       const updateEmployeeValues = [
+//         register_no, appointment_date, job_type, employee_role, employee_post, pay_scale,
+//         full_name, father_name, mother_name, mobile_no, gender, dob, cnic, marital_status,
+//         current_address, permanent_address, qualification, experience, work_shift,
+//         employee_campus_id, status
+//       ];
+
+//       if (profile_image) {
+//         updateEmployeeQuery += `, profile_image = ?`;
+//         updateEmployeeValues.push(profile_image);
+//       }
+
+//       updateEmployeeQuery += ` WHERE id = ?`;
+//       updateEmployeeValues.push(hidden_id);
+
+//       connection.query(updateEmployeeQuery, updateEmployeeValues, (err, result) => {
+//         if (err) {
+//           console.error('Error updating employee data:', err);
+//           return res.status(500).json({ error: 'Error updating employee data' });
+//         }
+
+//         // Fetch the last row id of service_book for this employee
+//         const getLastServiceBookIdQuery = `
+//           SELECT id FROM service_book WHERE employee_id = ? ORDER BY id DESC LIMIT 1
+//         `;
+
+//         connection.query(getLastServiceBookIdQuery, [hidden_id], (err, serviceBookResults) => {
+//           if (err) {
+//             console.error('Error fetching last service book id:', err);
+//             return res.status(500).json({ error: 'Error fetching last service book id' });
+//           }
+
+//           if (serviceBookResults.length === 0) {
+//             return res.status(400).json({ error: 'No service book record found for this employee' });
+//           }
+
+//           // Now update the last service book entry for this employee
+//           const updateServiceBookQuery = `
+//             UPDATE service_book
+//             SET employee_role_id = ?, employee_post_id = ?, pay_scale_id = ?, basic_salary = ?, annual_increment = ?,
+//                 house_rent = ?, additional_increments = ?, pessi = ?, eobi = ?, old_adhoc = ?, current_adhoc = ?, total_adhoc = ?, total_no_of_increments = ?,
+//                 grand_total_increments = ?, total_basic_salary = ?, total_net_salary = ?, security_deduction = ?
+//             WHERE id = ?
+//           `;
+
+//           const updateServiceBookValues = [
+//             employee_role, employee_post, pay_scale, basic_salary, annual_increment,
+//             house_rent, additional_increments, pessi, eobi, old_adhoc, current_adhoc, total_adhoc, total_no_of_increments,
+//             grand_total_increments, total_basic_salary, total_net_salary, security_deduction
+//           ];
+
+//           connection.query(updateServiceBookQuery, updateServiceBookValues, (err, result) => {
+//             if (err) {
+//               console.error('Error updating service book data:', err);
+//               return res.status(500).json({ error: 'Error updating service book data' });
+//             }
+//             res.json({ message: 'Employee and service book data updated successfully!' });
+//           });
+//         });
+//       });
+//     } else {
+//       // Insert new employee and service book data
+//       const insertEmployeeQuery = `
+//         INSERT INTO school_employees (
+//           register_no, appointment_date,  employee_role_id, employee_post_id, pay_scale_id,
+//           full_name, father_name, mother_name, mobile_no, gender, dob, cnic, marital_status,
+//           current_address, permanent_address, qualification, experience, work_shift,
+//           employee_campus_id, status, profile_image
+//         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+//       `;
+
+//       const insertEmployeeValues = [
+//         register_no, appointment_date, employee_role, employee_post, pay_scale,
+//         full_name, father_name, mother_name, mobile_no, gender, dob, cnic, marital_status,
+//         current_address, permanent_address, qualification, experience, work_shift,
+//         employee_campus_id, status, profile_image
+//       ];
+
+//       connection.query(insertEmployeeQuery, insertEmployeeValues, (err, employeeResult) => {
+//         if (err) {
+//           console.error('Error inserting employee data:', err);
+//           return res.status(500).json({ error: 'Error inserting employee data' });
+//         }
+
+//         // Getting the new employee ID for service_book
+//         const employee_id = employeeResult.insertId;
+
+//         // Now insert into the service_book table
+//         const insertServiceBookQuery = `
+//           INSERT INTO service_book (
+//             employee_id, employee_role_id, employee_post_id, pay_scale_id, basic_salary,
+//             annual_increment, house_rent, additional_increment, pessi, eobi, old_adhoc, current_adhoc, total_adhoc,
+//             total_no_of_increments, grand_total_increments, total_basic_salary
+//           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+//         `;
+
+//         const insertServiceBookValues = [
+//           employee_id, employee_role, employee_post, pay_scale, basic_salary,
+//           annual_increment, house_rent, additional_increment, pessi, eobi, old_adhoc, current_adhoc, total_adhoc,
+//           total_no_of_increments, grand_total_increments, total_basic_salary
+//         ];
+
+//         connection.query(insertServiceBookQuery, insertServiceBookValues, (err, result) => {
+//           if (err) {
+//             console.error('Error inserting service book data:', err);
+//             return res.status(500).json({ error: 'Error inserting service book data' });
+//           }
+//           res.json({ message: 'Employee and service book data inserted successfully!' });
+//         });
+//       });
+//     }
+//   });
+// });
+
+// app.post('/insert-school-employee', upload.single('profile_image'), (req, res) => {
+
+//   const {
+//     hidden_id, register_no, appointment_date, job_type, employee_role, employee_post, pay_scale,
+//     full_name, father_name, mother_name, mobile_no, gender, dob, cnic, marital_status,
+//     current_address, permanent_address, qualification, experience, work_shift, second_shift_honorarium,
+//     employee_campus_id, status, basic_salary, house_rent,
+//     additional_increment, pessi, eobi, old_adhoc, current_adhoc, total_adhoc,
+//     previous_total_increments, current_increment, total_net_salary, security_deduction, security_no_of_installment, account_no, total_security_deduction, bus_status, bus_charges, loan_no_of_installment, loan_deduction, loan, income_tax, rebate, principal_allownce, special_allownce, medical_allownce, campus_id, user_id
+//   } = req.body;
+
+//   const annual_increment_status = current_increment > 0 ? "annual_increment" : "";
+//   const adhoc_increment_status = current_adhoc > 0 ? "adhoc_increment" : "";
+
+//   let profile_image = req.file ? req.file.filename : '';
+
+//   // Check for uniqueness of register_no
+//   let checkQuery = 'SELECT id FROM school_employees WHERE register_no = ? AND soft_delete != "Off"';
+//   let checkValues = [register_no];
+
+//   if (hidden_id) {
+//     // Exclude current employee from check if updating
+//     checkQuery += ' AND id != ?';
+//     checkValues.push(hidden_id);
+//   }
+
+//   connection.query(checkQuery, checkValues, (err, results) => {
+//     if (err) {
+//       console.error('Error checking register_no uniqueness:', err);
+//       return res.status(500).json({ error: 'Error checking register_no uniqueness' });
+//     }
+
+//     if (results.length > 0) {
+//       // register_no already exists
+//       return res.status(400).json({ error: 'register_no must be unique' });
+//     }
+
+//     if (hidden_id) {
+//       // Update existing employee
+//       let updateEmployeeQuery = `
+//         UPDATE school_employees
+//         SET register_no = ?, appointment_date = ?, employee_role_id = ?, employee_post_id = ?, pay_scale_id = ?,
+//             full_name = ?, father_name = ?, mother_name = ?, mobile_no = ?, gender = ?, dob = ?, cnic = ?,
+//             marital_status = ?, current_address = ?, permanent_address = ?, qualification = ?,
+//             income_tax = ?, rebate = ?,  experience = ?, work_shift = ?, second_shift_honorarium = ?, employee_campus_id = ?, status = ?, account_no=? , security_deduction = ?, security_no_of_installment=?, total_security_deduction=?, bus_status = ? , bus_charges = ?, loan_no_of_installment = ?, loan_deduction = ?, total_loan_deduction = ?,   campus_id = ?, user_id = ?, additional_increments= ?, house_rent = ?, basic_salary = ?
+//       `;
+
+//       const updateEmployeeValues = [
+//         register_no, appointment_date, employee_role, employee_post, pay_scale,
+//         full_name, father_name, mother_name, mobile_no, gender, dob, cnic, marital_status,
+//         current_address, permanent_address, qualification, income_tax, rebate, experience, work_shift, second_shift_honorarium,
+//         employee_campus_id, status, account_no, security_deduction, security_no_of_installment, total_security_deduction, bus_status, bus_charges, loan_no_of_installment, loan_deduction, loan, campus_id, user_id, additional_increment, house_rent, basic_salary
+//       ];
+
+//       if (profile_image) {
+//         updateEmployeeQuery += `, profile_image = ?`;
+//         updateEmployeeValues.push(profile_image);
+//       }
+
+//       updateEmployeeQuery += ` WHERE id = ?`;
+//       updateEmployeeValues.push(hidden_id);
+
+//       connection.query(updateEmployeeQuery, updateEmployeeValues, (err, result) => {
+//         if (err) {
+//           console.error('Error updating employee data:', err);
+//           return res.status(500).json({ error: 'Error updating employee data' });
+//         }
+
+//         // Now update the service book entry for this employee
+//         const updateServiceBookQuery = `
+//         UPDATE service_book
+//         SET employee_role_id = ?, employee_post_id = ?, pay_scale_id = ?, basic_salary = ?,
+//             house_rent = ?, additional_increment = ?, pessi = ?, eobi = ?, old_adhoc = ?, current_adhoc = ?, total_adhoc = ?,
+//             previous_total_increments = ?, current_increment = ?, total_increment = ?,  total_net_salary = ?, second_shift_honorarium = ?,  campus_id = ?, user_id = ?, job_type = ?, annual_increment_status = ?, adhoc_increment_status = ?, principal_allownce = ?, special_allownce = ?, medical_allownce = ?
+//         WHERE employee_id = ?`;
+
+//         const updateServiceBookValues = [
+//           employee_role, employee_post, pay_scale, basic_salary,
+//           house_rent, additional_increment, pessi, eobi, old_adhoc, current_adhoc, total_adhoc,
+//           previous_total_increments, current_increment, previous_total_increments + current_increment, total_net_salary, second_shift_honorarium, campus_id, user_id, job_type, current_increment > 0 ? "annual_increment" : 0, current_adhoc > 0 ? "adhoc_increment" : 0, principal_allownce, special_allownce, medical_allownce, hidden_id
+//         ];
+
+//         connection.query(updateServiceBookQuery, updateServiceBookValues, (err, result) => {
+//           if (err) {
+//             console.error('Error updating service book data:', err);
+//             return res.status(500).json({ error: 'Error updating service book data' });
+//           }
+//           res.json({ message: 'Employee and service book data updated successfully!' });
+//         });
+//       });
+//     } else {
+
+//       // Insert new employee and service book data
+//       const insertEmployeeQuery = `
+//         INSERT INTO school_employees (
+//           register_no, appointment_date,  employee_role_id, employee_post_id, pay_scale_id,
+//           full_name, father_name, mother_name, mobile_no, gender, dob, cnic, marital_status,
+//           current_address, permanent_address, qualification, income_tax, rebate, experience, work_shift, second_shift_honorarium,
+//           employee_campus_id, status, account_no, security_deduction, security_no_of_installment, total_security_deduction, bus_status, bus_charges, loan_no_of_installment, loan_deduction, total_loan_deduction,  campus_id, user_id, additional_increments, house_rent, basic_salary, profile_image
+//         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+//       `;
+
+//       const insertEmployeeValues = [
+//         register_no, appointment_date, employee_role, employee_post, pay_scale,
+//         full_name, father_name, mother_name, mobile_no, gender, dob, cnic, marital_status,
+//         current_address, permanent_address, qualification, income_tax, rebate, experience, work_shift, second_shift_honorarium,
+//         employee_campus_id, status, account_no, security_deduction, security_no_of_installment, total_security_deduction, bus_status, bus_charges, loan_no_of_installment, loan_deduction, loan, campus_id, user_id, additional_increment, house_rent, basic_salary, profile_image
+//       ];
+
+//       connection.query(insertEmployeeQuery, insertEmployeeValues, (err, employeeResult) => {
+//         if (err) {
+//           console.error('Error inserting employee data:', err);
+//           return res.status(500).json({ error: 'Error inserting employee data' });
+//         }
+
+//         // Getting the new employee ID for service_book
+//         const employee_id = employeeResult.insertId;
+
+//         // Now insert into the service_book table
+
+//         const insertServiceBookQuery = `
+//         INSERT INTO service_book (
+//           employee_id,
+//           employee_role_id,
+//           employee_post_id,
+//           pay_scale_id,
+//           basic_salary,
+//           house_rent,
+//           additional_increment,
+//           pessi,
+//           eobi,
+//           old_adhoc,
+//           current_adhoc,
+//           total_adhoc,
+//           previous_total_increments,
+//           current_increment,
+//           total_increment,
+//           total_net_salary,
+//           second_shift_honorarium,
+//           campus_id,
+//           user_id,
+//           job_type,
+//           annual_increment_status,
+//           adhoc_increment_status,
+//           increment_date,
+//           entry_form,
+
+//           principal_allownce,
+//           special_allownce,
+//           medical_allownce
+
+//         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURDATE(), ?, ?, ?, ?)
+//       `;
+
+//       const insertServiceBookValues = [
+//         employee_id, employee_role, employee_post, pay_scale, basic_salary,
+//         house_rent, additional_increment, pessi, eobi, old_adhoc, current_adhoc, total_adhoc,
+//         previous_total_increments, current_increment, Number(previous_total_increments) + Number(current_increment),
+//         total_net_salary, second_shift_honorarium, campus_id, user_id, job_type,
+//         annual_increment_status, adhoc_increment_status, 'employee_form', principal_allownce, special_allownce, medical_allownce    // Make sure this value isn't missing
+//       ];
+
+//         connection.query(insertServiceBookQuery, insertServiceBookValues, (err, result) => {
+//           if (err) {
+//             console.error('Error inserting service book data:', err);
+//             return res.status(500).json({ error: 'Error inserting service book data' });
+//           }
+//           res.json({ message: 'Employee and service book data inserted successfully!' });
+//         });
+//       });
+//     }
+//   });
+// });
+
+app.post(
+  "/insert-school-employee",
+  upload.single("profile_image"),
+  (req, res) => {
+    const {
+      hidden_id,
+      register_no,
+      appointment_date,
+      job_type,
+      employee_role,
+      employee_post,
+      pay_scale,
+      full_name,
+      father_name,
+      mother_name,
+      mobile_no,
+      gender,
+      dob,
+      cnic,
+      marital_status,
+      current_address,
+      permanent_address,
+      qualification,
+      experience,
+      work_shift,
+      second_shift_honorarium,
+      employee_campus_id,
+      status,
+      basic_salary,
+      house_rent,
+      additional_increment,
+      pessi,
+      eobi,
+      old_adhoc,
+      current_adhoc,
+      total_adhoc,
+      previous_total_increments,
+      current_increment,
+      total_net_salary,
+      security_deduction,
+      security_no_of_installment,
+      account_no,
+      total_security_deduction,
+      bus_status,
+      bus_charges,
+      loan_no_of_installment,
+      loan_deduction,
+      loan,
+      principal_allownce,
+      special_allownce,
+      medical_allownce,
+      service_book_id,
+      increment_date,
+      cpf,
+      previous_total_cpf,
+      overall_security_deduction,
+      resign_retire_terminate_date,
+      campus_id,
+      user_id,
+      session_id,
+    } = req.body;
+
+    const currentDate = new Date().toISOString().slice(0, 10);
+
+    const annual_increment_status =
+      current_increment > 0 ? "annual_increment" : "";
+    const adhoc_increment_status = current_adhoc > 0 ? "adhoc_increment" : "";
+
+    let profile_image = req.file ? req.file.filename : "";
+
+    // Check for uniqueness of register_no
+    let checkQuery =
+      'SELECT id FROM school_employees WHERE register_no = ? AND soft_delete != "Off"';
+    let checkValues = [register_no];
+
+    if (hidden_id) {
+      // Exclude current employee from check if updating
+      checkQuery += " AND id != ?";
+      checkValues.push(hidden_id);
+    }
+
+    connection.query(checkQuery, checkValues, (err, results) => {
+      if (err) {
+        console.error("Error checking register_no uniqueness:", err);
+        return res
+          .status(500)
+          .json({ error: "Error checking register_no uniqueness" });
+      }
+
+      if (results.length > 0) {
+        // register_no already exists
+        return res.status(400).json({ error: "register_no must be unique" });
+      }
+
+      if (hidden_id) {
+        // Update existing employee
+        let updateEmployeeQuery = `
+        UPDATE school_employees
+        SET register_no = ?, appointment_date = ?, employee_role_id = ?, employee_post_id = ?, pay_scale_id = ?,
+            full_name = ?, father_name = ?, mother_name = ?, mobile_no = ?, gender = ?, dob = ?, cnic = ?,
+            marital_status = ?, current_address = ?, permanent_address = ?, qualification = ?, 
+            experience = ?, work_shift = ?, second_shift_honorarium = ?, employee_campus_id = ?, status = ?, account_no=?, security_deduction = ?, security_no_of_installment=?, total_security_deduction=?, bus_status = ?, bus_charges = ?, loan_no_of_installment = ?, loan_deduction = ?, total_loan_deduction = ?, campus_id = ?, user_id = ?, additional_increments= ?, house_rent = ?, basic_salary = ?,
+            previous_total_cpf = ?, overall_security_deduction = ?, resign_retire_terminate_date = ?
+      `;
+
+        const updateEmployeeValues = [
+          register_no,
+          appointment_date,
+          employee_role,
+          employee_post,
+          pay_scale,
+          full_name,
+          father_name,
+          mother_name,
+          mobile_no,
+          gender,
+          dob,
+          cnic,
+          marital_status,
+          current_address,
+          permanent_address,
+          qualification,
+          experience,
+          work_shift,
+          second_shift_honorarium,
+          employee_campus_id,
+          status,
+          account_no,
+          security_deduction,
+          security_no_of_installment,
+          total_security_deduction,
+          bus_status,
+          bus_charges,
+          loan_no_of_installment,
+          loan_deduction,
+          loan,
+          campus_id,
+          user_id,
+          additional_increment,
+          house_rent,
+          basic_salary,
+          previous_total_cpf,
+          overall_security_deduction,
+          resign_retire_terminate_date
+        ];
+
+        if (profile_image) {
+          updateEmployeeQuery += `, profile_image = ?`;
+          updateEmployeeValues.push(profile_image);
+        }
+
+        updateEmployeeQuery += ` WHERE id = ?`;
+        updateEmployeeValues.push(hidden_id);
+
+        connection.query(
+          updateEmployeeQuery,
+          updateEmployeeValues,
+          (err, result) => {
+            if (err) {
+              console.error("Error updating employee data:", err);
+              return res
+                .status(500)
+                .json({ error: "Error updating employee data" });
+            }
+
+            // Now update the service book entry for this employee
+            const updateServiceBookQuery = `
+        UPDATE service_book
+        SET employee_role_id = ?, employee_post_id = ?, pay_scale_id = ?, basic_salary = ?, 
+            house_rent = ?, additional_increment = ?, pessi = ?, eobi = ?, old_adhoc = ?, current_adhoc = ?, total_adhoc = ?,
+            previous_total_increments = ?, current_increment = ?, total_increment = ?, total_net_salary = ?, second_shift_honorarium = ?, campus_id = ?, user_id = ?, job_type = ?, annual_increment_status = ?, adhoc_increment_status = ?, principal_allownce = ?, special_allownce = ?, medical_allownce = ?, increment_date = ?, cpf = ?
+        WHERE id = ?`;
+
+            const updateServiceBookValues = [
+              employee_role,
+              employee_post,
+              pay_scale,
+              basic_salary,
+              house_rent,
+              additional_increment,
+              pessi,
+              eobi,
+              old_adhoc,
+              current_adhoc,
+              total_adhoc,
+              previous_total_increments,
+              current_increment,
+              parseInt(previous_total_increments) + parseInt(current_increment),
+              total_net_salary,
+              second_shift_honorarium,
+              campus_id,
+              user_id,
+              job_type,
+              current_increment > 0 ? "annual_increment" : 0,
+              current_adhoc > 0 ? "adhoc_increment" : 0,
+              principal_allownce,
+              special_allownce,
+              medical_allownce,
+              increment_date == 0 ? currentDate : increment_date,
+              cpf,
+              service_book_id,
+            ];
+
+            connection.query(
+              updateServiceBookQuery,
+              updateServiceBookValues,
+              (err, result) => {
+                if (err) {
+                  console.error("Error updating service book data:", err);
+                  return res
+                    .status(500)
+                    .json({ error: "Error updating service book data" });
+                }
+                res.json({
+                  message:
+                    "Employee and service book data updated successfully!",
+                });
+
+                 logAction('UPDATE',  'school_employees',  'School Employees', result.insertId, user_id, campus_id, session_id);
+              }
+            );
+          }
+        );
+      } else {
+        // Insert new employee and service book data
+        const insertEmployeeQuery = `
+        INSERT INTO school_employees (
+          register_no, appointment_date,  employee_role_id, employee_post_id, pay_scale_id,
+          full_name, father_name, mother_name, mobile_no, gender, dob, cnic, marital_status,
+          current_address, permanent_address, qualification, experience, work_shift, second_shift_honorarium,
+          employee_campus_id, status, account_no, security_deduction, security_no_of_installment, total_security_deduction, bus_status, bus_charges, loan_no_of_installment, loan_deduction, total_loan_deduction, campus_id, user_id, additional_increments, house_rent, basic_salary, previous_total_cpf, overall_security_deduction, resign_retire_terminate_date, profile_image
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `;
+
+        const insertEmployeeValues = [
+          register_no,
+          appointment_date,
+          employee_role,
+          employee_post,
+          pay_scale,
+          full_name,
+          father_name,
+          mother_name,
+          mobile_no,
+          gender,
+          dob,
+          cnic,
+          marital_status,
+          current_address,
+          permanent_address,
+          qualification,
+          experience,
+          work_shift,
+          second_shift_honorarium,
+          employee_campus_id,
+          status,
+          account_no,
+          security_deduction,
+          security_no_of_installment,
+          total_security_deduction,
+          bus_status,
+          bus_charges,
+          loan_no_of_installment,
+          loan_deduction,
+          loan,
+          campus_id,
+          user_id,
+          additional_increment,
+          house_rent,
+          basic_salary,
+          previous_total_cpf,
+          overall_security_deduction,
+          resign_retire_terminate_date,
+          profile_image
+        ];
+
+        connection.query(
+          insertEmployeeQuery,
+          insertEmployeeValues,
+          (err, employeeResult) => {
+            if (err) {
+              console.error("Error inserting employee data:", err);
+              return res
+                .status(500)
+                .json({ error: "Error inserting employee data" });
+            }
+
+            // Getting the new employee ID for service_book
+            const employee_id = employeeResult.insertId;
+
+            // Now insert into the service_book table
+            const insertServiceBookQuery = `
+        INSERT INTO service_book (
+          employee_id,
+          employee_role_id,
+          employee_post_id,
+          pay_scale_id,
+          basic_salary,
+          house_rent,
+          additional_increment,
+          pessi,
+          eobi,
+          old_adhoc, 
+          current_adhoc,
+          total_adhoc,
+          previous_total_increments,
+          current_increment,
+          total_increment,
+          total_net_salary,
+          second_shift_honorarium,
+          campus_id,
+          user_id,
+          job_type,
+          annual_increment_status,
+          adhoc_increment_status,
+          increment_date,
+          entry_form,
+          principal_allownce,
+          special_allownce,
+          medical_allownce,
+          cpf
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+
+            const insertServiceBookValues = [
+              employee_id,
+              employee_role,
+              employee_post,
+              pay_scale,
+              basic_salary,
+              house_rent,
+              additional_increment,
+              pessi,
+              eobi,
+              old_adhoc,
+              current_adhoc,
+              total_adhoc,
+              previous_total_increments,
+              current_increment,
+              Number(previous_total_increments) + Number(current_increment),
+              total_net_salary,
+              second_shift_honorarium,
+              campus_id,
+              user_id,
+              job_type,
+              annual_increment_status,
+              adhoc_increment_status,
+              currentDate,
+              "employee_form",
+              principal_allownce,
+              special_allownce,
+              medical_allownce,
+              cpf
+            ];
+
+            connection.query(
+              insertServiceBookQuery,
+              insertServiceBookValues,
+              (err, result) => {
+                if (err) {
+                  console.error("Error inserting service book data:", err);
+                  return res
+                    .status(500)
+                    .json({ error: "Error inserting service book data" });
+                }
+                res.json({
+                  message:
+                    "Employee and service book data inserted successfully!",
+                });
+                 logAction('CREATE',  'school_employees',  'Create School Employees', result.insertId, user_id, campus_id, session_id);
+              }
+            );
+          }
+        );
+      }
+    });
+  }
+);
+
+
+
+
+
+app.get("/get-school-employees/:from_month/:campus_id", (req, res) => {
+  const from_month = req.params.from_month;
+  const campus_id = req.params.campus_id;
+
+  console.log(campus_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching employees" });
+      return;
+    }
+
+    const sql = `
+    SELECT 
+    e.*, 
+    sb.*, 
+    e.id as employee_id, 
+    sb.id as service_book_id,  
+    ep.employee_post, 
+    er.employee_role, 
+    ps.pay_scale, 
+    ps.job_type,
+    esr.id AS salary_id,
+    esr.bus_charges AS salary_bus_charges,
+    esr.service_book_id AS salary_service_book_id,
+    esr.invoice_no AS salary_invoice_no,
+    esr.employee_id AS salary_employee_id,
+    esr.employee_role_id AS salary_employee_role_id,
+    esr.employee_post_id AS salary_employee_post_id,
+    esr.pay_scale_id AS salary_pay_scale_id,
+    esr.previous_increments AS salary_previous_increments,
+    esr.current_increment AS salary_current_increment,
+    esr.total_increments AS salary_total_increments,
+    esr.previous_adhoc AS salary_previous_adhoc,
+    esr.current_adhoc AS salary_current_adhoc,
+    esr.total_adhoc AS salary_total_adhoc,
+    esr.house_rent AS salary_house_rent,
+    esr.security_deduct AS salary_security_deduct,
+    esr.total_security_deduct AS salary_total_security_deduct,
+    esr.loan_deduct AS salary_loan_deduct,
+    esr.total_loan_deduct AS salary_total_loan_deduct,
+    esr.graduity AS salary_graduity,
+    esr.others_allownce AS salary_others_allownce,
+    esr.dow AS salary_dow,
+    esr.net_salary AS salary_net_salary,
+    esr.remaining AS salary_remaining,
+    esr.remarks AS salary_remarks,
+    esr.created_at AS salary_created_at,
+    esr.updated_at AS salary_updated_at,
+    esr.for_the_month AS salary_for_the_month,
+    esr.income_tax AS salary_income_tax,
+    esr.rebate AS salary_rebate,
+    esr.overtime AS salary_overtime,
+    esr.overtime_amount AS salary_overtime_amount,
+    esr.other_deduction,
+    esr.eobi AS salary_eobi,
+    esr.cpf AS salary_cpf,
+    esr.pessi AS salary_pessi,
+    esr.paid_through_id AS salary_paid_through_id,
+    esr.account_no AS salary_account_no,
+    SUM(ot.overtime_hours) AS total_overtime_hours,
+    COUNT(DISTINCT sea.id) AS total_present_days
+    FROM school_employees e
+    INNER JOIN (
+        -- Subquery to get the max increment_date and corresponding id
+        SELECT sb1.employee_id, sb1.increment_date, sb1.id AS last_service_id
+        FROM service_book sb1
+        INNER JOIN (
+            SELECT employee_id, MAX(increment_date) AS max_increment_date
+            FROM service_book
+            GROUP BY employee_id
+        ) latest ON sb1.employee_id = latest.employee_id AND sb1.increment_date = latest.max_increment_date
+    ) latest_service ON e.id = latest_service.employee_id
+    INNER JOIN service_book sb ON sb.id = latest_service.last_service_id
+    LEFT JOIN employee_posts ep ON e.employee_post_id = ep.id
+    LEFT JOIN employee_roles er ON e.employee_role_id = er.id
+    LEFT JOIN pay_scale ps ON e.pay_scale_id = ps.id
+    LEFT JOIN employee_salary_records esr ON esr.employee_id = e.id AND esr.for_the_month = ?
+    LEFT JOIN overtime ot ON ot.employee_id = e.id 
+        AND DATE_FORMAT(ot.overtime_date, '%Y-%m') = ? 
+        AND ot.campus_id = ?
+    LEFT JOIN school_employee_attendance sea ON sea.employee_id = e.id 
+        AND DATE_FORMAT(sea.date, '%Y-%m') = ?
+        AND sea.status = 'present'
+    WHERE DATE_FORMAT(e.appointment_date, '%Y-%m') <= ?
+    AND e.campus_id = ?
+    AND e.soft_delete != 'Off'
+    AND (DATE_FORMAT(e.resign_retire_terminate_date, '%Y-%m') >= ? OR e.resign_retire_terminate_date IS NULL OR e.resign_retire_terminate_date = '')
+    GROUP BY e.id`;
+
+    // var debug_query = debugQuery(sql, [from_month, from_month, campus_id, from_month, from_month, campus_id, from_month]);
+
+    // console.log(debug_query);
+    // AND e.status NOT IN ('Resign', 'Terminate', 'Retire') AND
+
+    connection.query(
+      sql,
+      [from_month, from_month, campus_id, from_month, from_month, campus_id, from_month],
+      (error, results) => {
+        connection.release(); // Release the connection
+
+        if (error) {
+          console.error("Error:", error);
+          res.status(500).json({ error: "Error fetching employees" });
+        } else {
+          console.log("Fetch Successfully");
+          res.status(200).json({ results });
+        }
+      }
+    );
+  });
+});
+
+
+
+app.get("/get-school-employees-for-increment/:campus_id/:pay_scale_id/:increment_date",
+  (req, res) => {
+    const campus_id = req.params.campus_id;
+    const pay_scale_id = req.params.pay_scale_id;
+    const increment_date = req.params.increment_date;
+
+    connection.getConnection((err, connection) => {
+      if (err) {
+        console.error("Error getting database connection:", err);
+        return res.status(500).json({ error: "Error fetching employees" });
+      }
+
+      //   let employeeQuery = `WITH filtered_service_book AS (
+      //   SELECT
+      //   sb.*,
+      //   ROW_NUMBER() OVER (PARTITION BY sb.employee_id
+      //                       ORDER BY
+      //                         CASE
+      //                           WHEN sb.increment_date = ? THEN 1
+      //                           ELSE 2
+      //                         END,
+      //                         sb.increment_date DESC) AS rn
+      //   FROM service_book sb
+      //   INNER JOIN (
+      //     SELECT employee_id, MAX(increment_date) AS max_increment_date
+      //     FROM service_book
+      //     GROUP BY employee_id
+      //   ) latest_service ON sb.employee_id = latest_service.employee_id
+      // )
+      // SELECT
+      //   e.*,
+      //   sb.*,
+      //   e.id AS employee_id,
+      //   sb.id AS service_book_id,
+      //   ep.employee_post,
+      //   er.employee_role,
+      //   ps.pay_scale,
+      //   ps.job_type,
+      //   IF(existing_sb.id IS NOT NULL, existing_sb.id, NULL) AS update_id,
+      //    TIMESTAMPDIFF(YEAR, e.appointment_date, sb.increment_date) AS years_of_service, -- Calculate years of service
+      // TIMESTAMPDIFF(MONTH, e.appointment_date, sb.increment_date) % 12 AS months_of_service -- Calculate remaining months of service
+      // FROM school_employees e
+      // INNER JOIN filtered_service_book sb ON e.id = sb.employee_id AND sb.rn = 1
+      // LEFT JOIN employee_posts ep ON e.employee_post_id = ep.id
+      // LEFT JOIN employee_roles er ON e.employee_role_id = er.id
+      // LEFT JOIN pay_scale ps ON e.pay_scale_id = ps.id
+      // LEFT JOIN service_book existing_sb
+      //   ON existing_sb.employee_id = e.id
+      //   AND existing_sb.increment_date = ?
+      // WHERE e.campus_id = ?
+      // AND e.soft_delete != 'Off'
+      // AND e.status NOT IN ('Resign', 'Terminate')
+      // AND e.appointment_date < sb.increment_date -- Ensure appointment_date is less than increment_date
+      // AND TIMESTAMPDIFF(MONTH, e.appointment_date, sb.increment_date) > 6 -- Ensure difference is greater than 6 months`;
+
+      let employeeQuery = `WITH filtered_service_book AS (
+    SELECT
+        sb.*,
+        ROW_NUMBER() OVER (PARTITION BY sb.employee_id ORDER BY sb.increment_date DESC) AS rn
+    FROM service_book sb
+    WHERE sb.increment_date <= ? 
+      )
+      SELECT
+          e.*,
+          sb.*,
+          e.id AS employee_id,
+          sb.id AS service_book_id,
+          ep.employee_post,
+          er.employee_role,
+          ps.pay_scale,
+          ps.job_type,
+          IF(existing_sb.id IS NOT NULL, existing_sb.id, NULL) AS update_id,
+          TIMESTAMPDIFF(YEAR, e.appointment_date, sb.increment_date) AS years_of_service,
+          TIMESTAMPDIFF(MONTH, e.appointment_date, sb.increment_date) % 12 AS months_of_service
+      FROM school_employees e
+      INNER JOIN filtered_service_book sb ON e.id = sb.employee_id
+      LEFT JOIN employee_posts ep ON e.employee_post_id = ep.id
+      LEFT JOIN employee_roles er ON e.employee_role_id = er.id
+      LEFT JOIN pay_scale ps ON e.pay_scale_id = ps.id
+      LEFT JOIN service_book existing_sb ON existing_sb.employee_id = e.id AND existing_sb.increment_date = ?
+      WHERE e.campus_id = ?
+      AND e.soft_delete != 'Off'
+      AND e.status NOT IN ('Resign', 'Terminate')
+      AND e.appointment_date < sb.increment_date
+      AND TIMESTAMPDIFF(MONTH, e.appointment_date, sb.increment_date) > 6
+      ORDER BY sb.increment_date DESC`;
+
+      const queryParams = [increment_date, increment_date, campus_id];
+      if (pay_scale_id !== "null" && pay_scale_id !== "undefined") {
+        employeeQuery += ` AND e.pay_scale_id = ?`;
+        queryParams.push(pay_scale_id); // Add pay_scale_id to query parameters
+      }
+
+      // console.log(employeeQuery); // Logs the full query
+      // console.log(queryParams);
+
+      const payScaleQuery = `
+      SELECT *
+      FROM pay_scale_wise_basic_salary
+    `;
+
+      // Query to get the increment_date of the last row in the service_book table
+      const lastIncrementDateQuery = `
+    SELECT increment_date 
+    FROM service_book 
+    WHERE entry_form = 'increment_form'
+    ORDER BY id DESC
+    LIMIT 1
+  `;
+
+      // Running all three queries in parallel
+      Promise.all([
+        new Promise((resolve, reject) => {
+          connection.query(employeeQuery, queryParams, (error, results) => {
+            if (error) return reject(error);
+            resolve(results);
+          });
+        }),
+        new Promise((resolve, reject) => {
+          connection.query(payScaleQuery, (error, results) => {
+            if (error) return reject(error);
+            resolve(results);
+          });
+        }),
+        new Promise((resolve, reject) => {
+          connection.query(lastIncrementDateQuery, (error, results) => {
+            if (error) return reject(error);
+            resolve(results);
+          });
+        }),
+      ])
+        .then(([employeeResults, payScaleResults, lastIncrementDateResult]) => {
+          connection.release(); // Ensure the connection is released, whether successful or not
+          console.log("Fetch Successfully");
+          const lastIncrementDate =
+            lastIncrementDateResult[0]?.increment_date || null; // Get the last increment date or null if not found
+          return res.status(200).json({
+            employees: employeeResults,
+            payScaleSalaries: payScaleResults,
+            lastIncrementDate: lastIncrementDate, // Include the last increment date in the response
+          });
+        })
+        .catch((error) => {
+          connection.release(); // Ensure the connection is released in case of error
+          console.error("Error querying database:", error);
+          return res.status(500).json({ error: "Error fetching data" });
+        });
+    });
+  }
+);
+
+
+app.get("/get-last-row-increment-date", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    const lastIncrementDateQuery = `
+    SELECT increment_date 
+    FROM service_book 
+    WHERE entry_form = 'increment_form'
+    ORDER BY id DESC
+    LIMIT 1
+  `;
+
+    connection.query(lastIncrementDateQuery, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results });
+      }
+    });
+  });
+});
+
+
+
+// app.get("/summary-report", (req, res) => {
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+//   const from_date = req.query.from_date;
+//   const to_date = req.query.to_date;
+//   const shift = req.query.shift;  // Get the shift parameter from the query
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error connecting to the database:", err);
+//       res.status(500).json({ error: "Error connecting to the database" });
+//       return;
+//     }
+
+//     // Base SQL query
+//     let lastIncrementDateQuery = `
+//       SELECT 
+//         c.class AS class, 
+//         sec.section_name, 
+//         sc.category, 
+//         COUNT(*) AS total_students,
+//         SUM(CASE WHEN s.gender = 'Male' THEN 1 ELSE 0 END) AS male_students,
+//         SUM(CASE WHEN s.gender = 'Female' THEN 1 ELSE 0 END) AS female_students
+//       FROM 
+//         students s
+//       JOIN 
+//         school_categories sc ON s.category_id = sc.id
+//       JOIN 
+//         classes c ON s.class_id = c.id
+//       JOIN 
+//         sections sec ON sec.id = s.section_id
+//       WHERE 
+//         s.campus_id = ? 
+//         AND s.session_id = ? 
+//         AND s.status IN ("New Admission", "Promoted") 
+//         AND s.status_on_off != 'Off'`;
+
+//     // If shift is provided, add it to the WHERE clause
+//     if (shift) {
+//       lastIncrementDateQuery += ` AND s.shift = ?`;
+//     }
+
+//     if (from_date && to_date) {
+//       lastIncrementDateQuery += ` AND s.admission_date  BETWEEN ? AND ?`;
+//     }
+
+//     lastIncrementDateQuery += `
+//       GROUP BY 
+//         c.class, sec.section_name, sc.category
+//       ORDER BY 
+//         c.id`;
+
+//     // Prepare query parameters
+//     const queryParams = shift ? [campus_id, session_id, shift] : [campus_id, session_id];
+
+//     connection.query(lastIncrementDateQuery, queryParams, (error, results) => {
+//       connection.release(); // Release the connection after query execution
+
+//       if (error) {
+//         console.error("Error executing SQL query:", error);
+//         res.status(500).json({ error: "Internal server error" });
+//         return;
+//       }
+
+//       res.json({ results });
+//     });
+//   });
+// });
+
+
+
+app.get("/summary-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const from_date = req.query.from_date;
+  const to_date = req.query.to_date;
+  const shift = req.query.shift;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // Base SQL query
+    let query = `
+      SELECT 
+        c.class AS class, 
+        sec.section_name, 
+        sc.category, 
+        COUNT(*) AS total_students,
+        par.id as parent_id,
+        par.parent_class,
+        SUM(CASE WHEN s.gender = 'Male' THEN 1 ELSE 0 END) AS male_students,
+        SUM(CASE WHEN s.gender = 'Female' THEN 1 ELSE 0 END) AS female_students
+      FROM 
+        students s
+      JOIN 
+        school_categories sc ON s.category_id = sc.id
+      JOIN 
+        classes c ON s.class_id = c.id
+      JOIN 
+        sections sec ON sec.id = s.section_id
+      Left JOIN 
+        parent_classes par ON c.parent_class_id = par.id
+      WHERE 
+        s.campus_id = ? 
+        AND s.session_id = ? 
+        AND s.status IN ("New Admission", "Promoted") 
+        AND s.status_on_off != 'Off'`;
+
+    const queryParams = [campus_id, session_id];
+
+    // Add shift condition if provided
+    if (shift) {
+      query += ` AND s.shift = ?`;
+      queryParams.push(shift);
+    }
+
+    // Add date range condition if both dates are provided
+    if (from_date && to_date) {
+      // console.log("hitted", from_date, to_date);
+      query += ` AND s.admission_date BETWEEN ? AND ?`;
+      queryParams.push(from_date, to_date);
+    }
+
+    query += `
+      GROUP BY 
+        c.class, sec.section_name, sc.category
+            ORDER BY 
+        sc.sorting, 
+        COALESCE(par.id, 0)`;
+
+      //  console.log( debugQuery(query, queryParams));
+
+    connection.query(query, queryParams, (error, results) => {
+      connection.release();
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      res.json({ results });
+    });
+  });
+});
+
+
+
+
+// app.get("/summary-report-new-admission", (req, res) => {
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+//   const shift = req.query.shift;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error connecting to the database:", err);
+//       res.status(500).json({ error: "Error connecting to the database" });
+//       return;
+//     }
+
+//     // Start building the base query
+//     let newAdmissionRecord = `
+//       SELECT 
+//         c.class AS class, 
+//         COUNT(*) AS total_students
+//       FROM 
+//         students s
+//       JOIN 
+//         classes c ON s.class_id = c.id
+//       WHERE 
+//         s.campus_id = ? 
+//         AND s.session_id = ? 
+//         AND s.status = "New Admission"  
+//         AND s.status_on_off = 'On'`;
+
+//     // If shift is provided, add it to the WHERE clause
+//     if (shift) {
+//       newAdmissionRecord += ` AND s.shift = ?`;
+//     }
+
+//     newAdmissionRecord += `
+//       GROUP BY 
+//         c.class
+//       ORDER BY c.id`;
+
+//     // Prepare query parameters
+//     const queryParams = shift ? [campus_id, session_id, shift] : [campus_id, session_id];
+
+//     connection.query(newAdmissionRecord, queryParams, (error, results) => {
+//       connection.release(); // Release the connection after query execution
+
+//       if (error) {
+//         console.error("Error executing SQL query:", error);
+//         res.status(500).json({ error: "Internal server error" });
+//         return;
+//       }
+//       res.json({ results });
+//     });
+//   });
+// });
+
+
+app.get("/summary-report-new-admission", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const shift = req.query.shift;
+  const from_date = req.query.from_date;
+  const to_date = req.query.to_date;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // Start building the base query
+    let query = `
+      SELECT 
+        c.class AS class, 
+        COUNT(*) AS total_students
+      FROM 
+        students s
+      JOIN 
+        classes c ON s.class_id = c.id
+      WHERE 
+        s.campus_id = ? 
+        AND s.session_id = ? 
+        AND s.status = "New Admission"  
+        AND s.status_on_off = 'On'`;
+
+    const queryParams = [campus_id, session_id];
+
+    // Add shift condition if provided
+    if (shift) {
+      query += ` AND s.shift = ?`;
+      queryParams.push(shift);
+    }
+
+    // Add date range condition if both dates are provided
+    if (from_date && to_date) {
+      query += ` AND s.admission_date BETWEEN ? AND ?`;
+      queryParams.push(from_date, to_date);
+    }
+
+    query += `
+      GROUP BY 
+        c.class
+      ORDER BY c.id`;
+
+    connection.query(query, queryParams, (error, results) => {
+      connection.release();
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      res.json({ results });
+    });
+  });
+});
+
+
+app.get("/view-assign-subjects-list", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+ 
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // Start building the base query
+    let newAdmissionRecord = `
+      SELECT 
+      assing_subjects_class.id,
+        subjects.subjects
+      FROM 
+        assing_subjects_class
+      JOIN 
+        subjects ON assing_subjects_class.subject_id = subjects.id
+      WHERE 
+        assing_subjects_class.campus_id = ? AND assing_subjects_class.class_id = ? AND assing_subjects_class.section_id= ? AND status_on_off = 'On'
+        ORDER BY subjects.id ASC`;
+  
+    // Prepare query parameters
+    const queryParams = [campus_id, class_id, section_id];
+
+    connection.query(newAdmissionRecord, queryParams, (error, results) => {
+      connection.release(); // Release the connection after query execution
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+      res.json({ results });
+    });
+  });
+});
+
+
+
+
+
+
+
+app.get("/view-assign-subjects-to-teacher-list", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const teacher_id = req.query.teacher_id;
+ 
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // Start building the base query
+    let newAdmissionRecord = `
+      SELECT 
+        assing_subjects_class_teacher.id, subjects.subjects, classes.class as class_name, sections.section_name
+      FROM 
+        assing_subjects_class_teacher
+      JOIN 
+        assing_subjects_class ON assing_subjects_class_teacher.assign_subject_class_id = assing_subjects_class.id
+      JOIN 
+        subjects ON assing_subjects_class.subject_id = subjects.id
+      JOIN 
+        classes ON assing_subjects_class.class_id = classes.id
+      JOIN 
+        sections ON assing_subjects_class.section_id = sections.id
+      WHERE 
+        assing_subjects_class_teacher.campus_id = ? AND assing_subjects_class_teacher.session_id = ? AND assing_subjects_class_teacher.teacher_id = ?
+        ORDER BY classes.id ASC`;
+  
+    // Prepare query parameters
+    const queryParams = [campus_id, session_id, teacher_id];
+
+    connection.query(newAdmissionRecord, queryParams, (error, results) => {
+      connection.release(); // Release the connection after query execution
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+      res.json({ results });
+    });
+  });
+});
+
+
+
+// app.get("/summary-report-slc", (req, res) => {
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+//   const shift = req.query.shift;  // Get the shift parameter from the query
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error connecting to the database:", err);
+//       res.status(500).json({ error: "Error connecting to the database" });
+//       return;
+//     }
+
+//     // Base SQL query
+//     let slcRecord = `
+//       SELECT 
+//         c.class AS class, 
+//         COUNT(*) AS total_students
+//       FROM 
+//         students s
+//       JOIN 
+//         classes c ON s.class_id = c.id
+//       WHERE 
+//         s.campus_id = ? 
+//         AND s.session_id = ? 
+//         AND s.status = "SLC" 
+//         AND s.status_on_off = 'On'`;
+
+//     // If shift is provided, add it to the WHERE clause
+//     if (shift) {
+//       slcRecord += ` AND s.shift = ?`;
+//     }
+
+//     slcRecord += `
+//       GROUP BY 
+//         c.class
+//       ORDER BY 
+//         c.id`;
+
+//     // Prepare query parameters
+//     const queryParams = shift ? [campus_id, session_id, shift] : [campus_id, session_id];
+
+//     connection.query(slcRecord, queryParams, (error, results) => {
+//       connection.release(); // Release the connection after query execution
+
+//       if (error) {
+//         console.error("Error executing SQL query:", error);
+//         res.status(500).json({ error: "Internal server error" });
+//         return;
+//       }
+
+//       res.json({ results });
+//     });
+//   });
+// });
+
+
+app.get("/summary-report-slc", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const shift = req.query.shift;
+  const from_date = req.query.from_date;
+  const to_date = req.query.to_date;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // Base SQL query
+    let query = `
+      SELECT 
+        c.class AS class, 
+        COUNT(*) AS total_students
+      FROM 
+        students s
+      JOIN 
+        classes c ON s.class_id = c.id
+      WHERE 
+        s.campus_id = ? 
+        AND s.session_id = ? 
+        AND s.status = "SLC" 
+        AND s.status_on_off = 'On'`;
+
+    const queryParams = [campus_id, session_id];
+
+    // Add shift condition if provided
+    if (shift) {
+      query += ` AND s.shift = ?`;
+      queryParams.push(shift);
+    }
+
+    // Add date range condition if both dates are provided
+    if (from_date && to_date) {
+      query += ` AND s.status_date BETWEEN ? AND ?`;
+      queryParams.push(from_date, to_date);
+    }
+
+    query += `
+      GROUP BY 
+        c.class
+      ORDER BY 
+        c.id`;
+
+    connection.query(query, queryParams, (error, results) => {
+      connection.release();
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      res.json({ results });
+    });
+  });
+});
+
+
+
+// app.get("/summary-report-all-status", (req, res) => {
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+//   const shift = req.query.shift;  // Get the shift parameter from the query
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error connecting to the database:", err);
+//       res.status(500).json({ error: "Error connecting to the database" });
+//       return;
+//     }
+
+//     // Base SQL query
+//     let slcRecord = `
+//       SELECT 
+//         c.class AS class, 
+//         sec.section_name, 
+//         s.status, 
+//         COUNT(*) AS total_students
+//       FROM 
+//         students s
+//       JOIN 
+//         classes c ON s.class_id = c.id
+//       LEFT JOIN 
+//         sections sec ON sec.id = s.section_id
+//       WHERE 
+//         s.campus_id = ? 
+//         AND s.session_id = ? 
+//         AND s.status_on_off = 'On'`;
+
+//     // If shift is provided, add it to the WHERE clause
+//     if (shift) {
+//       slcRecord += ` AND s.shift = ?`;
+//     }
+
+//     slcRecord += `
+//       GROUP BY 
+//         c.class, sec.id, s.status 
+//       ORDER BY 
+//         c.id`;
+
+//     // Prepare query parameters
+//     const queryParams = shift ? [campus_id, session_id, shift] : [campus_id, session_id];
+
+//     connection.query(slcRecord, queryParams, (error, results) => {
+//       connection.release(); // Release the connection after query execution
+
+//       if (error) {
+//         console.error("Error executing SQL query:", error);
+//         res.status(500).json({ error: "Internal server error" });
+//         return;
+//       }
+//       res.json({ results });
+//     });
+//   });
+// });
+
+
+
+app.get("/summary-report-all-status", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const shift = req.query.shift;
+  const from_date = req.query.from_date;
+  const to_date = req.query.to_date;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // Base SQL query with conditional date filtering
+    let query = `
+      SELECT 
+        c.class AS class, 
+        sec.section_name, 
+        s.status, 
+        COUNT(*) AS total_students
+      FROM 
+        students s
+      JOIN 
+        classes c ON s.class_id = c.id
+      LEFT JOIN 
+        sections sec ON sec.id = s.section_id
+      WHERE 
+        s.campus_id = ? 
+        AND s.session_id = ? 
+        AND s.status_on_off = 'On'`;
+
+    const queryParams = [campus_id, session_id];
+
+    // Add shift condition if provided
+    if (shift) {
+      query += ` AND s.shift = ?`;
+      queryParams.push(shift);
+    }
+
+    // Add date range condition if both dates are provided
+    if (from_date && to_date) {
+      query += ` AND (
+        (s.status IN ('New Admission', 'Promoted') AND s.admission_date BETWEEN ? AND ?)
+        OR
+        (s.status IN ('Struck Off', 'SLC') AND s.status_date BETWEEN ? AND ?)
+        OR
+        (s.status NOT IN ('New Admission', 'Promoted', 'Struck Off', 'SLC'))
+      )`;
+      queryParams.push(from_date, to_date, from_date, to_date);
+    }
+
+    query += `
+      GROUP BY 
+        c.class, sec.id, s.status
+      ORDER BY 
+        c.id`;
+
+    connection.query(query, queryParams, (error, results) => {
+      connection.release();
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      res.json({ results });
+    });
+  });
+});
+
+
+
+// app.get("/summary-report-struck-off", (req, res) => {
+//   const campus_id = req.query.campus_id;
+//   const session_id = req.query.session_id;
+//   const shift = req.query.shift;  // Get the shift parameter from the query
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error connecting to the database:", err);
+//       res.status(500).json({ error: "Error connecting to the database" });
+//       return;
+//     }
+
+//     // Base SQL query
+//     let slcRecord = `
+//       SELECT 
+//         c.class AS class, 
+//         sec.section_name, 
+//         s.status, 
+//         COUNT(*) AS total_students
+//       FROM 
+//         students s
+//       JOIN 
+//         classes c ON s.class_id = c.id
+//       LEFT JOIN 
+//         sections sec ON sec.id = s.section_id
+//       WHERE 
+//         s.campus_id = ? 
+//         AND s.session_id = ? 
+//         AND s.status_on_off = 'On' 
+//         AND s.status = 'Struck Off'`;
+
+//     // If shift is provided, add it to the WHERE clause
+//     if (shift) {
+//       slcRecord += ` AND s.shift = ?`;
+//     }
+
+//     slcRecord += `
+//       GROUP BY 
+//         c.class 
+//       ORDER BY 
+//         c.id`;
+
+//     // Prepare query parameters
+//     const queryParams = shift ? [campus_id, session_id, shift] : [campus_id, session_id];
+
+//     connection.query(slcRecord, queryParams, (error, results) => {
+//       connection.release(); // Release the connection after query execution
+
+//       if (error) {
+//         console.error("Error executing SQL query:", error);
+//         res.status(500).json({ error: "Internal server error" });
+//         return;
+//       }
+//       res.json({ results });
+//     });
+//   });
+// });
+
+
+app.get("/summary-report-struck-off", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const shift = req.query.shift;
+  const from_date = req.query.from_date;
+  const to_date = req.query.to_date;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // Base SQL query
+    let query = `
+      SELECT 
+        c.class AS class, 
+        sec.section_name, 
+        s.status, 
+        COUNT(*) AS total_students
+      FROM 
+        students s
+      JOIN 
+        classes c ON s.class_id = c.id
+      LEFT JOIN 
+        sections sec ON sec.id = s.section_id
+      WHERE 
+        s.campus_id = ? 
+        AND s.session_id = ? 
+        AND s.status_on_off = 'On' 
+        AND s.status = 'Struck Off'`;
+
+    const queryParams = [campus_id, session_id];
+
+    // Add shift condition if provided
+    if (shift) {
+      query += ` AND s.shift = ?`;
+      queryParams.push(shift);
+    }
+
+    // Add date range condition if both dates are provided
+    if (from_date && to_date) {
+      query += ` AND s.status_date BETWEEN ? AND ?`;
+      queryParams.push(from_date, to_date);
+    }
+
+    query += `
+      GROUP BY 
+        c.class, sec.section_name, s.status
+      ORDER BY 
+        c.id`;
+
+    connection.query(query, queryParams, (error, results) => {
+      connection.release();
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      res.json({ results });
+    });
+  });
+});
+
+
+app.get("/view-house-and-club-report", (req, res) => {
+  const campus_id = parseInt(req.query.campus_id);
+  const session_id = parseInt(req.query.session_id);
+  const shift = parseInt(req.query.shift);
+  const class_id = parseInt(req.query.class_id);
+  const section_id = parseInt(req.query.section_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error getting students" });
+      return;
+    }
+
+    let sql = `SELECT 
+      students.*, users.username,
+      classes.class AS class_name,
+      sections.section_name,
+      school_categories.category AS category_name,
+      sessions.session_name,
+      campuses.campus_name,
+      house.house_or_club_name as house_name,
+      club.house_or_club_name as club_name
+    FROM 
+      students
+    LEFT JOIN 
+      classes ON students.class_id = classes.id
+    LEFT JOIN 
+      sections ON students.section_id = sections.id
+    LEFT JOIN 
+      school_categories ON students.category_id = school_categories.id
+    LEFT JOIN 
+      sessions ON students.session_id = sessions.id
+    LEFT JOIN 
+      campuses ON students.campus_id = campuses.id
+    LEFT JOIN 
+      house_or_club as house ON students.house_id = house.id
+    LEFT JOIN 
+      house_or_club as club ON students.club_id = club.id
+    LEFT JOIN users ON users.user_id = students.student_unique_id
+    WHERE 
+      students.campus_id = ?
+      AND students.session_id = ?
+      AND students.status NOT IN ('Struck Off', 'SLC')`;
+    
+    let values = [campus_id, session_id];
+
+    // Add conditions for optional parameters
+    if (!isNaN(shift)) {
+      sql += " AND students.shift = ?";
+      values.push(shift);
+    }
+    
+    if (!isNaN(class_id)) {
+      sql += " AND students.class_id = ?";
+      values.push(class_id);
+    }
+    
+    if (!isNaN(section_id)) {
+      sql += " AND students.section_id = ?";
+      values.push(section_id);
+    }
+
+    sql += " ORDER BY students.id DESC";
+
+    connection.query(sql, values, (error, results) => {
+      connection.release();
+
+      if (error) {
+        console.error("Error getting students:", error);
+        res.status(500).json({ error: "Error getting students" });
+      } else {
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+app.delete("/delete-service-book-increment/:id_get", (req, res) => {
+  const id_get = parseInt(req.params.id_get);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    // Start the transaction
+    connection.beginTransaction((transactionError) => {
+      if (transactionError) {
+        console.error("Error starting transaction:", transactionError);
+        res.status(500).json({ error: "Error deleting" });
+        connection.release();
+        return;
+      }
+
+      // Query to delete from `service_book` only
+      const deleteServiceBookSql = "DELETE FROM service_book WHERE id = ?";
+
+      connection.query(
+        deleteServiceBookSql,
+        [id_get],
+        (serviceBookError, serviceBookResults) => {
+          if (serviceBookError) {
+            console.error("Error deleting service_book:", serviceBookError);
+            return connection.rollback(() => {
+              res
+                .status(500)
+                .json({ error: "Error deleting from service_book" });
+              connection.release(); // Release the connection on error
+            });
+          }
+
+          // If the delete from `service_book` succeeds, commit the transaction
+          connection.commit((commitError) => {
+            if (commitError) {
+              console.error("Error committing transaction:", commitError);
+              return connection.rollback(() => {
+                res.status(500).json({ error: "Error deleting" });
+                connection.release();
+              });
+            }
+
+            // Success response after successful commit
+            console.log("Item deleted successfully from service_book");
+            res.status(200).json({ message: "Deleted successfully" });
+            connection.release(); // Release the connection
+          });
+        }
+      );
+    });
+  });
+});
+
+
+
+
+// app.delete('/delete-service-book-increment/:id_get', (req, res) => {
+//   const id_get = parseInt(req.params.id_get);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error getting connection:', err);
+//       res.status(500).json({ error: 'Error deleting' });
+//       return;
+//     }
+
+//     // Start the transaction
+//     connection.beginTransaction((transactionError) => {
+//       if (transactionError) {
+//         console.error('Error starting transaction:', transactionError);
+//         res.status(500).json({ error: 'Error deleting' });
+//         connection.release();
+//         return;
+//       }
+
+//       // First query to delete from `service_book`
+//       const deleteServiceBookSql = 'DELETE FROM service_book WHERE id = ?';
+//       const deleteEmployeeSalarySql = 'DELETE FROM employee_salary_records WHERE service_book_id = ?';
+
+//       connection.query(deleteServiceBookSql, [id_get], (serviceBookError, serviceBookResults) => {
+//         if (serviceBookError) {
+//           console.error('Error deleting service_book:', serviceBookError);
+//           return connection.rollback(() => {
+//             res.status(500).json({ error: 'Error deleting from service_book' });
+//             connection.release(); // Release the connection on error
+//           });
+//         }
+
+//         // Second query to delete related records from `employee_salary_record`
+//         connection.query(deleteEmployeeSalarySql, [id_get], (salaryError, salaryResults) => {
+//           if (salaryError) {
+//             console.error('Error deleting employee_salary_record:', salaryError);
+//             return connection.rollback(() => {
+//               res.status(500).json({ error: 'Error deleting from employee_salary_record' });
+//               connection.release(); // Release the connection on error
+//             });
+//           }
+
+//           // If both deletes succeed, commit the transaction
+//           connection.commit((commitError) => {
+//             if (commitError) {
+//               console.error('Error committing transaction:', commitError);
+//               return connection.rollback(() => {
+//                 res.status(500).json({ error: 'Error deleting' });
+//                 connection.release();
+//               });
+//             }
+
+//             // Success response after successful commit
+//             console.log('Items deleted successfully');
+//             res.status(200).json({ message: 'Deleted successfully' });
+//             connection.release(); // Release the connection
+//           });
+//         });
+//       });
+//     });
+//   });
+// });
+
+function generateMonths(fromMonth, toMonth) {
+  const months = [];
+  const start = new Date(fromMonth + "-01");
+  const end = new Date(toMonth + "-01");
+
+  let current = start;
+  while (current <= end) {
+    const month = current.getMonth() + 1; // getMonth() is zero-based
+    const year = current.getFullYear();
+    months.push(`${year}-${month.toString().padStart(2, "0")}`);
+    current.setMonth(current.getMonth() + 1);
+  }
+
+  return months;
+}
+
+function mergeDataAndCalculateTotals(results, data1) {
+  // console.log(results);
+  // return false;
+
+  return results.map((result) => {
+    const category_detail = result.category_id.toString()+result.shift+result.fee_group_id;  //this category id is getting from studnet data 
+   
+    // console.log(data1, "without");
+    // console.log(data1[category_detail], "with check category id");
+    // return false;
+    // const fee_group_id = result.fee_group_id.toString();
+    const data = data1[category_detail] || [];
+    // console.log(data1[category_detail]);
+    // return false;
+    const totalAmount = data.reduce((sum, item) => sum + (item.amount || 0), 0);
+    // console.log(totalAmount);
+    // return false;
+    return { ...result, data, total_amount_data: totalAmount };
+  });
+}
+
+//this is correct code keep in mind dont delete it
+function queryAsync(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    connection.query(sql, params, (err, results) => {
+      if (err) return reject(err);
+      resolve(results);
+    });
+  });
+}
+
+//this is correct code keep in mind dont delete it
+// function queryAsync(sql, params = []) {
+//   return new Promise((resolve, reject) => {
+//     // Get a connection from the pool
+//     connection.getConnection((err, connection) => {
+//       if (err) {
+//         return reject(err);
+//       }
+
+//       // Execute the query
+//       connection.query(sql, params, (queryErr, results) => {
+//         // Always release the connection back to the pool
+//         connection.release();
+
+//         if (queryErr) {
+//           return reject(queryErr);
+//         }
+//         resolve(results);
+//       });
+//     });
+//   });
+// }
+
+async function fetchAdvanceData(from_month, campus_id, session_id) {
+  const getLastStatusAndArrearsQuery = `
+    SELECT fv.id AS voucher_id, fv.student_id, fv.advance_payments, fv.advance_status, fv.payment_received_through_bank, fv.scroll_no
+    FROM fee_vouchers fv
+    JOIN (
+      SELECT student_id, MAX(for_the_month) AS last_month
+      FROM fee_vouchers
+      WHERE for_the_month < ? AND advance_status = 'Advance'  AND (status = 'paid' OR status = 'partially_paid')
+      GROUP BY student_id
+    ) last_entries
+    ON fv.student_id = last_entries.student_id 
+    AND fv.for_the_month = last_entries.last_month
+    JOIN students s ON fv.student_id = s.id
+    WHERE s.campus_id = ? AND s.session_id = ? AND s.status IN ('New Admission', 'Promoted') AND s.status_on_off = 'On'`;
+
+  const advanceResults = await queryAsync(getLastStatusAndArrearsQuery, [
+    from_month,
+    campus_id,
+    session_id,
+  ]);
+
+  const advanceMap = {};
+  advanceResults.forEach((row) => {
+    advanceMap[row.student_id] = {
+      last_status: row.advance_status,
+      advance_payments: row.advance_payments,
+      voucher_id: row.voucher_id,
+      payment_received_through_bank: row.payment_received_through_bank,
+      scroll_no: row.scroll_no,
+    };
+  });
+
+  // console.log(advanceMap);
+
+  return advanceMap;
+}
+
+
+async function fetchArrearsData(
+  mergedResults,
+  from_month,
+  campus_id,
+  session_id
+) {
+  let formattedMonth = `${from_month}-01`;
+
+  let month = new Date(formattedMonth).getMonth() + 1;
+
+  
+
+  if (month === 9) {
+    const getLastThreeMonthsArrearsQuery = `
+    SELECT fv.id AS voucher_id, fv.student_id, fv.status AS last_status, 
+          fv.after_due_date_amount  AS after_due_amount, fv.arrears AS total_arrears, fv.fine, fv.arrears_fine AS total_arrears_fine, fv.first_arrear, fv.arrears_not_cleared, fv.first_advance_payment,
+          fv.for_the_month
+    FROM fee_vouchers fv
+    JOIN students s ON fv.student_id = s.id 
+    WHERE fv.for_the_month < ? 
+    AND fv.for_the_month >= DATE_SUB(?, INTERVAL 4 MONTH)
+    AND (fv.status = 'unpaid' OR fv.status = 'partially_paid')
+    AND s.campus_id = ? AND s.session_id = ?
+    AND s.status IN ('New Admission', 'Promoted') 
+    AND s.status_on_off = 'On'
+    ORDER BY fv.student_id, fv.for_the_month DESC`;
+
+    const arrearsResults = await queryAsync(getLastThreeMonthsArrearsQuery, [
+      formattedMonth,
+      formattedMonth,
+      campus_id,
+      session_id,
+    ]);
+
+    const arrearsMap = {};
+    arrearsResults.forEach((row) => {
+      if (!arrearsMap[row.student_id]) {
+        arrearsMap[row.student_id] = {
+          arrears_not_cleared: [],
+          total_arrears: 0,
+          previous_arrears: 0,
+          arrears_gap: 0,
+          total_fine: 0,
+          previous_fine: 0,
+          fine_gap: 0,
+
+        };
+      }
+
+      const currentTotalArrears = row.after_due_amount + (row.first_arrear == "yes" || month === 9 ? row.total_arrears : 0) +
+        parseInt(row.first_advance_payment, 10);
+      const previousArrears = arrearsMap[row.student_id].total_arrears; // Get the previous total arrears
+      const arrearsGap = currentTotalArrears - previousArrears; // Calculate the arrears gap
+
+
+      const currentTotalFine = row.fine + row.total_arrears_fine; // Calculate the current total fine
+      const previousFine = arrearsMap[row.student_id].total_fine; // Get the previous total fine
+      const fineGap = currentTotalFine - previousFine; // Calculate the fine gap
+
+
+      // Initialize arrears_not_cleared with existing data if present
+      let arrearsIds = [];
+      if (row.arrears_not_cleared) {
+        try {
+          arrearsIds = JSON.parse(row.arrears_not_cleared);
+        } catch (e) {
+          // Handle case where arrears_not_cleared is not valid JSON, treat it as a single ID
+          arrearsIds = [row.arrears_not_cleared];
+        }
+      }
+
+      // Add the current voucher ID to the arrears_not_cleared array only if it is not already present
+      if (!arrearsIds.includes(row.voucher_id)) {
+        arrearsIds.push(row.voucher_id);
+      }
+
+      // Update the arrearsMap with the unique arrearsIds, total_arrears, and arrears_gap
+      arrearsMap[row.student_id].arrears_not_cleared = [
+        ...new Set([
+          ...arrearsMap[row.student_id].arrears_not_cleared,
+          ...arrearsIds,
+        ]),
+      ];
+      arrearsMap[row.student_id].total_arrears += currentTotalArrears;
+      arrearsMap[row.student_id].arrears_gap = arrearsGap;
+
+      arrearsMap[row.student_id].total_fine += currentTotalFine;
+      arrearsMap[row.student_id].fine_gap = fineGap;
+
+      // Update the previous_arrears with the current total for the next iteration
+      arrearsMap[row.student_id].previous_arrears =
+        arrearsMap[row.student_id].total_arrears;
+
+        arrearsMap[row.student_id].previous_fine = arrearsMap[row.student_id].total_fine;
+    });
+
+    // console.log(arrearsMap);
+    return arrearsMap;
+  } else {
+  
+    const getLastThreeMonthsArrearsQuery = `
+    SELECT fv.id AS voucher_id, fv.student_id, fv.status AS last_status, 
+          fv.after_due_date_amount AS after_due_amount, fv.arrears AS total_arrears, 
+          fv.first_arrear, fv.fine, fv.arrears_fine as total_arrears_fine, 
+          fv.arrears_not_cleared, fv.first_advance_payment,
+          fv.for_the_month
+    FROM fee_vouchers fv
+    JOIN students s ON fv.student_id = s.id 
+    WHERE fv.for_the_month < ? 
+    AND fv.for_the_month >= DATE_SUB(?, INTERVAL 2 MONTH)
+    AND (fv.status = 'unpaid' OR fv.status = 'partially_paid')
+    AND s.campus_id = ? AND s.session_id = ?
+    AND s.status IN ('New Admission', 'Promoted') 
+    AND s.status_on_off = 'On'
+    ORDER BY fv.student_id, fv.for_the_month DESC`;
+
+const arrearsResults = await queryAsync(getLastThreeMonthsArrearsQuery, [
+  formattedMonth,
+  formattedMonth,
+  campus_id,
+  session_id,
+]);
+
+const arrearsMap = {};
+arrearsResults.forEach((row) => {
+  if (!arrearsMap[row.student_id]) {
+    arrearsMap[row.student_id] = {
+      arrears_not_cleared: [],
+      total_arrears: 0,
+      previous_arrears: 0,
+      arrears_gap: 0,
+      total_fine: 0,
+      previous_fine: 0,
+      fine_gap: 0,
+    };
+  }
+
+  const currentTotalArrears =
+    row.after_due_amount +
+    row.total_arrears +
+    parseInt(row.first_advance_payment, 10);
+  const previousArrears = arrearsMap[row.student_id].total_arrears;
+  const arrearsGap = currentTotalArrears - previousArrears;
+
+  const currentTotalFine = row.fine + row.total_arrears_fine;
+  const previousFine = arrearsMap[row.student_id].total_fine;
+  const fineGap = currentTotalFine - previousFine;
+
+  let arrearsIds = [];
+  if (row.arrears_not_cleared) {
+    try {
+      arrearsIds = JSON.parse(row.arrears_not_cleared);
+    } catch (e) {
+      arrearsIds = [row.arrears_not_cleared];
+    }
+  }
+
+  if (!arrearsIds.includes(row.voucher_id)) {
+    arrearsIds.push(row.voucher_id);
+  }
+
+  arrearsMap[row.student_id].arrears_not_cleared = [
+    ...new Set([
+      ...arrearsMap[row.student_id].arrears_not_cleared,
+      ...arrearsIds,
+    ]),
+  ];
+  arrearsMap[row.student_id].total_arrears += currentTotalArrears;
+  arrearsMap[row.student_id].arrears_gap = arrearsGap;
+
+  arrearsMap[row.student_id].total_fine += currentTotalFine;
+  arrearsMap[row.student_id].fine_gap = fineGap;
+
+  arrearsMap[row.student_id].previous_arrears =
+    arrearsMap[row.student_id].total_arrears;
+  arrearsMap[row.student_id].previous_fine =
+    arrearsMap[row.student_id].total_fine;
+});
+
+// console.log(arrearsMap);
+return arrearsMap;
+
+
+  }
+}
+
+
+const getFirstAndLastDate = (monthYear) => {
+  const [year, month] = monthYear.split('-');  // Split the "YYYY-MM" string
+
+  // First date of the month (e.g., 2025-01-01)
+  const firstDate = new Date(year, month - 1, 2);
+
+  // Last date of the month (0 means the last day of the previous month)
+  const lastDate = new Date(year, month, 1);  // `0` gives the last day of the previous month (January's last day is 31)
+
+  return {
+    firstDate: firstDate.toISOString().split('T')[0],  // Format the date as "YYYY-MM-DD"
+    lastDate: lastDate.toISOString().split('T')[0],    // Format the date as "YYYY-MM-DD"
+  };
+};
+
+
+
+function getPreviousMonth(dateStr) {
+  let [year, month] = dateStr.split("-").map(Number);
+  
+  // Create a date object for the first day of the given month
+  let prevMonthDate = new Date(year, month - 2, 1); // month is 0-based
+
+  // Format the result as YYYY-MM
+  return `${prevMonthDate.getFullYear()}-${String(prevMonthDate.getMonth() + 1).padStart(2, "0")}`;
+}
+
+// fetchBusFeeDetails
+
+async function fetchAttendance(campus_id, session_id, month) {
+
+  let previous_month = (getPreviousMonth(month));
+  const { firstDate, lastDate } = getFirstAndLastDate(previous_month);
+
+  // console.log(firstDate, lastDate, "this is first date and last date");
+
+  // console.log("first and last date", firstDate, lastDate);
+  const attendanceSql = `
+    SELECT student_id, COUNT(*) as count
+      FROM school_student_attendance
+      WHERE campus_id = ? AND session_id = ? and status = 'absent' and date between ? and ?
+      GROUP BY student_id, status
+  `;
+
+  try {
+    const attendanceQuery = await queryAsync(attendanceSql, [
+      campus_id,
+      session_id,
+      firstDate,
+      lastDate
+    ]);
+    const fetchAttendanceData = {};
+    // console.log(attendanceQuery, "this is attendance query");
+    attendanceQuery.forEach((row) => {
+      fetchAttendanceData[row.student_id] = row.count;
+    });
+
+    return fetchAttendanceData;
+  } catch (err) {
+    console.error("Error fetching bus fee details:", err);
+    throw err;
+  }
+}
+
+
+
+
+app.post("/fee-voucher", async (req, res) => {
+  let arrear_checked = false; // assuming this is true based on your requirements
+  const {
+    class_id,
+    shift,
+    from_month,
+    to_month,
+    due_date,
+    remarks,
+    session_id,
+    campus_id,
+    user_id,
+    arrear_set,
+    bus_fee_status,
+    fine,
+  } = req.body.editFormData;
+
+
+  // let classIdArray = class_id.split(',').map(id => parseInt(id, 10));
+
+  // console.log(classIdString);
+
+  // return false;
+
+  // console.log("check from start" + fine);
+  const data1 = req.body.groupedData;
+
+  // this is alternate set because I dont want to customize code. it already set to false
+  if (arrear_set == true) {
+    arrear_checked = false;
+  } else {
+    arrear_checked = true;
+  }
+
+  const months = generateMonths(from_month, to_month);
+
+  let sql;
+  let sqlParams;
+
+  
+  sql = `SELECT s.id, s.category_id, s.bus_fee, s.bus_status, s.class_id, s.section_id, s.shift, s.campus_id, s.session_id, s.old_arrear_ids, s.old_arrears_amount, s.old_arrears_fine, s.arrears_generated, 
+       cl.fee_group_id, s.student_unique_id
+        FROM students s
+        JOIN school_categories c ON s.category_id = c.id
+        JOIN classes cl ON s.class_id = cl.id
+        WHERE s.class_id IN (?)
+          AND s.campus_id = ? 
+          AND s.session_id = ?
+          AND s.status IN ('New Admission', 'Promoted')
+          AND s.status_on_off = 'On'
+          AND s.status_for_pendings = 'On'
+        ORDER BY s.category_id`;
+
+  sqlParams = [class_id, campus_id, session_id];
+
+
+  const getLastInvoiceNoQuery =
+    `SELECT invoice_no FROM fee_vouchers WHERE campus_id = ? ORDER BY invoice_no DESC LIMIT 1`;
+
+   let sqlParamsInvoiceNo = [campus_id];
+
+  try {
+    const lastInvoiceResult = await queryAsync(getLastInvoiceNoQuery, sqlParamsInvoiceNo);
+    let invoiceNo =
+      lastInvoiceResult.length > 0
+        ? parseInt(lastInvoiceResult[0].invoice_no) + 1
+        : 1000;
+
+    const studentResults = await queryAsync(sql, sqlParams);
+    const mergedResults = mergeDataAndCalculateTotals(studentResults, data1);
+
+    // console.log('this is merge result', mergedResults[0].data);
+
+    // return false;
+
+    const advanceMap = await fetchAdvanceData(
+      from_month,
+      campus_id,
+      session_id
+    );
+
+    if (!arrear_checked) {
+      const arrearsResults = await fetchArrearsData(
+        mergedResults,
+        from_month,
+        campus_id,
+        session_id
+      );
+      await fetchBankDetailsAndProcessVouchers(
+        mergedResults,
+        months,
+        arrearsResults,
+        advanceMap,
+        invoiceNo,
+        from_month,
+        to_month,
+        due_date,
+        remarks,
+        campus_id,
+        session_id,
+        res,
+        bus_fee_status,
+        fine,
+        shift,
+        user_id
+      );
+    } else {
+      await fetchBankDetailsAndProcessVouchers(
+        mergedResults,
+        months,
+        {},
+        advanceMap,
+        invoiceNo,
+        from_month,
+        to_month,
+        due_date,
+        remarks,
+        campus_id,
+        session_id,
+        res,
+        bus_fee_status,
+        fine,
+        shift,
+        user_id,
+        arrear_checked
+      );
+    }
+  } catch (err) {
+    console.error("Error processing fee vouchers:", err);
+    res.status(500).json({ error: "Error processing fee vouchers" });
+  }
+});
+
+async function fetchBankDetailsAndProcessVouchers(
+  mergedResults,
+  months,
+  arrearsMap,
+  advanceMap,
+  invoiceNo,
+  from_month,
+  to_month,
+  due_date,
+  remarks,
+  campus_id,
+  session_id,
+  res,
+  bus_fee_status,
+  fine,
+  shift,
+  user_id,
+  arrear_checked = false
+) {
+  const getBankDetailsQuery = `
+    SELECT id AS bank_id
+    FROM bank_details
+    WHERE campus_id = ? AND status = 'On'
+  `;
+
+  try {
+    const bankDetailsResults = await queryAsync(getBankDetailsQuery, [
+      campus_id,
+    ]);
+    const bankDetails = bankDetailsResults.map((row) => row.bank_id);
+
+    await processAndInsertMultiple(
+      mergedResults,
+      months,
+      arrearsMap,
+      advanceMap,
+      invoiceNo,
+      from_month,
+      to_month,
+      due_date,
+      remarks,
+      campus_id,
+      session_id,
+      res,
+      bus_fee_status,
+      fine,
+      shift,
+      user_id,
+      arrear_checked,
+      bankDetails
+    );
+  } catch (err) {
+    console.error("Error fetching bank details:", err);
+    res.status(500).json({ error: "Error fetching bank details" });
+  }
+}
+
+async function processAndInsertMultiple(
+  mergedResults,
+  months,
+  arrearsMap,
+  advanceMap,
+  invoiceNo,
+  from_month,
+  to_month,
+  due_date,
+  remarks,
+  campus_id,
+  session_id,
+  res,
+  bus_fee_status,
+  fine,
+  shift,
+  user_id,
+  arrear_checked = false,
+  bankDetails
+) {
+  // console.log("this is fine" + fine);
+
+  const checkExistingEntriesQuery = `
+    SELECT student_id, for_the_month
+    FROM fee_vouchers
+    WHERE student_id IN (SELECT id FROM students WHERE campus_id = ? AND session_id = ? AND status IN ('New Admission', 'Promoted') AND status_on_off = 'On' AND status_for_pendings = 'On')
+    AND for_the_month BETWEEN ? AND ?
+  `;
+
+  try {
+    const existingEntries = await queryAsync(checkExistingEntriesQuery, [
+      campus_id,
+      session_id,
+      from_month,
+      to_month,
+    ]);
+
+
+    const fetchAttendanceData = await fetchAttendance(campus_id, session_id, from_month);
+
+    const existingEntriesSet = new Set(
+      existingEntries.map(
+        (entry) => `${entry.student_id}-${entry.for_the_month}`
+      )
+    );
+
+    const finalResults = mergedResults.flatMap((result) => {
+      return months
+        .map((month) => {
+          const key = `${result.id}-${month}`;
+          const arrearsInfo = arrearsMap[result.id];
+         
+          const advanceInfo = advanceMap[result.id];
+
+          // console.log("test attendance", fetchAttendanceData, result.id);
+          let total_attendance_absents = fetchAttendanceData[result.id] || 0 ;
+
+          let calculate_attendance_amount = total_attendance_absents * 100;
+
+          // console.log(attendance_fine);
+
+          let bus_fee = bus_fee_status ? (result.bus_status === "On" ? result.bus_fee || 0 : 0) : 0;
+
+          let total_amount_data = result.total_amount_data + bus_fee + calculate_attendance_amount;
+          let status = "unpaid";
+
+          if (!existingEntriesSet.has(key)) {
+            let arrears_not_cleared = arrear_checked
+              ? []
+              : arrearsInfo
+              ? [...arrearsInfo.arrears_not_cleared]
+              : [];
+
+            if (
+              advanceInfo &&
+              advanceInfo.advance_payments >= total_amount_data
+            ) {
+              status = "paid";
+            }
+
+            if (
+              advanceInfo &&
+              advanceInfo.advance_payments > 0 &&
+              advanceInfo.advance_payments < total_amount_data
+            ) {
+              status = "unpaid";
+            }
+
+            if (month === from_month && arrearsInfo) {
+              if (
+                (arrearsInfo.last_status === "unpaid" ||
+                  arrearsInfo.last_status === "partially_paid") &&
+                arrearsInfo.total_arrears > 0
+              ) {
+                arrears_not_cleared.push(arrearsInfo.voucher_id.toString());
+                return {
+                  old_arrears_id:result.old_arrears_id,
+                  old_arrears_amount:result.old_arrears_amount,
+                  old_arrears_fine:result.old_arrears_fine,
+                  arrears_generated:result.arrears_generated,
+                  student_id: result.id,
+                  class_id: result.class_id,
+                  section_id: result.section_id,
+                  category_id: result.category_id,
+                  campus_id: result.campus_id,
+                  session_id: result.session_id,
+                  fee_head: JSON.stringify(result.data),
+                  total_amount_data:
+                    advanceInfo &&
+                    advanceInfo.advance_payments > 0 &&
+                    advanceInfo.advance_payments <
+                      total_amount_data +
+                        (arrearsInfo && arrearsInfo.total_arrears
+                          ? arrearsInfo.total_arrears
+                          : 0)
+                      ? total_amount_data - (advanceInfo.advance_payments || 0)
+                      : total_amount_data,
+                  after_due_date_amount:
+                    advanceInfo &&
+                    advanceInfo.advance_payments > 0 &&
+                    advanceInfo.advance_payments <
+                      total_amount_data +
+                        (arrearsInfo && arrearsInfo.total_arrears
+                          ? arrearsInfo.total_arrears
+                          : 0)
+                      ? total_amount_data -
+                        (advanceInfo.advance_payments || 0) +
+                        parseInt(fine)
+                      : total_amount_data + parseInt(fine),
+                  for_the_month: month,
+                  due_date,
+                  shift: result.shift,
+                  // shift,
+                  actual_due_date: due_date,
+                  remarks,
+                  invoice_no: invoiceNo++,
+                  first_arrear: (result.arrears_generated === "not generated" ? "yes" : null),
+                  arrears: result.arrears_generated === "not generated" ?  (result.old_arrears_amount || 0) :
+                  advanceInfo &&
+                  advanceInfo.advance_payments >=
+                    total_amount_data +
+                      (arrearsInfo && arrearsInfo.total_arrears
+                        ? arrearsInfo.total_arrears
+                        : 0)
+                    ? 0
+                    : arrearsInfo
+                    ? arrearsInfo.total_arrears
+                    : 0,
+
+                  arrears_fine: result.arrears_generated === "not generated" ?  (result.old_arrears_fine || 0) :
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data + (arrearsInfo && arrearsInfo.total_arrears ? arrearsInfo.total_arrears : 0)
+                      ? 0
+                      : arrearsInfo
+                      ? arrearsInfo.total_fine
+                      : 0,
+                  status,
+                // arrears_not_cleared:
+                //   advanceInfo &&
+                //   advanceInfo.advance_payments >=
+                //     total_amount_data +
+                //       (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                //     ? "[]"
+                //     : JSON.stringify(arrears_not_cleared),
+
+                arrears_not_cleared : result.arrears_generated === "not generated"
+                  ? (result.old_arrear_ids || [])
+                  : advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data + (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                    ? "[]"
+                    : JSON.stringify(arrears_not_cleared || []),
+                    
+                  bank_details: JSON.stringify(bankDetails),
+                  advance_payments:
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? advanceInfo.advance_payments -
+                        (total_amount_data +
+                          (arrearsInfo ? arrearsInfo.total_arrears : 0))
+                      : 0,
+                  advance_status:
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? "Advance"
+                      : advanceInfo &&
+                        advanceInfo.advance_payments > 0 &&
+                        advanceInfo.advance_payments <
+                          total_amount_data +
+                            (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? "Advance"
+                      : "Exhaust",
+                  payment_date:
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                        ? due_date
+                      // ? new Date().toISOString().split("T")[0]
+                      : null,
+                  recieved_payment:
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      : 0,
+                  scroll_no:
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? advanceInfo.scroll_no
+                      : null,
+                  payment_received_through_bank:
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? advanceInfo.payment_received_through_bank
+                      : null,
+                  bus_fee: bus_fee, // Adding bus fee here
+                  attendance_amount: calculate_attendance_amount,
+                  arrears_gap: arrearsInfo ? arrearsInfo.arrear_gap : 0, // New field
+                  // arrear_gap_from_payable: arrearsInfo ? arrearsInfo.arrear_gap - total_amount_data : 0 ,
+                  voucher_created_form: "Multiple",
+                  fine,
+                  user_id,
+                  student_unique_id: result.student_unique_id
+                };
+              }
+            }
+            // console.log("this is student results", result);
+            // General case without adding arrears to total_amount_data
+            return {
+              old_arrears_id:result.old_arrears_id,
+              old_arrears_amount:result.old_arrears_amount,
+              old_arrears_fine:result.old_arrears_fine,
+              arrears_generated:result.arrears_generated,
+              student_id: result.id,
+              class_id: result.class_id,
+              section_id: result.section_id,
+              category_id: result.category_id,
+              campus_id: result.campus_id,
+              session_id: result.session_id,
+              fee_head: JSON.stringify(result.data),
+              total_amount_data:
+                advanceInfo &&
+                advanceInfo.advance_payments > 0 &&
+                advanceInfo.advance_payments <
+                  total_amount_data +
+                    (arrearsInfo && arrearsInfo.total_arrears
+                      ? arrearsInfo.total_arrears
+                      : 0)
+                  ? total_amount_data - (advanceInfo.advance_payments || 0)
+                  : total_amount_data,
+              after_due_date_amount:
+                advanceInfo &&
+                advanceInfo.advance_payments > 0 &&
+                advanceInfo.advance_payments <
+                  total_amount_data +
+                    (arrearsInfo && arrearsInfo.total_arrears
+                      ? arrearsInfo.total_arrears
+                      : 0)
+                  ? total_amount_data -
+                    (advanceInfo.advance_payments || 0) +
+                    parseInt(fine)
+                  : total_amount_data + parseInt(fine),
+              for_the_month: month,
+              due_date,
+              shift: result.shift,
+              // shift,
+              actual_due_date: due_date,
+              remarks,
+              invoice_no: invoiceNo++,
+              first_arrear: (result.arrears_generated === "not generated" ? "yes" : null),
+              arrears: result.arrears_generated === "not generated" ?  (result.old_arrears_amount || 0) :
+              advanceInfo &&
+              advanceInfo.advance_payments >=
+                total_amount_data +
+                  (arrearsInfo && arrearsInfo.total_arrears
+                    ? arrearsInfo.total_arrears
+                    : 0)
+                ? 0
+                : arrearsInfo
+                ? arrearsInfo.total_arrears
+                : 0,
+
+              arrears_fine: result.arrears_generated === "not generated" ?  (result.old_arrears_fine || 0) :
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data + (arrearsInfo && arrearsInfo.total_arrears ? arrearsInfo.total_arrears : 0)
+                  ? 0
+                  : arrearsInfo
+                  ? arrearsInfo.total_fine
+                  : 0,
+              status,
+            // arrears_not_cleared:
+            //   advanceInfo &&
+            //   advanceInfo.advance_payments >=
+            //     total_amount_data +
+            //       (arrearsInfo ? arrearsInfo.total_arrears : 0)
+            //     ? "[]"
+            //     : JSON.stringify(arrears_not_cleared),
+
+            arrears_not_cleared : result.arrears_generated === "not generated"
+              ? (result.old_arrear_ids || [])
+              : advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data + (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                ? "[]"
+                : JSON.stringify(arrears_not_cleared || []),
+              bank_details: JSON.stringify(bankDetails),
+              advance_payments:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? advanceInfo.advance_payments -
+                    (total_amount_data +
+                      (arrearsInfo ? arrearsInfo.total_arrears : 0))
+                  : 0,
+              advance_status:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? "Advance"
+                  : advanceInfo &&
+                    advanceInfo.advance_payments > 0 &&
+                    advanceInfo.advance_payments <
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? "Advance"
+                  : "Exhaust",
+              payment_date: 
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                    ? due_date
+                  // ? new Date().toISOString().split("T")[0]
+                  : null,
+              recieved_payment:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  : 0,
+              scroll_no:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? advanceInfo.scroll_no
+                  : null,
+              payment_received_through_bank:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? advanceInfo.payment_received_through_bank
+                  : null,
+              bus_fee: bus_fee, // Adding bus fee here
+              attendance_amount: calculate_attendance_amount,
+              arrears_gap: arrearsInfo ? arrearsInfo.arrear_gap : 0, // New field
+              // arrear_gap_from_payable: arrearsInfo ? arrearsInfo.arrear_gap - total_amount_data : 0 ,
+              voucher_created_form: "Multiple",
+              fine,
+              user_id,
+              student_unique_id: result.student_unique_id
+            };
+          } else {
+            return null;
+          }
+        })
+        .filter((entry) => entry !== null);
+    });
+
+    // Extracting voucher_ids that are stored in arrears_not_cleared
+    const voucherIdsToUpdate = finalResults.reduce((acc, result) => {
+      const arrearsIds = JSON.parse(result.arrears_not_cleared || "[]");
+      return acc.concat(arrearsIds);
+    }, []);
+
+    if (voucherIdsToUpdate.length > 0) {
+      const updateArrearsQuery = `
+        UPDATE fee_vouchers
+        SET is_arrear = 'arrears'
+        WHERE id IN (?)
+      `;
+      await queryAsync(updateArrearsQuery, [voucherIdsToUpdate]);
+    }
+
+    if (finalResults.length === 0) {
+      return res.status(200).json({
+        message: "No new fee vouchers to insert",
+        arrear_not_cleared: finalResults.map(
+          (result) => result.arrears_not_cleared
+        ),
+      });
+    }
+
+    const insertQuery = `
+      INSERT INTO fee_vouchers
+      (student_id,  class_id, section_id,  category_id, campus_id, session_id, fee_head, total_amount_data, after_due_date_amount, for_the_month, due_date, shift, actual_due_date, remarks, invoice_no, first_arrear, arrears, arrears_fine, status, arrears_not_cleared, bank_details, advance_payments, advance_status, payment_date, recieved_payment, scroll_no, payment_received_through_bank, bus_fee,  attendance_amount, arrears_gap, voucher_created_form, fine,  user_id, student_unique_id)
+      VALUES ?
+    `;
+
+    const values = finalResults.map((result) => [
+      result.student_id,
+      result.class_id,
+      result.section_id,
+      result.category_id,
+      result.campus_id,
+      result.session_id,
+      result.fee_head,
+      result.total_amount_data,
+      result.after_due_date_amount,
+      result.for_the_month,
+      result.due_date,
+      result.shift,
+      result.actual_due_date,
+      result.remarks,
+      result.invoice_no,
+      result.first_arrear,
+      result.arrears,
+      result.arrears_fine,
+      result.status,
+      result.arrears_not_cleared,
+      result.bank_details,
+      result.advance_payments,
+      result.advance_status,
+      result.payment_date,
+      result.recieved_payment,
+      result.scroll_no,
+      result.payment_received_through_bank,
+      result.bus_fee,
+      result.attendance_amount,
+      result.arrears_gap,
+      // result.arrear_gap_from_payable,
+      result.voucher_created_form,
+      result.fine,
+      result.user_id,
+      result.student_unique_id
+    ]);
+
+    const insertResult = await queryAsync(insertQuery, [values]);
+
+
+    // console.log(finalResults);
+
+    // Check and update student status for arrears > 3 months
+    // const studentsToUpdate = finalResults
+    //   .filter((result) => {
+    //     const arrearsDuration = JSON.parse(result.arrears_not_cleared).length;
+    //     return arrearsDuration > 1;
+    //   })
+    //   .map((result) => result.student_id);
+
+    // // if (studentsToUpdate.length > 0) {
+    // //   const updateStudentStatusQuery = `
+    // //     UPDATE students
+    // //     SET status_for_pendings = 'Off'
+    // //     WHERE id IN (?)
+    // //   `;
+    // //   await queryAsync(updateStudentStatusQuery, [studentsToUpdate]);
+    // // }
+
+
+
+    const studentsToUpdate = finalResults
+    .filter((result) => result.arrears_generated === "not generated") // Filter students whose arrears_generated is "not generated"
+    .map((result) => result.student_id); 
+
+    if (studentsToUpdate.length > 0) {
+      const updateStudentStatusQuery = `
+        UPDATE students
+        SET arrears_generated = 'generated'
+        WHERE id IN (?)
+      `;
+      await queryAsync(updateStudentStatusQuery, [studentsToUpdate]);
+    }
+
+
+    logAction('CREATE', 'fee_vouchers' ,'Month Wise Fee Generated', 0, user_id, campus_id, session_id);
+
+    res.status(200).json({
+      message: "Fee vouchers inserted successfully",
+      insertResult,
+      arrear_not_cleared: finalResults.map(
+        (result) => result.arrears_not_cleared
+      ),
+    });
+  } catch (err) {
+    console.error("Error processing fee vouchers:", err);
+    res.status(500).json({ error: "Error processing fee vouchers" });
+  }
+}
+
+
+
+// .....this is old code and 100% correct.............
+// app.post('/update-arrears', async (req, res) => {
+//   const { student_id, arrear_id, hidden_id, month } = req.body;
+
+//   try {
+//       // Step 1: Get the total amount and fine for the specific `arrear_id`
+//       const totalAmountQuery = `
+//           SELECT id, (after_due_date_amount + first_advance_payment) as total_amount, fine
+//           FROM fee_vouchers
+//           WHERE student_id = ? AND id = ?;
+//       `;
+
+//       const totalAmountResult = await new Promise((resolve, reject) => {
+//           connection.query(totalAmountQuery, [student_id, arrear_id], (error, results) => {
+//               if (error) return reject(error);
+//               resolve(results[0]);
+//           });
+//       });
+
+//       if (!totalAmountResult) {
+//           return res.status(404).json({ message: 'No matching records found for total amount calculation' });
+//       }
+
+//       const { total_amount: totalAmount, fine } = totalAmountResult;
+
+//       // Step 2: Retrieve all records for the student where arrears_not_cleared is non-empty
+//       const potentialMatchesQuery = `
+//           SELECT id, arrears_not_cleared, arrears, arrears_fine
+//           FROM fee_vouchers
+//           WHERE student_id = ? AND id = ?;
+//       `;
+
+//       const potentialMatches = await new Promise((resolve, reject) => {
+//           connection.query(potentialMatchesQuery, [student_id, hidden_id], (error, results) => {
+//               if (error) return reject(error);
+//               resolve(results);
+//           });
+//       });
+
+//       if (potentialMatches.length === 0) {
+//           return res.status(404).json({ message: 'No records found with arrears not cleared' });
+//       }
+
+//       // Step 3: Filter and update each matching record in JavaScript
+//       for (const record of potentialMatches) {
+//           const arrearsArray = JSON.parse(record.arrears_not_cleared);
+
+//           // Check if arrear_id exists as a string or integer in arrearsArray
+//           if (arrearsArray.includes(arrear_id) || arrearsArray.includes(arrear_id.toString())) {
+
+//               // Remove arrear_id from arrearsArray
+//               const updatedArrearsNotCleared = arrearsArray.filter(id => id !== arrear_id && id !== arrear_id.toString());
+//               const updatedArrears = record.arrears - totalAmount;
+//               const updatedArrearFine = record.arrears_fine - fine;
+
+//               const updateQuery = `
+//                   UPDATE fee_vouchers
+//                   SET arrears_not_cleared = ?, arrears = ?, arrears_fine = ?
+//                   WHERE id = ?;
+//               `;
+
+//               await new Promise((resolve, reject) => {
+//                   connection.query(updateQuery, [JSON.stringify(updatedArrearsNotCleared), updatedArrears, updatedArrearFine, record.id], (error, results) => {
+//                       if (error) return reject(error);
+//                       resolve(results);
+//                   });
+//               });
+//           }
+//       }
+
+//       res.status(200).json({ message: 'Arrears and associated fine updated successfully' });
+//   } catch (error) {
+//       console.error(error);
+//       res.status(500).json({ message: 'An error occurred while updating arrears' });
+//   }
+// });
+
+
+
+
+// app.post('/update-arrears', async (req, res) => {
+//   const { student_id, arrear_id, hidden_id, month } = req.body;
+
+//   try {
+//     // Step 1: Get the total amount and fine for the specific `arrear_id`
+//     const totalAmountQuery = `
+//         SELECT id, (after_due_date_amount + first_advance_payment) as total_amount, fine
+//         FROM fee_vouchers
+//         WHERE student_id = ? AND id = ?;
+//     `;
+
+//     const totalAmountResult = await new Promise((resolve, reject) => {
+//         connection.query(totalAmountQuery, [student_id, arrear_id], (error, results) => {
+//             if (error) return reject(error);
+//             resolve(results[0]);
+//         });
+//     });
+
+//     if (!totalAmountResult) {
+//         return res.status(404).json({ message: 'No matching records found for total amount calculation' });
+//     }
+
+//     const { total_amount: totalAmount, fine } = totalAmountResult;
+
+//     // Step 2: Retrieve all records for the student where arrears_not_cleared is non-empty
+//     const potentialMatchesQuery = `
+//         SELECT id, arrears_not_cleared, arrears, arrears_fine
+//         FROM fee_vouchers
+//         WHERE student_id = ? AND id = ?;
+//     `;
+
+//     const potentialMatches = await new Promise((resolve, reject) => {
+//         connection.query(potentialMatchesQuery, [student_id, hidden_id], (error, results) => {
+//             if (error) return reject(error);
+//             resolve(results);
+//         });
+//     });
+
+//     if (potentialMatches.length === 0) {
+//         return res.status(404).json({ message: 'No records found with arrears not cleared' });
+//     }
+
+//     // Step 3: Add logic to check if arrear_id exists in future vouchers before the specified month
+
+    
+//     const arrearIdAsString = arrear_id.toString();
+
+//     const findBeforeMonthQuery = `
+//       SELECT COUNT(*) as count
+//       FROM fee_vouchers
+//       WHERE student_id = ? 
+//         AND for_the_month < ? 
+//         AND (JSON_CONTAINS(arrears_not_cleared, JSON_ARRAY(?), '$') OR JSON_CONTAINS(arrears_not_cleared, JSON_ARRAY(?), '$'))
+//     `;
+
+//     const findBeforeMonthResults = await new Promise((resolve, reject) => {
+//         connection.query(findBeforeMonthQuery, [student_id, month, arrearIdAsString, arrear_id], (error, results) => {
+//             if (error) return reject(error);
+//             resolve(results[0].count);
+//         });
+//     });
+   
+//     // console.log(findBeforeMonthResults);
+
+//     if (findBeforeMonthResults <= 0) {
+//         // Step 4: If count is <= 0, update the is_arrear field for that specific arrear_id
+//         const updateQuery = `
+//           UPDATE fee_vouchers
+//           SET is_arrear = NULL
+//           WHERE student_id = ? AND id = ?;
+//         `;
+
+//         await new Promise((resolve, reject) => {
+//             connection.query(updateQuery, [student_id, arrear_id], (error, results) => {
+//                 if (error) return reject(error);
+//                 resolve(results);
+//             });
+//         });
+//         console.log('Arrear marked as cleared and is_arrear set to ""');
+//     }
+
+//     // Step 5: Filter and update each matching record in JavaScript
+//     for (const record of potentialMatches) {
+//         const arrearsArray = JSON.parse(record.arrears_not_cleared);
+
+//         // Check if arrear_id exists as a string or integer in arrearsArray
+//         if (arrearsArray.includes(arrear_id) || arrearsArray.includes(arrear_id.toString())) {
+
+//             // Remove arrear_id from arrearsArray
+//             const updatedArrearsNotCleared = arrearsArray.filter(id => id !== arrear_id && id !== arrear_id.toString());
+//             const updatedArrears = record.arrears - totalAmount;
+//             const updatedArrearFine = record.arrears_fine - fine;
+
+//             const updateQuery = `
+//                 UPDATE fee_vouchers
+//                 SET arrears_not_cleared = ?, arrears = ?, arrears_fine = ?
+//                 WHERE id = ?;
+//             `;
+
+//             await new Promise((resolve, reject) => {
+//                 connection.query(updateQuery, [JSON.stringify(updatedArrearsNotCleared), updatedArrears, updatedArrearFine, record.id], (error, results) => {
+//                     if (error) return reject(error);
+//                     resolve(results);
+//                 });
+//             });
+//         }
+//     }
+
+//     res.status(200).json({ message: 'Arrears and associated fine updated successfully' });
+//   } catch (error) {
+//     console.error(error);
+//     res.status(500).json({ message: 'An error occurred while updating arrears' });
+//   }
+// });
+
+
+
+
+app.post('/update-arrears', async (req, res) => {
+  const { student_id, arrear_id, hidden_id, month } = req.body;
+
+  try {
+    // Step 1: Get the total amount and fine for the specific `arrear_id`
+    const totalAmountQuery = `
+        SELECT id, (after_due_date_amount + first_advance_payment) as total_amount, fine
+        FROM fee_vouchers
+        WHERE id = ?;
+    `;
+
+    const totalAmountResult = await new Promise((resolve, reject) => {
+        connection.query(totalAmountQuery, [arrear_id], (error, results) => {
+            if (error) return reject(error);
+            resolve(results[0]);
+        });
+    });
+
+    if (!totalAmountResult) {
+        return res.status(404).json({ message: 'No matching records found for total amount calculation' });
+    }
+
+    const { total_amount: totalAmount, fine } = totalAmountResult;
+
+    // Step 2: Retrieve all records for the student where arrears_not_cleared is non-empty
+    const potentialMatchesQuery = `
+        SELECT id, arrears_not_cleared, arrears, arrears_fine
+        FROM fee_vouchers
+        WHERE id = ?;
+    `;
+
+    const potentialMatches = await new Promise((resolve, reject) => {
+        connection.query(potentialMatchesQuery, [hidden_id], (error, results) => {
+            if (error) return reject(error);
+            resolve(results);
+        });
+    });
+
+    if (potentialMatches.length === 0) {
+        return res.status(404).json({ message: 'No records found with arrears not cleared' });
+    }
+
+    // Step 3: Add logic to check if arrear_id exists in future vouchers before the specified month
+
+    
+    const arrearIdAsString = arrear_id.toString();
+
+    const findBeforeMonthQuery = `
+      SELECT COUNT(*) as count
+      FROM fee_vouchers
+      WHERE for_the_month < ? 
+        AND (JSON_CONTAINS(arrears_not_cleared, JSON_ARRAY(?), '$') OR JSON_CONTAINS(arrears_not_cleared, JSON_ARRAY(?), '$'))
+    `;
+
+    const findBeforeMonthResults = await new Promise((resolve, reject) => {
+        connection.query(findBeforeMonthQuery, [month, arrearIdAsString, arrear_id], (error, results) => {
+            if (error) return reject(error);
+            resolve(results[0].count);
+        });
+    });
+   
+    // console.log(findBeforeMonthResults);
+
+    if (findBeforeMonthResults <= 0) {
+        // Step 4: If count is <= 0, update the is_arrear field for that specific arrear_id
+        const updateQuery = `
+          UPDATE fee_vouchers
+          SET is_arrear = NULL AND session_end = 'no'
+          WHERE id = ?;
+        `;
+
+        await new Promise((resolve, reject) => {
+            connection.query(updateQuery, [arrear_id], (error, results) => {
+                if (error) return reject(error);
+                resolve(results);
+            });
+        });
+        console.log('Arrear marked as cleared and is_arrear set to ""');
+    }
+
+    // Step 5: Filter and update each matching record in JavaScript
+    for (const record of potentialMatches) {
+        const arrearsArray = JSON.parse(record.arrears_not_cleared);
+
+        // Check if arrear_id exists as a string or integer in arrearsArray
+        if (arrearsArray.includes(arrear_id) || arrearsArray.includes(arrear_id.toString())) {
+
+            // Remove arrear_id from arrearsArray
+            const updatedArrearsNotCleared = arrearsArray.filter(id => id !== arrear_id && id !== arrear_id.toString());
+            const updatedArrears = record.arrears - totalAmount;
+            const updatedArrearFine = record.arrears_fine - fine;
+
+            const updateQuery = `
+                UPDATE fee_vouchers
+                SET arrears_not_cleared = ?, arrears = ?, arrears_fine = ?
+                WHERE id = ?;
+            `;
+
+            await new Promise((resolve, reject) => {
+                connection.query(updateQuery, [JSON.stringify(updatedArrearsNotCleared), updatedArrears, updatedArrearFine, record.id], (error, results) => {
+                    if (error) return reject(error);
+                    resolve(results);
+                });
+            });
+        }
+    }
+
+    res.status(200).json({ message: 'Arrears and associated fine updated successfully' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: 'An error occurred while updating arrears' });
+  }
+});
+
+
+
+
+
+async function fetchAttendanceSingleVoucher(campus_id, session_id, month, student_id) {
+// console.log("attendance", campus_id, session_id, month, student_id);
+  // const { firstDate, lastDate } = getFirstAndLastDate(month);
+
+   let previous_month = (getPreviousMonth(month));
+  const { firstDate, lastDate } = getFirstAndLastDate(previous_month);
+
+  console.log("first and last date", firstDate, lastDate);
+
+  const attendanceSql = `
+    SELECT student_id, COUNT(*) as count
+      FROM school_student_attendance
+      WHERE campus_id = ? AND session_id = ? and status = 'absent' and student_id = ? and date between ? and ?
+      GROUP BY student_id, status
+  `;
+
+  try {
+    const attendanceQuery = await queryAsync(attendanceSql, [
+      campus_id,
+      session_id,
+      student_id,
+      firstDate,
+      lastDate
+    ]);
+    const fetchAttendanceData = {};
+    // console.log(attendanceQuery, "this is attendance query");
+    attendanceQuery.forEach((row) => {
+      fetchAttendanceData[row.student_id] = row.count;
+    });
+
+    return fetchAttendanceData;
+  } catch (err) {
+    console.error("Error fetching bus fee details:", err);
+    throw err;
+  }
+}
+
+
+
+function mergeDataAndCalculateTotalsForSingleFee(results, data1) {
+  return results.map((result) => {
+    const categoryId = result.category_id.toString();
+    const data = data1[categoryId] || [];
+    const totalAmount = data.reduce((sum, item) => sum + (item.amount || 0), 0);
+    return { ...result, data, total_amount_data: totalAmount };
+  });
+}
+
+
+
+app.post("/single-fee-voucher", async (req, res) => {
+  let arrear_checked = false;
+  const {
+    hidden_id,
+    student_id,
+    student_unique_id,
+    from_month,
+    to_month,
+    due_date,
+    remarks,
+    session_id,
+    arrears,
+    advance_payments,
+    first_advance_payment,
+    hidden_advance_payment,
+    campus_id,
+    user_id,
+    arrear_set,
+    bus_fee_status,
+    bus_fee,
+    fine,
+    advance,
+    shift,
+  } = req.body.editFormData;
+
+  
+
+  const data1 = req.body.groupedData;
+
+  if (arrear_set === true) {
+    arrear_checked = false;
+  } else {
+    arrear_checked = true;
+  }
+
+  const months = generateMonths(from_month, to_month);
+
+  const getLastInvoiceNoQuery =
+    "SELECT invoice_no FROM fee_vouchers WHERE campus_id = ? ORDER BY invoice_no DESC LIMIT 1";
+
+  try {
+    if (hidden_id !== "") {
+      //this is to add first arrears
+      const check_monthwise_arrears_exist = req.body.amountsData;
+
+      // Fetch arrears_not_cleared and after_due_date_amount from fee_vouchers for hidden_id
+      let fetchArrearsQuery = `
+        SELECT arrears_not_cleared, after_due_date_amount
+        FROM fee_vouchers 
+        WHERE id = ?
+      `;
+
+      connection.query(fetchArrearsQuery, [hidden_id], (err, result) => {
+        if (err) {
+          console.error("Error fetching arrears_not_cleared:", err);
+          return res
+            .status(500)
+            .json({ error: "Error fetching arrears_not_cleared" });
+        }
+
+        let arrearsNotCleared = [];
+        let currentAfterDueDateAmount = 0;
+
+        if (result.length > 0) {
+          if (result[0].arrears_not_cleared) {
+            arrearsNotCleared = JSON.parse(result[0].arrears_not_cleared);
+          }
+          currentAfterDueDateAmount = result[0].after_due_date_amount || 0;
+        }
+
+        var arrears_id_data = req.body.amountsData;
+
+        let arrears_id = arrears_id_data
+          .filter((item) => item.status !== false)
+          .map((item) => item.id.toString());
+
+        if (arrears === 0) {
+          arrears_id = [];
+        }
+     
+
+        const get_category = req.body.editFormData["category_id"];
+        const get_heads_data = req.body.groupedData[get_category];
+
+        const grandSum = Object.values(data1)
+          .flat()
+          .reduce((total, item) => total + item.amount, 0);
+
+        // After adding fine
+        const after_due_date_amount_get = grandSum + parseInt(fine == '' ? 0 : fine);
+
+        const transform_head_detail = get_heads_data.map((item) => ({
+          id: item.id,
+          amount: item.amount,
+          category_name: item.category_name,
+        }));
+
+        const fee_head_detail_get = JSON.stringify(transform_head_detail);
+
+        let getAdvanceQuery = `
+          SELECT advance_payments
+          FROM fee_vouchers
+          WHERE student_id = ?
+            AND for_the_month = ?
+            AND campus_id = ?
+            AND session_id = ?
+            AND advance_status = 'Advance' 
+            AND status IN ('paid', 'partially_paid')
+          ORDER BY for_the_month DESC
+          LIMIT 1
+        `;
+
+        connection.query(
+          getAdvanceQuery,
+          [student_id, from_month, campus_id, session_id],
+          (err, results) => {
+            if (err) {
+              console.error("Error fetching advance payments:", err);
+              return res
+                .status(500)
+                .json({ error: "Error fetching advance payments" });
+            }
+
+            let advancePayments = 0;
+            if (results.length > 0 && results[0].advance_payments) {
+              advancePayments = results[0].advance_payments;
+            }
+
+            let updateQuery;
+            let updateValues;
+
+              updateQuery = `
+              UPDATE fee_vouchers
+              SET
+                student_id = ?,
+                student_unique_id = ?,
+                category_id = ?,
+                for_the_month = ?,
+                fee_head = ?,
+                total_amount_data = ?,
+                due_date = ?,
+                actual_due_date = ?,
+                after_due_date_amount = ?,
+                arrears_not_cleared = ?,
+                arrears = ?,
+                first_arrear = ?,
+                remarks = ?,
+                advance_payments = ?,
+                advance_status = 'Advance',
+                first_advance_payment = ?,
+                fine = ?,
+                shift = ?
+              WHERE id = ?
+            `;
+
+              updateValues = [
+                student_id,
+                student_unique_id,
+                get_category,
+                from_month,
+                fee_head_detail_get,
+                grandSum + bus_fee,
+                due_date,
+                //actual_due_date
+                due_date,
+                after_due_date_amount_get + bus_fee,
+                JSON.stringify(arrears_id),
+                arrears,
+                check_monthwise_arrears_exist.length <= 0 && arrears > 0
+                  ? "yes"
+                  : "",
+                remarks,
+                !isNaN(parseInt(advancePayments)) && !isNaN(parseInt(first_advance_payment)) ?  (parseInt(advancePayments) -  (advancePayments !== 0 ? parseInt(hidden_advance_payment) : 0))  + parseInt(first_advance_payment)  : 0,
+                first_advance_payment == '' ? 0 : first_advance_payment,
+                fine == '' ? 0 : fine,
+                shift,
+                hidden_id,
+              ];
+           
+
+            connection.query(updateQuery, updateValues, (err, result) => {
+              if (err) {
+                console.error("Error updating data:", err);
+                return res.status(500).json({ error: "Error updating data" });
+              } else {
+                logAction('UPDATE', 'fee_vouchers' ,'Updated Fee Voucher', hidden_id, user_id, campus_id, session_id);
+                return res.json({ message: "Data updated successfully!" });
+              }
+            });
+          }
+        );
+      });
+    } else {
+      
+      let sqlParamsInvoiceNo = [campus_id];
+
+      const lastInvoiceResult = await queryAsync(getLastInvoiceNoQuery, sqlParamsInvoiceNo);
+      let invoiceNo =
+        lastInvoiceResult.length > 0
+          ? parseInt(lastInvoiceResult[0].invoice_no) + 1
+          : 1000;
+
+      
+      // Fetch student details
+      const studentQuery = `
+        SELECT s.id, s.category_id, s.student_unique_id, s.bus_fee, s.bus_status, s.class_id, s.section_id, s.shift, s.campus_id, s.session_id, s.old_arrear_ids, s.old_arrears_amount, s.old_arrears_fine, s.arrears_generated
+        FROM students s
+        WHERE s.id = ?
+      `;
+      const studentResult = await queryAsync(studentQuery, [student_id]);
+      if (studentResult.length === 0) {
+        return res.status(404).json({ error: "Student not found" });
+      }
+      const studentData = studentResult[0];
+
+      // Merge student data with provided fee data
+      const mergedData = mergeDataAndCalculateTotalsForSingleFee([studentData], data1);
+
+      // Fetch advance data
+      const advanceMap = await fetchAdvanceData(
+        from_month,
+        campus_id,
+        session_id
+      );
+
+      // Fetch arrears data
+      const arrearsMap = arrear_checked
+        ? {}
+        : await fetchArrearsData(mergedData, from_month, campus_id, session_id);
+
+
+      // Fetch bank details and process voucher
+      await fetchBankDetailsAndProcessSingleVoucher(
+        mergedData,
+        months,
+        arrearsMap,
+        advanceMap,
+        invoiceNo,
+        from_month,
+        to_month,
+        due_date,
+        remarks,
+        fine,
+        advance,
+        user_id,
+        campus_id,
+        session_id,
+        bus_fee_status,
+        // busFeeMap,
+        res,
+        arrear_checked
+      );
+    }
+  } catch (err) {
+    console.error("Error processing fee voucher:", err);
+    res.status(500).json({ error: "Error processing fee voucher" });
+  }
+});
+
+async function fetchBankDetailsAndProcessSingleVoucher(
+  mergedResults,
+  months,
+  arrearsMap,
+  advanceMap,
+  invoiceNo,
+  from_month,
+  to_month,
+  due_date,
+  remarks,
+  fine,
+  advance,
+  user_id,
+  campus_id,
+  session_id,
+  bus_fee_status,
+  // busFeeMap,
+  res,
+  arrear_checked = false
+) {
+  const getBankDetailsQuery = `
+    SELECT id AS bank_id
+    FROM bank_details
+    WHERE campus_id = ? AND status = 'On'
+  `;
+
+  try {
+    const bankDetailsResults = await queryAsync(getBankDetailsQuery, [
+      campus_id,
+    ]);
+    const bankDetails = bankDetailsResults.map((row) => row.bank_id);
+
+    await processAndInsertSingleVoucher(
+      mergedResults,
+      months,
+      arrearsMap,
+      advanceMap,
+      invoiceNo,
+      from_month,
+      to_month,
+      due_date,
+      remarks,
+      fine,
+      advance,
+      user_id,
+      campus_id,
+      session_id,
+      bus_fee_status,
+      // busFeeMap,
+      res,
+      arrear_checked,
+      bankDetails
+    );
+  } catch (err) {
+    console.error("Error fetching bank details:", err);
+    res.status(500).json({ error: "Error fetching bank details" });
+  }
+}
+
+
+// async function fetchBusFee(student_id, campus_id, session_id) {
+//   const getBusFeeQuery = `
+//     SELECT bus_fee
+//     FROM students
+//     WHERE id = ?
+//     AND campus_id = ?
+//     AND session_id = ?
+//     AND bus_status = "On"
+//   `;
+
+//   try {
+//     const busFeeResults = await queryAsync(getBusFeeQuery, [
+//       student_id,
+//       campus_id,
+//       session_id,
+//     ]);
+//     if (busFeeResults.length === 0) {
+//       return 0;
+//     }
+
+//     return busFeeResults[0].bus_fee;
+//   } catch (err) {
+//     console.error("Error fetching bus fee:", err);
+//     throw err;
+//   }
+// }
+
+
+
+async function processAndInsertSingleVoucher(
+  mergedResults,
+  months,
+  arrearsMap,
+  advanceMap,
+  invoiceNo,
+  from_month,
+  to_month,
+  due_date,
+  remarks,
+  fine,
+  advance,
+  user_id,
+  campus_id,
+  session_id,
+  bus_fee_status,
+  // busFeeMap,
+  res,
+  arrear_checked = false,
+  bankDetails
+) {
+  const checkExistingEntriesQuery = `
+    SELECT student_id, for_the_month
+    FROM fee_vouchers
+    WHERE student_id = ? AND for_the_month BETWEEN ? AND ?
+  `;
+
+  try {
+    const existingEntries = await queryAsync(checkExistingEntriesQuery, [
+      mergedResults[0].id,
+      from_month,
+      to_month,
+    ]);
+
+
+    const fetchAttendanceDataSingleVoucher = await fetchAttendanceSingleVoucher(campus_id, session_id, from_month, mergedResults[0].id);
+
+   
+
+    const existingEntriesSet = new Set(
+      existingEntries.map(
+        (entry) => `${entry.student_id}-${entry.for_the_month}`
+      )
+    );
+
+    const finalResults = mergedResults.flatMap((result) => {
+      return months
+        .map((month) => {
+          const key = `${result.id}-${month}`;
+          const arrearsInfo = arrearsMap[result.id];
+          const advanceInfo = advanceMap[result.id];
+          // let bus_fee = busFeeMap || 0; // Using bus fee from the separate query
+
+          // console.log(fetchAttendanceDataSingleVoucher, "test attendance", fetchAttendanceDataSingleVoucher[result.id]);
+
+          let total_attendance_absents = fetchAttendanceDataSingleVoucher[result.id] || 0 ;
+
+          let calculate_attendance_amount = total_attendance_absents * 100;
+
+          let bus_fee = bus_fee_status ? (result.bus_status === "On" ? result.bus_fee || 0 : 0) : 0;
+
+          let total_amount_data = result.total_amount_data + bus_fee; // Adding bus fee to total amount
+          let status = "unpaid";
+
+          if (!existingEntriesSet.has(key)) {
+            let arrears_not_cleared = arrear_checked
+              ? []
+              : arrearsInfo
+              ? [...arrearsInfo.arrears_not_cleared]
+              : [];
+
+            if (
+              advanceInfo &&
+              advanceInfo.advance_payments >=
+                total_amount_data +
+                  (arrearsInfo && arrearsInfo.total_arrears
+                    ? arrearsInfo.total_arrears
+                    : 0)
+            ) {
+              status = "paid";
+            }
+
+            if (
+              advanceInfo &&
+              advanceInfo.advance_payments > 0 &&
+              advanceInfo.advance_payments <
+                total_amount_data +
+                  (arrearsInfo && arrearsInfo.total_arrears
+                    ? arrearsInfo.total_arrears
+                    : 0)
+            ) {
+              status = "unpaid";
+            }
+
+            if (month === from_month && arrearsInfo) {
+              if (
+                (arrearsInfo.last_status === "unpaid" ||
+                  arrearsInfo.last_status === "partially_paid") &&
+                arrearsInfo.total_arrears > 0
+              ) {
+                arrears_not_cleared.push(arrearsInfo.voucher_id.toString());
+                return {
+                  old_arrears_id:result.old_arrears_id,
+                  old_arrears_amount:result.old_arrears_amount,
+                  old_arrears_fine:result.old_arrears_fine,
+                  arrears_generated:result.arrears_generated,
+                  student_id: result.id,
+                  class_id: result.class_id,
+                  section_id: result.section_id,
+                  category_id: result.category_id,
+                  campus_id: result.campus_id,
+                  session_id: result.session_id,
+                  fee_head: JSON.stringify(result.data),
+                  total_amount_data:
+                    advanceInfo &&
+                    advanceInfo.advance_payments > 0 &&
+                    advanceInfo.advance_payments <
+                      total_amount_data +
+                        (arrearsInfo && arrearsInfo.total_arrears
+                          ? arrearsInfo.total_arrears
+                          : 0) 
+                      ? total_amount_data - (advanceInfo.advance_payments || 0)
+                      : total_amount_data,
+                  after_due_date_amount:
+                    advanceInfo &&
+                    advanceInfo.advance_payments > 0 &&
+                    advanceInfo.advance_payments <
+                      total_amount_data +
+                        (arrearsInfo && arrearsInfo.total_arrears
+                          ? arrearsInfo.total_arrears
+                          : 0)
+                      ? total_amount_data -
+                        (advanceInfo.advance_payments || 0) +
+                        parseInt(fine)
+                      : total_amount_data + parseInt(fine),
+                  for_the_month: month,
+                  due_date,
+                  shift:result.shift,
+                  actual_due_date: due_date,
+                  remarks,
+                  invoice_no: invoiceNo++,
+                  first_arrear: (result.arrears_generated === "not generated" ? "yes" : null),
+                  arrears:  result.arrears_generated === "not generated" ? (result.old_arrears_amount || 0) : advanceInfo && advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo && arrearsInfo.total_arrears
+                          ? arrearsInfo.total_arrears
+                          : 0)
+                      ? 0
+                      : arrearsInfo
+                      ? arrearsInfo.total_arrears
+                      : 0,
+                      arrears_fine: result.arrears_generated === "not generated" ? result.old_arrears_fine :
+                      advanceInfo &&
+                      advanceInfo.advance_payments >=
+                        total_amount_data + (arrearsInfo && arrearsInfo.total_arrears ? arrearsInfo.total_arrears : 0)
+                        ? 0
+                        : arrearsInfo
+                        ? arrearsInfo.total_fine
+                        : 0,
+                  status,
+                  arrears_not_cleared:  result.arrears_generated === "not generated"
+                  ? (result.old_arrear_ids || []) :
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? "[]"
+                      : JSON.stringify(arrears_not_cleared),
+                  bank_details: JSON.stringify(bankDetails),
+                  advance_payments:
+                  advanceInfo &&
+                  advanceInfo.advance_payments >=
+                    total_amount_data +
+                      (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                    ? advanceInfo.advance_payments -
+                      (total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0))
+                    : advance,
+                advance_status:
+                  advanceInfo &&
+                  advanceInfo.advance_payments >=
+                    total_amount_data +
+                      (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                    ? "Advance"
+                    : advanceInfo &&
+                      advanceInfo.advance_payments > 0 &&
+                      advanceInfo.advance_payments <
+                        total_amount_data +
+                          (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                    ? "Advance"
+                    : advance > 0 ? "Advance" : "Exhaust",
+                  payment_date:
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                        ? due_date
+                      // ? new Date().toISOString().split("T")[0]
+                      : null,
+                  recieved_payment:
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      : 0,
+                  scroll_no:
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? advanceInfo.scroll_no
+                      : null,
+                  payment_received_through_bank:
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? advanceInfo.payment_received_through_bank
+                      : null,
+                  bus_fee: bus_fee, // Adding bus fee here
+                  attendance_amount: calculate_attendance_amount,
+                  arrears_gap: arrearsInfo ? arrearsInfo.arrear_gap : 0, // New field
+                  // arrear_gap_from_payable: arrearsInfo ? arrearsInfo.arrear_gap - total_amount_data : 0 ,
+                  voucher_created_form: "Single",
+                  fine,
+                  advance,
+                  user_id,
+                  student_unique_id: result.student_unique_id
+                };
+              } else {
+                // total_amount_data += arrearsInfo.total_arrears;
+              }
+            }
+
+          //  console.log(arrearsInfo.total_arrears);
+
+            return {
+              old_arrears_id:result.old_arrears_id,
+              old_arrears_amount:result.old_arrears_amount,
+              old_arrears_fine:result.old_arrears_fine,
+              arrears_generated:result.arrears_generated,
+              student_id: result.id,
+              class_id: result.class_id,
+              section_id: result.section_id,
+              category_id: result.category_id,
+              campus_id: result.campus_id,
+              session_id: result.session_id,
+              fee_head: JSON.stringify(result.data),
+              total_amount_data:
+                advanceInfo &&
+                advanceInfo.advance_payments > 0 &&
+                advanceInfo.advance_payments <
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? total_amount_data - (advanceInfo.advance_payments || 0)
+                  : total_amount_data,
+              after_due_date_amount:
+                advanceInfo &&
+                advanceInfo.advance_payments > 0 &&
+                advanceInfo.advance_payments <
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? total_amount_data -
+                    (advanceInfo.advance_payments || 0) +
+                    parseInt(fine)
+                  : total_amount_data + parseInt(fine),
+              for_the_month: month,
+              due_date,
+              shift:result.shift,
+              actual_due_date: due_date,
+              remarks,
+              invoice_no: invoiceNo++,
+              first_arrear: (result.arrears_generated === "not generated" ? "yes" : null),
+              arrears:  result.arrears_generated === "not generated" ? 
+                  (result.old_arrears_amount || 0) : advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo && arrearsInfo.total_arrears
+                          ? arrearsInfo.total_arrears
+                          : 0)
+                      ? 0
+                      : arrearsInfo
+                      ? arrearsInfo.total_arrears
+                      : 0,
+                      arrears_fine: result.arrears_generated === "not generated" ? result.old_arrears_fine :
+                      advanceInfo &&
+                      advanceInfo.advance_payments >=
+                        total_amount_data + (arrearsInfo && arrearsInfo.total_arrears ? arrearsInfo.total_arrears : 0)
+                        ? 0
+                        : arrearsInfo
+                        ? arrearsInfo.total_fine
+                        : 0,
+                  status,
+                  arrears_not_cleared:  result.arrears_generated === "not generated"
+                  ? (result.old_arrear_ids || []) :
+                    advanceInfo &&
+                    advanceInfo.advance_payments >=
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                      ? "[]"
+                      : JSON.stringify(arrears_not_cleared),
+              bank_details: JSON.stringify(bankDetails),
+              advance_payments:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? advanceInfo.advance_payments -
+                    (total_amount_data +
+                      (arrearsInfo ? arrearsInfo.total_arrears : 0))
+                  : advance,
+              advance_status:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? "Advance"
+                  : advanceInfo &&
+                    advanceInfo.advance_payments > 0 &&
+                    advanceInfo.advance_payments <
+                      total_amount_data +
+                        (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? "Advance"
+                  : advance > 0 ? "Advance" : "Exhaust",
+              payment_date:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                    ? due_date
+                  // ? new Date().toISOString().split("T")[0]
+                  : null,
+              recieved_payment:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data + (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? total_amount_data + (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  : 0,
+              scroll_no:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? advanceInfo.scroll_no
+                  : null,
+              payment_received_through_bank:
+                advanceInfo &&
+                advanceInfo.advance_payments >=
+                  total_amount_data +
+                    (arrearsInfo ? arrearsInfo.total_arrears : 0)
+                  ? advanceInfo.payment_received_through_bank
+                  : null,
+              bus_fee: bus_fee, // Adding bus fee here
+              attendance_amount: calculate_attendance_amount,
+              arrears_gap: arrearsInfo ? arrearsInfo.arrear_gap : 0, // New field
+              // arrear_gap_from_payable: arrearsInfo ? arrearsInfo.arrear_gap - total_amount_data : 0 ,
+              voucher_created_form: "Single",
+              fine,
+              advance,
+              user_id,
+              student_unique_id: result.student_unique_id
+            };
+          } else {
+            return null;
+          }
+        })
+        .filter((entry) => entry !== null);
+    });
+
+    // Extracting voucher_ids that are stored in arrears_not_cleared
+    const voucherIdsToUpdate = finalResults.reduce((acc, result) => {
+      const arrearsIds = JSON.parse(result.arrears_not_cleared || "[]");
+      return acc.concat(arrearsIds);
+    }, []);
+
+    if (voucherIdsToUpdate.length > 0) {
+      const updateArrearsQuery = `
+        UPDATE fee_vouchers
+        SET is_arrear = 'arrears'
+        WHERE id IN (?)
+      `;
+      await queryAsync(updateArrearsQuery, [voucherIdsToUpdate]);
+    }
+
+    if (finalResults.length === 0) {
+      return res.status(200).json({
+        message: "No new fee vouchers to insert",
+        arrear_not_cleared: finalResults.map(
+          (result) => result.arrears_not_cleared
+        ),
+      });
+    }
+
+    const insertQuery = `
+      INSERT INTO fee_vouchers
+      (student_id, class_id, section_id, category_id, campus_id, session_id, fee_head, total_amount_data, after_due_date_amount, for_the_month, due_date, shift, actual_due_date, remarks, invoice_no, first_arrear, arrears, status, arrears_fine, arrears_not_cleared, bank_details, advance_payments, advance_status, payment_date, recieved_payment, scroll_no, payment_received_through_bank, bus_fee, attendance_amount, arrears_gap, voucher_created_form, fine,
+                first_advance_payment, user_id, student_unique_id)
+      VALUES ?
+    `;
+
+    const values = finalResults.map((result) => [
+      result.student_id,
+      result.class_id,
+      result.section_id,
+      result.category_id,
+      result.campus_id,
+      result.session_id,
+      result.fee_head,
+      result.total_amount_data,
+      result.after_due_date_amount,
+      result.for_the_month,
+      result.due_date,
+      result.shift,
+      result.actual_due_date,
+      result.remarks,
+      result.invoice_no,
+      result.first_arrear,
+      result.arrears,
+      result.status,
+      result.arrears_fine,
+      result.arrears_not_cleared,
+      result.bank_details,
+      result.advance_payments,
+      result.advance_status,
+      result.payment_date,
+      result.recieved_payment,
+      result.scroll_no,
+      result.payment_received_through_bank,
+      result.bus_fee,
+      result.attendance_amount,
+      result.arrears_gap, // New field
+      // result.arrear_gap_from_payable,
+      result.voucher_created_form,
+      result.fine,
+      result.advance,
+      result.user_id,
+      result.student_unique_id
+    ]);
+
+    const insertResult = await queryAsync(insertQuery, [values]);
+
+    // Check and update student status for arrears > 3 months
+    // const studentsToUpdate = finalResults
+    //   .filter((result) => {
+    //     const arrearsDuration = JSON.parse(result.arrears_not_cleared).length;
+    //     return arrearsDuration > 1;
+    //   })
+    //   .map((result) => result.student_id);
+
+    // if (studentsToUpdate.length > 0) {
+    //   const updateStudentStatusQuery = `
+    //     UPDATE students
+    //     SET status_for_pendings = 'Off'
+    //     WHERE id IN (?)
+    //   `;
+    //   await queryAsync(updateStudentStatusQuery, [studentsToUpdate]);
+    // }
+
+    const studentsToUpdate = finalResults
+    .filter((result) => result.arrears_generated === "not generated") // Filter students whose arrears_generated is "not generated"
+    .map((result) => result.student_id); 
+
+    if (studentsToUpdate.length > 0) {
+      const updateStudentStatusQuery = `
+        UPDATE students
+        SET arrears_generated = 'generated'
+        WHERE id IN (?)
+      `;
+      await queryAsync(updateStudentStatusQuery, [studentsToUpdate]);
+    }
+
+
+    // console.log("hitted");
+    logAction('CREATE', 'fee_vouchers' ,'Created Single Fee Voucher', 0, user_id, campus_id, session_id);
+
+    res.status(200).json({
+      message: "Fee voucher inserted successfully",
+      insertResult,
+      arrear_not_cleared: finalResults.map(
+        (result) => result.arrears_not_cleared
+      ),
+    });
+  } catch (err) {
+    console.error("Error processing fee voucher:", err);
+    res.status(500).json({ error: "Error processing fee voucher" });
+  }
+}
+
+
+
+app.post("/fetch-data-arrears-id", (req, res) => {
+  const { arear_not_cleared_id } = req.body; // Assuming the request body contains the array of IDs
+  const ids = arear_not_cleared_id;
+  // console.log("check arrear" + ids);
+
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return res.status(400).json({ error: "Invalid or empty IDs array" });
+  }
+
+  // Generate SQL query to fetch dates for the given IDs
+  // const sql = `
+  //   SELECT id, for_the_month, after_due_date_amount  
+  //   FROM fee_vouchers 
+  //   WHERE id IN (${ids.map((id) => connection.escape(id)).join(", ")})
+  // `;
+
+    const sql = `
+    SELECT 
+      id, 
+      for_the_month, 
+      after_due_date_amount + 
+      CASE 
+        WHEN first_arrear = 'yes' THEN arrears 
+        ELSE 0 
+      END AS total_amount
+    FROM fee_vouchers 
+    WHERE id IN (${ids.map((id) => connection.escape(id)).join(", ")})
+  `;
+
+
+  connection.query(sql, (err, results) => {
+    if (err) {
+      console.error("Error fetching dates:", err);
+      return res.status(500).json({ error: "Error fetching dates" });
+    }
+
+    res.status(200).json({ results });
+  });
+});
+
+
+
+app.get("/delete-admission/:admission_id/:user_id/:campus_id/:session_id/:full_name/:class_name/:section_name/:father_name", (req, res) => {
+  const admission_id = parseInt(req.params.admission_id);
+   const user_id = parseInt(req.params.user_id);
+ const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+  const full_name = req.params.full_name;
+  const class_name = req.params.class_name;
+  const section_name = req.params.section_name;
+  const father_name = req.params.father_name;
+
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting admission" });
+      return;
+      d;
+    }
+
+    sql = 'UPDATE students SET status_on_off = "Off" WHERE id = ?';
+    const values = [admission_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting admission:", error);
+        res.status(500).json({ error: "Error deleting admission" });
+      } else {
+        console.log("Admission deleted successfully");
+        res.status(200).json({ message: "Admission deleted successfully" });
+
+        let descriptions = {
+        full_name:full_name,
+        class:class_name,
+        section:section_name,
+        father:father_name
+        }  
+
+         logAction('DELETE', 'students', 'Delete Student', admission_id, user_id, campus_id, session_id);
+      }
+    });
+  });
+
+});
+
+
+
+// app.delete("/delete-admission/:admission_id", (req, res) => {
+//   const admission_id = parseInt(req.params.admission_id);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error deleting admission" });
+//       return;
+//       d;
+//     }
+
+//     sql = 'UPDATE assing_subjects_class SET status_on_off = "Off" WHERE id = ?';
+//     const values = [admission_id];
+
+//     connection.query(sql, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error("Error deleting admission:", error);
+//         res.status(500).json({ error: "Error deleting admission" });
+//       } else {
+//         console.log("Admission deleted successfully");
+//         res.status(200).json({ message: "Admission deleted successfully" });
+//       }
+//     });
+//   });
+// });
+
+
+app.delete("/delete-subject/:assign_subject_id", (req, res) => {
+  const assign_subject_id = parseInt(req.params.assign_subject_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    sql = 'UPDATE assing_subjects_class SET status_on_off = "Off" WHERE id = ?';
+    const values = [assign_subject_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting:", error);
+        res.status(500).json({ error: "Error deleting" });
+      } else {
+        console.log("Deleted successfully");
+        res.status(200).json({ message: "Deleted successfully" });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.delete("/delete-subject-teacher/:assign_subject_id", (req, res) => {
+  const assign_subject_id = parseInt(req.params.assign_subject_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    sql = 'DELETE FROM assing_subjects_class_teacher WHERE id = ?';
+    const values = [assign_subject_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting:", error);
+        res.status(500).json({ error: "Error deleting" });
+      } else {
+        console.log("Deleted successfully");
+        res.status(200).json({ message: "Deleted successfully" });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.delete("/delete-homework/:id/:session_id/:campus_id", (req, res) => {
+  const id = parseInt(req.params.id);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    sql = 'DELETE FROM homework WHERE id = ? AND campus_id = ? AND session_id = ?';
+    const values = [id, campus_id, session_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting:", error);
+        res.status(500).json({ error: "Error deleting" });
+      } else {
+        console.log("Deleted successfully");
+        res.status(200).json({ message: "Deleted successfully" });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+app.delete("/delete-house-or-club/:id/:campus_id/:user_id/:session_id", (req, res) => {
+  const id = parseInt(req.params.id);
+  const campus_id = parseInt(req.params.campus_id);
+  const user_id = parseInt(req.params.user_id);
+  const session_id = parseInt(req.params.session_id);
+
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    sql = 'DELETE FROM house_or_club WHERE id = ? AND campus_id = ?';
+    const values = [id, campus_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting:", error);
+        res.status(500).json({ error: "Error deleting" });
+      } else {
+        console.log("Deleted successfully");
+         logAction('DELETE', 'house_or_club' ,'Delete HOUSE AND CLUB', id, user_id, campus_id, session_id);
+        res.status(200).json({ message: "Deleted successfully" });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.get("/delete-timetable/:id/:campus_id/:session_id", (req, res) => {
+  const id = parseInt(req.params.id);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+
+
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    const sql = 'DELETE FROM school_time_table WHERE id = ? AND campus_id = ? AND session_id = ?';
+    const values = [id, campus_id, session_id];
+    
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting:", error);
+        res.status(500).json({ error: "Error deleting" });
+      } else {
+        console.log("Deleted successfully");
+        res.status(200).json({ message: "Deleted successfully" });
+      }
+    });
+  });
+});
+
+
+app.delete("/delete-employee/:employee_id", (req, res) => {
+  const employee_id = parseInt(req.params.employee_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting employee" });
+      return;
+      d;
+    }
+
+    sql = 'UPDATE school_employees SET soft_delete = "Off" WHERE id = ?';
+    const values = [employee_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting employee:", error);
+        res.status(500).json({ error: "Error deleting employee" });
+      } else {
+        console.log("Admission deleted successfully");
+        res.status(200).json({ message: "Admission deleted successfully" });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.delete("/delete-finance-voucher/:invoice_no/:campus_id/:session_id", (req, res) => {
+  const voucher_invoice_no = parseInt(req.params.invoice_no);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+      d;
+    }
+
+    sql = 'Delete FROM create_voucher_finanace WHERE voucher_invoice_no = ? AND campus_id = ? AND session_id = ?';
+    const values = [voucher_invoice_no, campus_id, session_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting:", error);
+        res.status(500).json({ error: "Error deleting" });
+      } else {
+        console.log("Deleted successfully");
+        res.status(200).json({ message: "Deleted successfully" });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+
+app.get("/get-admission/:admission_id", (req, res) => {
+  const admission_id = parseInt(req.params.admission_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting admission" });
+      return;
+      d;
+    }
+
+    const sql = "SELECT students.*, classes.class as class_name, sections.section_name FROM students INNER JOIN classes ON students.class_id = classes.id INNER JOIN sections ON students.section_id = sections.id  WHERE students.id = ?";
+    const values = [admission_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting admission:", error);
+        res.status(500).json(error);
+      } else {
+        console.log("Admission deleted successfully");
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+// app.get('/get-employee/:employee_id', (req, res) => {
+//   const employee_id = parseInt(req.params.employee_id);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error deleting employee' });
+//       return;
+//       d
+//     }
+
+//     const sql = 'SELECT * FROM school_employees WHERE id = ?';
+//     const values = [employee_id];
+
+//     connection.query(sql, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+
+//         console.error('Error deleting employee:', error);
+//         res.status(500).json(error);
+
+//       } else {
+
+//         console.log('Employee fetch successfully');
+//         res.json({
+//           results
+//         });
+
+//       }
+//     });
+//   });
+// });
+
+app.get("/get-employee/:employee_id", (req, res) => {
+  const employee_id = parseInt(req.params.employee_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching employee data" });
+      return;
+    }
+
+    // Query to fetch employee data from school_employees table
+    const employeeSql = "SELECT * FROM school_employees WHERE id = ?";
+    const employeeValues = [employee_id];
+
+    connection.query(
+      employeeSql,
+      employeeValues,
+      (employeeError, employeeResults) => {
+        if (employeeError) {
+          console.error("Error fetching employee data:", employeeError);
+          connection.release();
+          res.status(500).json({ error: "Error fetching employee data" });
+          return;
+        }
+
+        // Query to fetch the last row from the service_Book table for this employee
+        const serviceBookSql =
+          "SELECT * FROM service_book WHERE employee_id = ? ORDER BY increment_date DESC LIMIT 1";
+        const serviceBookValues = [employee_id];
+
+        connection.query(
+          serviceBookSql,
+          serviceBookValues,
+          (serviceBookError, serviceBookResults) => {
+            connection.release(); // Release the connection after both queries are done
+
+            if (serviceBookError) {
+              console.error(
+                "Error fetching service book data:",
+                serviceBookError
+              );
+              res
+                .status(500)
+                .json({ error: "Error fetching service book data" });
+            } else {
+              res.json({
+                employee: employeeResults,
+                serviceBook:
+                  serviceBookResults.length > 0 ? serviceBookResults[0] : null,
+              });
+            }
+          }
+        );
+      }
+    );
+  });
+});
+
+app.get("/fetch-school-employees", (req, res) => {
+  const campus_id = parseInt(req.query.campus_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error getting students" });
+      return;
+    }
+
+    const sql = `
+   SELECT 
+            school_employees.id, school_employees.full_name,
+            employee_roles.employee_role,
+            employee_posts.employee_post,
+            pay_scale.pay_scale,
+            pay_scale.job_type
+        FROM 
+            school_employees
+         JOIN 
+            employee_roles ON school_employees.employee_role_id = employee_roles.id 
+         JOIN 
+            employee_posts ON school_employees.employee_post_id = employee_posts.id
+         JOIN 
+            pay_scale ON school_employees.pay_scale_id = pay_scale.id
+         WHERE 
+          school_employees.soft_delete = 'On' AND school_employees.campus_id = ?`;
+
+    const values = [campus_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error getting data:", error);
+        res.status(500).json({ error: "Error getting data" });
+      } else {
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+// app.get('/fetch-overtime', (req, res) => {
+
+//   const campus_id = parseInt(req.query.campus_id);
+//   const session_id = parseInt(req.query.session_id);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error getting students' });
+//       return;
+//     }
+
+//     const sql = `
+//    SELECT
+//            overtime.*,
+//            school_employees.full_name
+//     FROM
+//            overtime
+//     JOIN
+//            school_employees ON school_employees.id = overtime.employee_id
+//            WHERE
+//            overtime.campus_id = ? AND  overtime.session_id = ?`;
+
+//     const values = [campus_id, session_id];
+
+//     connection.query(sql, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error getting data:', error);
+//         res.status(500).json({ error: 'Error getting data' });
+//       } else {
+//         res.status(200).json({ results });
+//       }
+//     });
+//   });
+// });
+
+app.get("/fetch-overtime", (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search || "";
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to database:", err);
+      res.status(500).json({ error: "Database connection error" });
+      return;
+    }
+
+    // SQL query for fetching overtime data with pagination and filtering
+    let sql = `
+      SELECT 
+        overtime.*, 
+        school_employees.full_name 
+      FROM 
+        overtime
+      JOIN 
+        school_employees ON school_employees.id = overtime.employee_id
+      WHERE overtime.campus_id = ? AND overtime.session_id = ? 
+    `;
+
+    const params = [campus_id, session_id];
+
+    // If search_data is provided, include it in the WHERE clause
+    if (search_data) {
+      sql += ` AND school_employees.full_name LIKE ?`;
+      params.push(`%${search_data}%`);
+    }
+
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    // Execute the query
+    connection.query(sql, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+        return;
+      }
+
+      // Query to get the total count of items for pagination
+      let countSql = `
+        SELECT COUNT(*) AS total 
+        FROM overtime 
+        JOIN school_employees ON school_employees.id = overtime.employee_id 
+        WHERE overtime.campus_id = ? AND overtime.session_id = ? 
+      `;
+
+      const countParams = [campus_id, session_id];
+
+      if (search_data) {
+        countSql += ` AND school_employees.full_name LIKE ?`;
+        countParams.push(`%${search_data}%`);
+      }
+
+      // Execute the count query
+      connection.query(countSql, countParams, (countError, countResult) => {
+        connection.release(); // Release the connection
+
+        if (countError) {
+          console.error("Error executing count SQL query:", countError);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        const total = countResult[0].total;
+        const totalPages = Math.ceil(total / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          total,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      });
+    });
+  });
+});
+
+
+
+
+app.get("/get-classes/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+  console.log(campus_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching classes" });
+      return;
+    }
+
+    const sql = `
+    SELECT 
+        classes.id, classes.class, classes.section_id, sections.section_name, parent_classes.id as parent_id
+    FROM 
+        classes
+    JOIN 
+        sections ON classes.section_id = sections.id
+    JOIN 
+        parent_classes ON classes.parent_class_id = parent_classes.id
+    WHERE 
+      classes.status = 'On' AND classes.campus_id = ? ORDER BY COALESCE(parent_classes.id, 0), classes.id;
+    `;
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching campuses" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+app.get("/get-houses-and-club/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+  // console.log(campus_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching classes" });
+      return;
+    }
+
+    const sql = `
+    SELECT 
+       *
+    FROM 
+        house_or_club
+    WHERE 
+      house_or_club.status = 'On' AND house_or_club.campus_id = ? ORDER BY house_or_club.id ASC;
+    `;
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching campuses" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+app.get("/get-basic-salary-scale-wise", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search = req.query.search || ""; // Get the search query from the request
+
+  try {
+    // Base SQL query
+    let sql = `
+      SELECT 
+        pay_scale_wise_basic_salary.*,
+        pay_scale.job_type, 
+        pay_scale.pay_scale
+      FROM 
+        pay_scale_wise_basic_salary
+      JOIN 
+        pay_scale ON pay_scale_wise_basic_salary.pay_scale_id = pay_scale.id
+    `;
+
+    let countSql = `
+      SELECT 
+        COUNT(*) AS total 
+      FROM 
+        pay_scale_wise_basic_salary
+      JOIN 
+        pay_scale ON pay_scale_wise_basic_salary.pay_scale_id = pay_scale.id
+    `;
+
+    const params = [];
+    const countParams = [];
+
+    // Add search conditionally
+    if (search) {
+      sql += `
+        WHERE 
+          pay_scale.job_type LIKE ? OR 
+          pay_scale.pay_scale LIKE ?
+      `;
+      countSql += `
+        WHERE 
+          pay_scale.job_type LIKE ? OR 
+          pay_scale.pay_scale LIKE ?
+      `;
+      const searchParam = `%${search}%`;
+      params.push(searchParam, searchParam);
+      countParams.push(searchParam, searchParam);
+    }
+
+    // Add ordering and pagination
+    sql += `
+      ORDER BY 
+        pay_scale.pay_scale ASC
+      LIMIT ? OFFSET ?;
+    `;
+    params.push(limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, params, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(countSql, countParams, (err, results) => {
+          if (err) reject(err);
+          else resolve(results);
+        });
+      }),
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching basic salary:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+app.get("/get-teachers/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+
+  console.log("hitted");
+  // Validate campus_id is a number
+  if (isNaN(campus_id)) {
+    return res.status(400).json({ error: "Invalid campus ID" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Connection error:", err);
+      return res.status(500).json({ error: "Database connection error" });
+    }
+
+    const sql = `SELECT 
+        school_employees.id,
+        school_employees.full_name,
+        employee_posts.employee_post,
+        pay_scale.pay_scale,
+        pay_scale.job_type,
+        campuses.campus_name
+      FROM 
+        school_employees
+      JOIN 
+        employee_roles ON school_employees.employee_role_id = employee_roles.id 
+      JOIN 
+        employee_posts ON school_employees.employee_post_id = employee_posts.id
+      JOIN 
+        pay_scale ON school_employees.pay_scale_id = pay_scale.id
+      JOIN  
+        campuses ON school_employees.campus_id = campuses.id 
+      WHERE  
+        employee_roles.employee_role = 'Teacher' 
+        AND school_employees.campus_id = ?`;
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Always release connection
+
+      if (error) {
+        console.error("Query error:", error);
+        return res.status(500).json({ error: "Database query error" });
+      }
+
+      console.log(`Fetched ${results.length} teachers`);
+      
+      // Return results directly (not wrapped in another object)
+      res.status(200).json(results);
+    });
+  });
+});
+
+
+app.get(
+  "/edit-fee-voucher/:voucher_id/:campus_id/:session_id",
+  async (req, res) => {
+    const voucher_id = req.params.voucher_id;
+    const campus_id = req.params.campus_id;
+    const session_id = req.params.session_id;
+
+    const voucherSql = `
+      SELECT 
+          fee_vouchers.*, 
+          students.full_name, 
+          students.shift as student_shift,
+          students.class_id, 
+          students.section_id,
+          school_categories.category 
+      FROM 
+          fee_vouchers 
+      JOIN 
+          students 
+      ON 
+          fee_vouchers.student_id = students.id 
+      JOIN 
+          school_categories 
+      ON 
+          students.category_id = school_categories.id 
+      WHERE 
+          fee_vouchers.id = ? 
+      AND 
+          fee_vouchers.campus_id = ? 
+      AND 
+          fee_vouchers.session_id = ?
+  `;
+
+    const headsSql = `
+      SELECT 
+          heads.* 
+      FROM 
+          heads 
+      WHERE 
+          heads.campus_id = ? 
+  `;
+
+    try {
+      const [voucherResults, headsResults] = await Promise.all([
+        connection.query(voucherSql, [voucher_id, campus_id, session_id]),
+        connection.query(headsSql, [campus_id]),
+      ]);
+
+      res.status(200).json({
+        vouchers: voucherResults,
+        heads: headsResults,
+      });
+    } catch (error) {
+      console.error("Error fetching data:", error);
+      res.status(500).json({ error: "Failed to fetch data" });
+    }
+  }
+);
+
+
+
+
+app.get('/check-advance/:student_id/:campus_id/:session_id', (req, res) => {
+
+  const student_id = parseInt(req.params.student_id);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error:', err);
+      res.status(500).json({ error: 'Error checking advance' });
+      return;
+    }
+
+    // Query to get the last (most recent) fee voucher by the highest id
+    const sql = `
+      SELECT * 
+      FROM fee_vouchers 
+      WHERE student_id = ? 
+      AND campus_id = ? 
+      AND session_id = ?  
+      AND advance_status = 'Advance'
+      ORDER BY id DESC 
+      LIMIT 1
+    `;
+
+    const values = [student_id, campus_id, session_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error('Error checking advance:', error);
+        res.status(500).json({ error: 'Error checking advance' });
+      } else if (results.length > 0) {
+        // If a record is found with advance payments, return the value
+        res.status(200).json({ advance_payments: results[0].advance_payments, status: results[0].status});
+      } else {
+        // If no record is found, return advance_payments as 0
+        res.status(200).json({ advance_payments: 0 });
+      }
+    });
+  });
+});
+
+
+
+
+app.delete("/delete-fee-voucher/:id_get/:campus_id/:session_id/:user_id/:full_name/:class_name/:section_name/:for_the_month/:register_no", (req, res) => {
+  const id_get = parseInt(req.params.id_get);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+  const user_id = parseInt(req.params.user_id);
+
+  const full_name = req.params.full_name;
+  const class_name = req.params.class_name;
+  const section_name = req.params.section_name;
+  const for_the_month = req.params.for_the_month;
+  const register_no = req.params.register_no;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    // Start a transaction
+    connection.beginTransaction((err) => {
+      if (err) {
+        console.error("Transaction Error:", err);
+        res.status(500).json({ error: "Error deleting" });
+        return;
+      }
+
+      // Get the arrears_not_cleared field
+      const selectSql =
+        "SELECT arrears_not_cleared FROM fee_vouchers WHERE id = ? AND campus_id = ? AND session_id = ? LIMIT 1";
+      const selectValues = [id_get, campus_id, session_id];
+
+      connection.query(
+        selectSql,
+        selectValues,
+        (selectError, selectResults) => {
+          if (selectError) {
+            console.error("Select Error:", selectError);
+            return connection.rollback(() => {
+              res.status(500).json({ error: "Error deleting" });
+            });
+          }
+
+          if (
+            selectResults.length === 0 ||
+            !selectResults[0].arrears_not_cleared
+          ) {
+            // No arrears_not_cleared found, run only the delete query
+            const deleteSql =
+              "DELETE FROM fee_vouchers WHERE id = ? AND campus_id = ? AND session_id = ?";
+            const deleteValues = [id_get, campus_id, session_id];
+
+            connection.query(
+              deleteSql,
+              deleteValues,
+              (deleteError, deleteResults) => {
+                if (deleteError) {
+                  console.error("Delete Error:", deleteError);
+                  return connection.rollback(() => {
+                    res.status(500).json({ error: "Error deleting" });
+                  });
+                }
+
+                connection.commit((commitError) => {
+                  if (commitError) {
+                    console.error("Commit Error:", commitError);
+                    return connection.rollback(() => {
+                      res.status(500).json({ error: "Error deleting" });
+                    });
+                  }
+
+                  console.log("Deleted successfully");
+                  res.status(200).json({ message: "Deleted successfully" });
+
+                  // Log the action
+
+                  let descriptions = {
+                      for_the_month:for_the_month,
+                      register_no:register_no,
+                      full_name:full_name,
+                      class:class_name,
+                      section:section_name
+                      
+                  }
+
+                   logAction('DELETE', 'fee_vouchers' ,'Delete Fee Voucher', deleteResults.insertId, user_id, campus_id, session_id);
+                });
+              }
+            );
+          } else {
+            let arrearsNotClearedArray;
+            try {
+              arrearsNotClearedArray = JSON.parse(
+                selectResults[0].arrears_not_cleared
+              );
+              // console.log("this is updated key" + arrearsNotClearedArray);
+            } catch (e) {
+              console.error("JSON Parse Error:", e);
+              return connection.rollback(() => {
+                res.status(500).json({ error: "Error parsing JSON" });
+              });
+            }
+
+            if (arrearsNotClearedArray.length === 0) {
+              // If the array is empty, proceed with the deletion
+              const deleteSql =
+                "DELETE FROM fee_vouchers WHERE id = ? AND campus_id = ? AND session_id = ?";
+              const deleteValues = [id_get, campus_id, session_id];
+
+              connection.query(
+                deleteSql,
+                deleteValues,
+                (deleteError, deleteResults) => {
+                  if (deleteError) {
+                    console.error("Delete Error:", deleteError);
+                    return connection.rollback(() => {
+                      res.status(500).json({ error: "Error deleting" });
+                    });
+                  }
+
+                  connection.commit((commitError) => {
+                    if (commitError) {
+                      console.error("Commit Error:", commitError);
+                      return connection.rollback(() => {
+                        res.status(500).json({ error: "Error deleting" });
+                      });
+                    }
+
+                    console.log("Deleted successfully");
+                    res.status(200).json({ message: "Deleted successfully" });
+                     let descriptions = {
+                      for_the_month:for_the_month,
+                      register_no:register_no,
+                      full_name:full_name,
+                      class:class_name,
+                      section:section_name
+                      
+                  }
+
+                   logAction('DELETE', 'fee_vouchers' ,'Delete Fee Voucher', deleteResults.insertId, user_id, campus_id, session_id);
+                  });
+                }
+              );
+            } else {
+              const arrearsNotClearedId = arrearsNotClearedArray[0]; // Get the first ID
+
+              // Update the status of the arrears_not_cleared ID to "unpaid"
+              const updateSql =
+                'UPDATE fee_vouchers SET status = "unpaid", recieved_payment = "0", payment_received_through_bank = "", payment_date = "", scroll_no = "0"  WHERE id = ? AND status != "paid" ';
+
+              connection.query(
+                updateSql,
+                [arrearsNotClearedId],
+                (updateError) => {
+                  if (updateError) {
+                    console.error("Update Error:", updateError);
+                    return connection.rollback(() => {
+                      res.status(500).json({ error: "Error updating" });
+                    });
+                  }
+
+                  // Delete the parent row
+                  const deleteSql =
+                    "DELETE FROM fee_vouchers WHERE id = ? AND campus_id = ? AND session_id = ?";
+                  const deleteValues = [id_get, campus_id, session_id];
+
+                  connection.query(
+                    deleteSql,
+                    deleteValues,
+                    (deleteError, deleteResults) => {
+                      if (deleteError) {
+                        console.error("Delete Error:", deleteError);
+                        return connection.rollback(() => {
+                          res.status(500).json({ error: "Error deleting" });
+                        });
+                      }
+
+                      connection.commit((commitError) => {
+                        if (commitError) {
+                          console.error("Commit Error:", commitError);
+                          return connection.rollback(() => {
+                            res.status(500).json({ error: "Error deleting" });
+                          });
+                        }
+
+                        console.log("Updated and deleted successfully");
+                        res.status(200).json({
+                          message: "Updated and deleted successfully",
+                        });
+                         let descriptions = {
+                      for_the_month:for_the_month,
+                      register_no:register_no,
+                      full_name:full_name,
+                      class:class_name,
+                      section:section_name
+                      
+                  }
+
+                   logAction('DELETE', 'fee_vouchers' ,'Delete Fee Voucher', deleteResults.insertId, user_id, campus_id, session_id);
+                      });
+                    }
+                  );
+                }
+              );
+            }
+          }
+        }
+      );
+    });
+  });
+});
+
+// app.get("/unpost-fee-voucher/:id_get/:campus_id/:session_id", (req, res) => {
+//   const voucher_ids = req.params.id_get; // Assume IDs are passed from the client as an array
+//   const campus_id = req.params.campus_id; // Assume IDs are passed from the client as an array
+//   const session_id = req.params.session_id; // Assume IDs are passed from the client as an array
+
+//   if (!voucher_ids || !voucher_ids.length) {
+//     return res.status(400).json({ error: "Voucher IDs are required" });
+//   }
+
+//   // Convert the string into an array of integers
+//   let idArray = voucher_ids.split(",").map(Number);
+
+//   // Join the array back into a comma-separated string without quotes
+//   let idList = idArray.join(",");
+
+//   const query = `
+//     UPDATE fee_vouchers
+//     SET
+//       due_date = actual_due_date,
+//       status = 'unpaid',
+//       recieved_payment = 0,
+//       scroll_no = NULL
+//     WHERE id IN (?) AND campus_id = ? AND session_id = ?;
+//   `;
+
+//   connection.query(query, [idList, campus_id, session_id], (error, results) => {
+//     if (error) {
+//       console.error("Error updating fee vouchers:", error);
+//       return res.status(500).json({ error: "Error updating fee vouchers" });
+//     }
+//     res.json({ message: "Fee vouchers unposted successfully" });
+//   });
+// });
+
+app.get("/unpost-fee-voucher/:id_get/:campus_id/:session_id/:user_id", (req, res) => {
+  const voucher_ids = req.params.id_get; // Assuming IDs are passed as a comma-separated string
+  const campus_id = req.params.campus_id;
+  const session_id = req.params.session_id;
+  const user_id = req.params.user_id;
+
+
+  // console.log(voucher_ids);
+
+  // return false;
+
+  if (!voucher_ids || !voucher_ids.length) {
+    return res.status(400).json({ error: "Voucher IDs are required" });
+  }
+
+  // Convert the string into an array of integers
+  let idArray = voucher_ids.split(",").map(Number);
+
+  // Make sure all IDs are valid numbers
+  if (idArray.some(isNaN)) {
+    return res.status(400).json({ error: "Invalid voucher IDs" });
+  }
+
+  const query = `
+    UPDATE fee_vouchers 
+    SET 
+      due_date = actual_due_date,
+      status = 'unpaid',
+      recieved_payment = 0,
+      scroll_no = NULL,
+      payment_date = NULL
+    WHERE id IN (?) AND campus_id = ?;
+  `;
+
+  // Pass the idArray directly to the query instead of a string
+  connection.query(
+    query,
+    [idArray, campus_id],
+    (error, results) => {
+      if (error) {
+        console.error("Error updating fee vouchers:", error);
+        return res.status(500).json({ error: "Error updating fee vouchers" });
+      }
+      res.json({
+        message: "Fee vouchers unposted successfully",
+        affectedRows: results.affectedRows,
+      });
+         logAction('UNPOST', 'fee_vouchers',  "Fee Unpost", 0, user_id, campus_id, session_id);
+    }
+  );
+});
+
+
+
+
+
+app.get("/get-students/:class_id/:section_id/:campus_id/:session_id/:shift",
+  (req, res) => {
+    const class_id = req.params.class_id;
+    const campus_id = req.params.campus_id;
+    const session_id = req.params.session_id;
+    const section_id = req.params.section_id;
+    const shift = req.params.shift;
+
+    console.log(campus_id);
+
+    connection.getConnection((err, connection) => {
+      if (err) {
+        console.error("Error:", err);
+        res.status(500).json({ error: "Error fetching students" });
+        return;
+      }
+
+      const sql =
+        'SELECT * FROM students WHERE  class_id = ? AND section_id = ? AND campus_id = ? AND session_id = ? AND shift = ?  AND status IN ("New Admission", "Promoted") AND status_on_off = "On" AND status_for_pendings= "On" ';
+
+      connection.query(
+        sql,
+        [class_id, section_id, campus_id, session_id, shift],
+        (error, results) => {
+          connection.release(); // Release the connection
+
+          if (error) {
+            console.error("Error:", error);
+            res.status(500).json({ error: "Error fetching students" });
+          } else {
+            console.log("Fetch Successfully");
+            res.status(200).json({ results });
+          }
+        }
+      );
+    });
+  }
+);
+
+
+
+
+app.get(
+  "/get-employee-for-discipline/:campus_id/",
+  (req, res) => {
+
+    const campus_id = req.params.campus_id;
+  
+    console.log(campus_id);
+
+    connection.getConnection((err, connection) => {
+      if (err) {
+        console.error("Error:", err);
+        res.status(500).json({ error: "Error fetching students" });
+        return;
+      }
+
+      const sql =
+        ` SELECT 
+        school_employees.*,
+        employee_roles.employee_role,
+        employee_posts.employee_post,
+        pay_scale.pay_scale,
+        pay_scale.job_type,
+        campuses.campus_name
+      FROM 
+          school_employees
+      JOIN 
+          employee_roles ON school_employees.employee_role_id = employee_roles.id 
+      JOIN 
+          employee_posts ON school_employees.employee_post_id = employee_posts.id
+      JOIN 
+          pay_scale ON school_employees.pay_scale_id = pay_scale.id
+      JOIN 
+          campuses ON school_employees.campus_id = campuses.id WHERE school_employees.campus_id = ?`;
+      connection.query(
+        sql,
+        [campus_id],
+        (error, results) => {
+          connection.release(); // Release the connection
+
+          if (error) {
+            console.error("Error:", error);
+            res.status(500).json({ error: "Error fetching students" });
+          } else {
+            console.log("Fetch Successfully");
+            res.status(200).json({ results });
+          }
+        }
+      );
+    });
+  }
+);
+
+
+//this is 100 percent correct code*
+
+// app.post('/view-fee-vouchers', async (req, res) => {
+//   console.log(req.body);
+//   const { campus_id, invoices, session_id } = req.body;
+
+//   try {
+//     // Define the placeholders for the invoice IDs
+//     const placeholders = invoices.map(() => '?').join(',');
+
+//     // Get heads, vouchers, arrears, and bank details in parallel
+//     const [headsResults, vouchersResults, arrearsResults, bankDetailsResults] = await Promise.all([
+//       connection.query(`
+//         SELECT fee_head_details.id, heads.head_name
+//         FROM fee_head_details
+//         JOIN heads ON fee_head_details.fee_head_id = heads.id
+//         WHERE fee_head_details.campus_id = ?
+//       `, [campus_id]),
+
+//       connection.query(`
+//         SELECT fee_vouchers.*, students.register_no, students.full_name, students.father_name,
+//                school_categories.category, classes.class as class_name, sections.section_name,
+//                fee_vouchers.arrears_not_cleared
+//         FROM fee_vouchers
+//         JOIN students ON fee_vouchers.student_id = students.id
+//         JOIN school_categories ON students.category_id = school_categories.id
+//         JOIN classes ON students.class_id = classes.id
+//         JOIN sections ON students.section_id = sections.id
+//         WHERE fee_vouchers.id IN (${placeholders}) AND students.campus_id = ? AND students.session_id = ?
+//       `, [...invoices, campus_id, session_id]),
+
+//       connection.query(`
+//         SELECT id, arrears_not_cleared
+//         FROM fee_vouchers
+//         WHERE id IN (${placeholders})
+//       `, [...invoices]),
+
+//       connection.query(`
+//         SELECT bank_details.id, bank_details.bank_id, banks.bank_name, bank_details.account_title, bank_details.account_no, bank_details.status
+//         FROM bank_details
+//         JOIN banks ON bank_details.bank_id = banks.id
+//         WHERE bank_details.status = 'On' AND bank_details.campus_id = ?
+//       `, [campus_id])
+//     ]);
+
+//     // Gather all unique arrear IDs from the arrearsResults
+//     let allArrearIds = [];
+//     arrearsResults.forEach(arrear => {
+//       if (arrear.arrears_not_cleared !== "[]") {
+//         const arrearIds = JSON.parse(arrear.arrears_not_cleared);
+//         allArrearIds = allArrearIds.concat(arrearIds);
+//       }
+//     });
+//     allArrearIds = [...new Set(allArrearIds)]; // Remove duplicate IDs
+
+//     // Fetch for_the_month for all unique arrear IDs in a single query
+//     let arrearIdToMonthMap = {};
+//     if (allArrearIds.length > 0) {
+//       const arrearPlaceholders = allArrearIds.map(() => '?').join(',');
+//       const forMonthResults = await connection.query(`
+//         SELECT id, for_the_month
+//         FROM fee_vouchers
+//         WHERE id IN (${arrearPlaceholders})
+//       `, allArrearIds);
+
+//       // Create a mapping of arrear ID to for_the_month
+//       forMonthResults.forEach(result => {
+//         arrearIdToMonthMap[result.id] = result.for_the_month;
+//       });
+//     }
+
+//     // Map arrear IDs to their corresponding for_the_month values in vouchersResults
+//     let arrearsDetails = vouchersResults.map(voucher => {
+//       let forMonths = '';
+//       if (voucher.arrears_not_cleared !== "[]") {
+//         const arrearIds = JSON.parse(voucher.arrears_not_cleared);
+//         forMonths = arrearIds.map(id => arrearIdToMonthMap[id]).filter(Boolean).join(', ');
+//       }
+//       return {
+//         id: voucher.id,
+//         arrears_not_cleared: forMonths,
+//       };
+//     });
+
+//     // Prepare response
+//     const results = {
+//       heads: headsResults,
+//       vouchers: vouchersResults,
+//       arrears: arrearsDetails,
+//       bankDetails: bankDetailsResults,
+//     };
+
+//     res.json(results);
+//   } catch (error) {
+//     console.error('Error fetching data:', error);
+//     res.status(500).json({ error: 'Internal server error' });
+//   }
+// });
+
+
+
+app.post("/view-students-id-card", async (req, res) => {
+  console.log(req.body);
+  const { class_id, campus_id, invoices, session_id, user_id} = req.body;
+
+  try {
+    // Define placeholders for invoice IDs
+    const placeholders = invoices.map(() => "?").join(",");
+
+    // Fetch voucher data along with related student, category, class, section, session, and campus details
+    const vouchersResults = await connection.query(
+      `
+      SELECT students.*,
+      school_categories.category,
+      classes.class as class_name,
+      sections.section_name,
+      sessions.session_name,
+      campuses.campus_name
+      FROM students
+      JOIN school_categories ON students.category_id = school_categories.id
+      JOIN classes ON students.class_id = classes.id
+      JOIN sections ON students.section_id = sections.id
+      JOIN sessions ON students.session_id = sessions.id
+      JOIN campuses ON students.campus_id = campuses.id
+      WHERE students.id IN (${placeholders}) AND students.class_id = ? AND students.campus_id = ? AND students.session_id = ?
+      `,
+      [...invoices, class_id, campus_id, session_id]
+    );
+
+    // Prepare the response with only voucher-related data
+    const results = {
+      vouchers: vouchersResults,
+    };
+
+    res.json(results);
+    
+    //  logAction('VIEW', '' ,'VIEW STUDENT ID CARD', 0, user_id, campus_id, session_id);
+  } catch (error) {
+    console.error("Error fetching data:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+app.post("/view-employee-id-card", async (req, res) => {
+  console.log(req.body);
+  const { class_id, campus_id, invoices, session_id } = req.body;
+
+  try {
+    // Define placeholders for invoice IDs
+    const placeholders = invoices.map(() => "?").join(",");
+
+    // Fetch voucher data along with related student, category, class, section, session, and campus details
+    const vouchersResults = await connection.query(
+      `
+      SELECT 
+        school_employees.*,
+        employee_roles.employee_role,
+        employee_posts.employee_post,
+        pay_scale.pay_scale,
+        pay_scale.job_type,
+        campuses.campus_name
+      FROM 
+          school_employees
+      JOIN 
+          employee_roles ON school_employees.employee_role_id = employee_roles.id 
+      JOIN 
+          employee_posts ON school_employees.employee_post_id = employee_posts.id
+      JOIN 
+          pay_scale ON school_employees.pay_scale_id = pay_scale.id
+      JOIN 
+          campuses ON school_employees.campus_id = campuses.id
+      WHERE school_employees.id IN (${placeholders}) AND school_employees.campus_id = ?
+      `,
+      [...invoices, campus_id]
+    );
+
+    // Prepare the response with only voucher-related data
+    const results = {
+      vouchers: vouchersResults,
+    };
+
+    res.json(results);
+  } catch (error) {
+    console.error("Error fetching data:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+// Route to fetch fee vouchers and related data
+app.post("/view-fee-vouchers", async (req, res) => {
+  console.log(req.body);
+  const { campus_id, invoices, session_id } = req.body;
+
+  try {
+    // Define the placeholders for the invoice IDs
+    const placeholders = invoices.map(() => "?").join(",");
+
+    // Get heads, vouchers, arrears, bank details, and bank notes in parallel
+    const [
+      headsResults,
+      vouchersResults,
+      arrearsResults,
+      bankDetailsResults,
+      bankNotesResults,
+    ] = await Promise.all([
+      connection.query(
+        `
+        SELECT fee_head_details.id, heads.head_name
+        FROM fee_head_details
+        JOIN heads ON fee_head_details.fee_head_id = heads.id
+        WHERE fee_head_details.campus_id = ?
+      `,
+        [campus_id]
+      ),
+
+     
+      // connection.query(
+      //   `
+      //   SELECT fee_vouchers.*, students.register_no, students.full_name, students.father_name, 
+      //          school_categories.category, classes.class as class_name, sections.section_name,
+      //          fee_vouchers.arrears_not_cleared, sessions.session_name, campuses.campus_name
+      //   FROM fee_vouchers
+      //   JOIN students ON fee_vouchers.student_id = students.id
+      //   JOIN school_categories ON students.category_id = school_categories.id
+      //   JOIN classes ON students.class_id = classes.id
+      //   JOIN sections ON students.section_id = sections.id
+      //   JOIN sessions ON students.session_id = sessions.id
+      //   JOIN campuses ON students.campus_id = campuses.id
+      //   WHERE fee_vouchers.id IN (${placeholders}) AND students.campus_id = ? AND students.session_id = ?
+      // `,
+      //   [...invoices, campus_id, session_id]
+      // ),
+
+
+       //dont delete this query keep in mind because when current query not run properly then it run
+      connection.query(
+        `
+        SELECT fv.*, 
+               s.register_no, 
+               s.full_name, 
+               s.father_name, 
+               sc.category, 
+               c.class AS class_name, 
+               sec.section_name,
+               fv.arrears_not_cleared,
+               ses.session_name, 
+               cp.campus_name,
+               cp.phone_no,
+               cp.email,
+               cp.address,
+               cp.logo,
+               JSON_ARRAYAGG(
+          JSON_OBJECT(
+              'total_amount_data', lfv.total_amount_data,
+              'after_due_date_amount', lfv.after_due_date_amount,
+              'received_payment', lfv.recieved_payment,
+              'arrears', lfv.arrears,
+              'first_advance_payment', lfv.first_advance_payment,
+              'for_the_month', lfv.for_the_month,
+              'status', lfv.status
+          )
+          ORDER BY lfv.id DESC
+          LIMIT 3  -- Limit to last 3 vouchers
+       ) AS last_three_vouchers
+        FROM fee_vouchers fv
+        JOIN students s ON fv.student_id = s.id
+        JOIN school_categories sc ON s.category_id = sc.id
+        JOIN classes c ON s.class_id = c.id
+        JOIN sections sec ON s.section_id = sec.id
+        JOIN sessions ses ON s.session_id = ses.id
+        JOIN campuses cp ON s.campus_id = cp.id
+        LEFT JOIN fee_vouchers lfv 
+          ON fv.student_id = lfv.student_id 
+          AND lfv.id < fv.id  -- Exclude current voucher by making sure it is older
+          AND lfv.campus_id = s.campus_id
+          AND lfv.session_id = s.session_id
+        WHERE fv.id IN (${placeholders}) 
+          AND s.campus_id = ? 
+          AND s.session_id = ?
+        GROUP BY fv.id
+        ORDER BY fv.id DESC
+        `,
+        [...invoices, campus_id, session_id]
+      ),
+
+
+    
+      
+      
+      
+
+      connection.query(
+        `
+        SELECT id, arrears_not_cleared
+        FROM fee_vouchers
+        WHERE id IN (${placeholders})
+      `,
+        invoices
+      ),
+
+      connection.query(
+        `
+        SELECT bank_details.id, bank_details.bank_id, banks.bank_name, bank_details.account_title, bank_details.account_no, bank_details.status, banks.logo
+        FROM bank_details
+        JOIN banks ON bank_details.bank_id = banks.id
+        WHERE bank_details.campus_id = ?
+      `,
+        [campus_id]
+      ),
+
+      connection.query(
+        `
+        SELECT id, note_title, note_description, session_id, campus_id, user_id, created_at, updated_at
+        FROM bank_notes
+        WHERE campus_id = ? AND session_id = ?
+      `,
+        [campus_id, session_id]
+      ),
+    ]);
+
+    // Gather all unique arrear IDs from the arrearsResults
+    let allArrearIds = [];
+    arrearsResults.forEach((arrear) => {
+      if (arrear.arrears_not_cleared !== "[]") {
+        const arrearIds = JSON.parse(arrear.arrears_not_cleared);
+        allArrearIds = allArrearIds.concat(arrearIds);
+      }
+    });
+    allArrearIds = [...new Set(allArrearIds)]; // Remove duplicate IDs
+
+    // Fetch for_the_month for all unique arrear IDs in a single query
+    let arrearIdToMonthMap = {};
+    if (allArrearIds.length > 0) {
+      const arrearPlaceholders = allArrearIds.map(() => "?").join(",");
+      const forMonthResults = await connection.query(
+        `
+        SELECT id, for_the_month
+        FROM fee_vouchers
+        WHERE id IN (${arrearPlaceholders})
+      `,
+        allArrearIds
+      );
+
+      // Create a mapping of arrear ID to for_the_month
+      forMonthResults.forEach((result) => {
+        arrearIdToMonthMap[result.id] = result.for_the_month;
+      });
+    }
+
+    // Map arrear IDs to their corresponding for_the_month values in vouchersResults
+    let arrearsDetails = vouchersResults.map((voucher) => {
+      let forMonths = "";
+      if (voucher.arrears_not_cleared !== "[]") {
+        const arrearIds = JSON.parse(voucher.arrears_not_cleared);
+        forMonths = arrearIds
+          .map((id) => arrearIdToMonthMap[id])
+          .filter(Boolean)
+          .join(", ");
+      }
+      return {
+        id: voucher.id,
+        arrears_not_cleared: forMonths,
+      };
+    });
+
+    // Prepare response
+    const results = {
+      heads: headsResults,
+      vouchers: vouchersResults,
+      arrears: arrearsDetails,
+      bankDetails: bankDetailsResults,
+      bankNotes: bankNotesResults,
+    };
+
+    res.json(results);
+  } catch (error) {
+    console.error("Error fetching data:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+app.get("/bank-note-get/:id", (req, res) => {
+  const id = req.params.id;
+
+  const sql =
+    "SELECT id, note_title, note_description FROM bank_notes WHERE id = ?";
+
+  connection.query(sql, [id], (error, results) => {
+    if (error) {
+      console.error("Error executing query:", error);
+      res.status(500).json({ error: "Internal server error" });
+      return;
+    }
+
+    if (results.length === 0) {
+      res.status(404).json({ error: "Bank note not found" });
+      return;
+    }
+
+    res.status(200).json({ results });
+  });
+});
+
+// app.post('/insert-bank-note', (req, res) => {
+//   const {hidden_id, note_title, note_description, session_id, campus_id, user_id } = req.body;
+
+//   const query = `
+//     INSERT INTO bank_notes (note_title, note_description, session_id, campus_id, user_id)
+//     VALUES (?, ?, ?, ?, ?)
+//   `;
+
+//   connection.query(query, [note_title, note_description, session_id, campus_id, user_id], (err, results) => {
+//     if (err) {
+//       console.error('Error inserting data:', err);
+//       return res.status(500).json({ error: 'Error inserting data' });
+//     }
+//     res.status(200).json({ message: 'Data inserted successfully', insertId: results.insertId });
+//   });
+// });
+
+app.post("/insert-bank-note", (req, res) => {
+  const {
+    hidden_id,
+    note_title,
+    note_description,
+    session_id,
+    campus_id,
+    user_id,
+  } = req.body;
+
+  console.log(req.body);
+
+  let query;
+  let queryParams;
+
+  if (hidden_id) {
+    // Update existing record
+    query = `
+      UPDATE bank_notes
+      SET note_title = ?, note_description = ?
+      WHERE id = ?
+    `;
+    queryParams = [note_title, note_description, hidden_id];
+  } else {
+    // Insert new record
+    query = `
+      INSERT INTO bank_notes (note_title, note_description, session_id, campus_id, user_id)
+      VALUES (?, ?, ?, ?, ?)
+    `;
+    queryParams = [
+      note_title,
+      note_description,
+      session_id,
+      campus_id,
+      user_id,
+    ];
+  }
+
+  connection.query(query, queryParams, (err, results) => {
+    if (err) {
+      console.error("Error executing query:", err);
+      return res.status(500).json({ error: "Error executing query" });
+    }
+
+    if (hidden_id) {
+      res.status(200).json({ message: "Data updated successfully" });
+    } else {
+      res.status(200).json({
+        message: "Data inserted successfully",
+        insertId: results.insertId,
+      });
+    }
+  });
+});
+
+app.get("/get-categories/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching category" });
+      return;
+    }
+
+    const sql = `
+      SELECT  
+        sc.id,
+        sc.category
+      FROM selected_categories_campuswise scc
+      LEFT JOIN school_categories sc ON scc.category_id = sc.id
+      WHERE scc.campus_id = ? AND scc.status = "On"
+    `;
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Release the connection
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.get("/get-all-categories", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching category" });
+      return;
+    }
+
+    const sql = `SELECT * FROM school_categories WHERE status = 'On'`;
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.get("/get-subjects", (req, res) => {
+  const campusId = req.query.campus_id; // Access the campus_id from the query parameters
+   console.log(req.query.campus_id);
+  if (!campusId) {
+    return res.status(400).json({ error: "campus_id is required" }); // If campus_id is not provided
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      return res.status(500).json({ error: "Error connecting to the database" });
+    }
+
+    // Use the campusId in the SQL query
+    const sql = `SELECT * FROM subjects WHERE campus_id = ?`;
+
+    connection.query(sql, [campusId], (error, results) => {
+      connection.release(); // Release the connection after the query is complete
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        return res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results }); // Send the fetched subjects as the response
+      }
+    });
+  });
+});
+
+
+
+
+
+
+
+app.get("/get-subjects", (req, res) => {
+  const campusId = req.query.campus_id; // Access the campus_id from the query parameters
+   console.log(req.query.campus_id);
+  if (!campusId) {
+    return res.status(400).json({ error: "campus_id is required" }); // If campus_id is not provided
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      return res.status(500).json({ error: "Error connecting to the database" });
+    }
+
+    // Use the campusId in the SQL query
+    const sql = `SELECT * FROM subjects WHERE campus_id = ?`;
+
+    connection.query(sql, [campusId], (error, results) => {
+      connection.release(); // Release the connection after the query is complete
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        return res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results }); // Send the fetched subjects as the response
+      }
+    });
+  });
+});
+
+
+
+
+// app.get("/get-subjects", (req, res) => {
+//   connection.getConnection((err, connection) => {
+
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching subjects" });
+//       return;
+//     }
+
+//     const sql = `SELECT * FROM assing_subjects_class INNER JOIN subjects ON assing_subjects_class.subject_id = subjects.id
+//     INNER JOIN school_employees ON assing_subjects_class.teacher_id = school_employees.id`;
+
+//     connection.query(sql, (error, results) => {
+//       connection.release(); // Release the connection
+//       if (error) {
+//         console.error("Error executing SQL query:", error);
+//         res.status(500).json({ error: "Internal server error" });
+//       } else {
+//         res.json({ results });
+//       }
+//     });
+//   });
+// });
+
+
+
+
+app.get("/fee-heads/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+
+  console.log(campus_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = "SELECT * FROM heads WHERE campus_id = ?";
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Release the connection
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results });
+      }
+    });
+  });
+});
+
+// app.get('/get-fee-heads-details-for-vouchers/:campus_id/:class_id/:shift/:category_id?', (req, res) => {
+//   const campus_id = req.params.campus_id;
+//   const class_id = req.params.class_id;
+//   const shift = req.params.shift;
+//   const categoryId = req.params.category_id || null;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching connection' });
+//       return;
+//     }
+
+//     const sql = `
+//     SELECT fhd.*, sc.category, sc.id as category_id, h.head_name
+//     FROM fee_head_details fhd
+//     JOIN school_categories sc ON fhd.category_id = sc.id
+//     JOIN heads h ON fhd.fee_head_id = h.id
+//     JOIN classes c ON fhd.fee_group_id = c.fee_group_id
+//     WHERE fhd.shift = ? AND c.id = ? AND c.campus_id = ?
+//   `;
+
+//     connection.query(sql, [shift,class_id, campus_id], (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error:', error);
+//         res.status(500).json({ error: 'Error fetching fee head details' });
+//       } else {
+//         console.log('Fetch Successfully');
+//         res.status(200).json({ results });
+//       }
+//     });
+//   });
+// });
+
+// app.get('/get-fee-heads-details-for-vouchers/:campus_id/:class_id/:shift/:category_id?', (req, res) => {
+//   const campus_id = req.params.campus_id;
+//   const class_id = req.params.class_id;
+//   const shift = req.params.shift;
+//   const categoryId = req.params.category_id || null;
+
+//   connection.getConnection((err, connection) => {
+
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching connection' });
+//       return;
+//     }
+
+//     let sql = `
+//       SELECT fhd.*, sc.category, sc.id as category_id, h.head_name
+//       FROM fee_head_details fhd
+//       JOIN school_categories sc ON fhd.category_id = sc.id
+//       JOIN heads h ON fhd.fee_head_id = h.id
+//       JOIN fee_groups fg ON fhd.fee_group_id = fg.id
+//       JOIN classes c on fg.class_id = c.id
+//       WHERE fhd.shift = ? AND fhd.status = 'On' AND c.id = ? AND c.campus_id = ?
+//     `;
+
+//     const params = [shift, class_id, campus_id];
+
+//     // Add category_id conditionally
+//     if (categoryId !== null) {
+//       sql += ' AND fhd.category_id = ?';
+//       params.push(categoryId);
+//     }
+
+//     connection.query(sql, params, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error:', error);
+//         res.status(500).json({ error: 'Error fetching fee head details' });
+//       } else {
+//         console.log('Fetch Successfully');
+//         res.status(200).json({ results });
+//       }
+//     });
+//   });
+// });
+
+
+
+
+
+// ....this is last and accurate code*......
+// app.get("/get-fee-heads-details-for-vouchers/:campus_id/:class_id/:shift/:voucher_type/:category_id?",
+//   (req, res) => {
+//     const campus_id = req.params.campus_id;
+//     const class_id = req.params.class_id;
+//     const shift = req.params.shift;
+//     const categoryId = req.params.category_id || null;
+//     const voucherType = req.params.voucher_type;
+
+//     connection.getConnection((err, connection) => {
+//       if (err) {
+//         console.error("Error:", err);
+//         res.status(500).json({ error: "Error fetching connection" });
+//         return;
+//       }
+
+//       // First query to find the fee_group_id based on class_id from the classes table
+//       const firstQuery = `
+//       SELECT fee_group_id
+//       FROM classes
+//       WHERE id = ? AND campus_id = ?
+//     `;
+
+//       connection.query(
+//         firstQuery,
+//         [class_id, campus_id],
+//         (firstError, firstResults) => {
+//           if (firstError) {
+//             connection.release();
+//             console.error("Error:", firstError);
+//             res.status(500).json({ error: "Error fetching fee group" });
+//             return;
+//           }
+
+//           if (firstResults.length === 0) {
+//             connection.release();
+//             res
+//               .status(404)
+//               .json({ error: "No fee group found for the given class_id" });
+//             return;
+//           }
+
+//           const fee_group_id = firstResults[0].fee_group_id;
+
+//           // Second query to fetch fee head details based on fee_group_id
+//           let secondQuery = `
+//             SELECT fhd.*, sc.category, sc.id as category_id, h.head_name, h.checked_status
+//             FROM fee_head_details fhd
+//             JOIN school_categories sc ON fhd.category_id = sc.id
+//             JOIN heads h ON fhd.fee_head_id = h.id
+//             WHERE fhd.shift = ? AND fhd.status = 'On' AND fhd.fee_group_id = ? AND fhd.campus_id = ? AND h.voucher_type IN (?, 'both')
+//           `;
+
+//           const params = [shift, fee_group_id, campus_id, voucherType];
+
+//           // Add category_id conditionally
+//           if (categoryId !== null) {
+//             secondQuery += " AND fhd.category_id = ?";
+//             params.push(categoryId);
+//           }
+
+//           connection.query(
+//             secondQuery,
+//             params,
+//             (secondError, secondResults) => {
+//               connection.release(); // Release the connection
+
+//               if (secondError) {
+//                 console.error("Error:", secondError);
+//                 res
+//                   .status(500)
+//                   .json({ error: "Error fetching fee head details" });
+//               } else {
+//                 console.log("Fetch Successfully");
+//                 res.status(200).json({ results: secondResults });
+//               }
+//             }
+//           );
+//         }
+//       );
+//     });
+//   }
+// );
+
+
+
+
+
+
+// app.get("/get-fee-heads-details-for-vouchers/:campus_id/:voucher_type/:category_id?/:class_id?/:shift?", (req, res) => {
+//   const campus_id = req.params.campus_id;
+//   const class_id = req.params.class_id;
+//   const shift = req.params.shift;
+//   const categoryId = req.params.category_id || null;
+//   const voucherType = req.params.voucher_type;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching connection" });
+//       return;
+//     }
+
+//     // Directly query the fee_head_details without needing fee_group_id
+//     let secondQuery = `
+//       SELECT fhd.*,  fee_groups.fee_group_name,  sc.category, sc.id as category_id, h.head_name,  h.checked_status
+//       FROM fee_head_details fhd
+//       JOIN school_categories sc ON fhd.category_id = sc.id
+//       JOIN heads h ON fhd.fee_head_id = h.id
+//       JOIN fee_groups ON  fhd.fee_group_id = fee_groups.id
+//       WHERE fhd.status = 'On' AND fhd.campus_id = ? AND h.voucher_type IN (?, 'both')
+//     `;
+
+//     const params = [campus_id, voucherType];
+
+//     // Add class_id and category_id conditions if provided
+//     if (class_id) {
+//       secondQuery += " AND classes.id = ?";
+//       params.push(class_id);
+//     }
+
+
+//     if (shift) {
+//       secondQuery += " AND fhd.shift = ?";
+//       params.push(shift);
+//     }
+
+
+//     if (categoryId !== null) {
+//       secondQuery += " AND fhd.category_id = ?";
+//       params.push(categoryId);
+//     }
+
+//     secondQuery += `
+//     ORDER BY fhd.fee_group_id, h.id, sc.id
+//     `;
+
+//     connection.query(secondQuery, params, (secondError, secondResults) => {
+//       connection.release(); // Release the connection
+
+//       if (secondError) {
+//         console.error("Error:", secondError);
+//         res.status(500).json({ error: "Error fetching fee head details" });
+//       } else {
+//         console.log("Fetch Successfully");
+//         res.status(200).json({ results: secondResults });
+//       }
+//     });
+//   });
+// });
+
+app.get("/get-fee-heads-details-for-vouchers/:campus_id/:voucher_type/:category_id?/:class_id?/:shift?", (req, res) => {
+  const campus_id = req.params.campus_id;
+  const class_id = req.params.class_id;
+  const shift = req.params.shift;
+  const categoryId = req.params.category_id || null;
+  const voucherType = req.params.voucher_type;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching connection" });
+      return;
+    }
+
+    const runSecondQuery = (fee_group_id = null) => {
+      let secondQuery = `
+        SELECT fhd.*, fee_groups.fee_group_name, sc.category, sc.id as category_id, h.head_name, h.checked_status
+        FROM fee_head_details fhd
+        JOIN school_categories sc ON fhd.category_id = sc.id
+        JOIN heads h ON fhd.fee_head_id = h.id
+        JOIN fee_groups ON fhd.fee_group_id = fee_groups.id
+        WHERE h.status = 'On' AND fhd.campus_id = ? AND h.voucher_type IN (?, 'both')
+      `;
+
+      const params = [campus_id, voucherType];
+
+      if (fee_group_id) {
+        secondQuery += " AND fhd.fee_group_id = ?";
+        params.push(fee_group_id);
+      }
+
+      if (shift) {
+        secondQuery += " AND fhd.shift = ?";
+        params.push(shift);
+      }
+
+      if (categoryId !== null) {
+        secondQuery += " AND fhd.category_id = ?";
+        params.push(categoryId);
+      }
+
+      secondQuery += `
+        ORDER BY fhd.fee_group_id, h.id, sc.id
+      `;
+
+      connection.query(secondQuery, params, (secondError, secondResults) => {
+        connection.release();
+
+        if (secondError) {
+          console.error("Error:", secondError);
+          res.status(500).json({ error: "Error fetching fee head details" });
+        } else {
+          console.log("Fetch Successfully");
+          res.status(200).json({ results: secondResults });
+        }
+      });
+    };
+
+    // If class_id and voucher_type match, try to get fee_group_id first
+    if (class_id && voucherType === "single_voucher_form") {
+      const firstQuery = `
+        SELECT fee_group_id
+        FROM classes
+        WHERE id = ? AND campus_id = ?
+      `;
+
+      connection.query(firstQuery, [class_id, campus_id], (firstError, firstResults) => {
+        if (firstError) {
+          console.error("Error:", firstError);
+          // Still run secondQuery without fee_group_id
+          runSecondQuery();
+          return;
+        }
+
+        if (firstResults.length === 0) {
+          console.warn("No fee group found, continuing without fee_group_id.");
+          runSecondQuery();
+          return;
+        }
+
+        const fee_group_id = firstResults[0].fee_group_id;
+        runSecondQuery(fee_group_id);
+      });
+    } else {
+      // Skip first query and run second directly
+      runSecondQuery();
+    }
+  });
+});
+
+
+
+
+app.get("/fee-groups/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+
+  console.log(campus_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = "SELECT * FROM fee_groups WHERE campus_id = ?";
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Release the connection
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results });
+      }
+    });
+  });
+});
+
+app.post("/insert-fee-head-details", (req, res) => {
+  const {
+    fee_head_id,
+    category_id,
+    fee_group_id,
+    shift,
+    amount,
+    campus_id,
+    hidden_id,
+  } = req.body;
+
+  // Function to validate uniqueness
+  const validateUniqueness = (callback) => {
+    let uniquenessCheckQuery = `
+      SELECT COUNT(*) AS count 
+      FROM fee_head_details 
+      WHERE fee_head_id = ? AND category_id = ? AND fee_group_id = ? AND shift = ? AND campus_id = ?
+    `;
+    const uniquenessCheckValues = [
+      fee_head_id,
+      category_id,
+      fee_group_id,
+      shift,
+      campus_id,
+    ];
+
+    if (hidden_id) {
+      uniquenessCheckQuery += " AND id != ?";
+      uniquenessCheckValues.push(hidden_id);
+    }
+
+    connection.query(
+      uniquenessCheckQuery,
+      uniquenessCheckValues,
+      (err, result) => {
+        if (err) {
+          callback(err, null);
+        } else {
+          console.log(result);
+          callback(null, result[0].count > 0);
+        }
+      }
+    );
+  };
+
+  // Validate required fields
+  if (
+    !fee_head_id ||
+    !category_id ||
+    !fee_group_id ||
+    !shift ||
+    !amount ||
+    !campus_id
+  ) {
+    return res.status(400).json({ error: "All fields are required" });
+  }
+
+  validateUniqueness((err, isDuplicate) => {
+    if (err) {
+      console.error("Error checking uniqueness:", err);
+      res.status(500).json({ error: "Error checking uniqueness" });
+      return;
+    }
+
+    if (isDuplicate) {
+      return res.status(400).json({ error: "Fee head already exist" });
+    }
+
+    if (hidden_id) {
+      // Update existing record
+      let updateQuery = `
+        UPDATE fee_head_details
+        SET
+          fee_head_id = ?, category_id = ?, fee_group_id = ?, shift = ? ,amount = ?
+        WHERE id = ?
+      `;
+      const updateValues = [
+        fee_head_id,
+        category_id,
+        fee_group_id,
+        shift,
+        amount,
+        hidden_id,
+      ];
+
+      connection.query(updateQuery, updateValues, (err, result) => {
+        if (err) {
+          console.error("Error updating data:", err);
+          res.status(500).json({ error: "Error updating data" });
+        } else {
+          res.json({ message: "Data updated successfully!" });
+        }
+      });
+    } else {
+      // Insert new record
+      const insertQuery = `
+        INSERT INTO fee_head_details (
+           fee_head_id, category_id, fee_group_id, shift, amount, campus_id
+        ) VALUES (?, ?, ?, ?, ?, ?)
+      `;
+      const insertValues = [
+        fee_head_id,
+        category_id,
+        fee_group_id,
+        shift,
+        amount,
+        campus_id,
+      ];
+
+      connection.query(insertQuery, insertValues, (err, result) => {
+        if (err) {
+          console.error("Error inserting data:", err);
+          res.status(500).json({ error: "Error inserting data" });
+        } else {
+          res.json({ message: "Data saved successfully!" });
+        }
+      });
+    }
+  });
+});
+
+// app.post('/insert-fee-head-details', (req, res) => {
+//   const {
+//     fee_head_id, category_id, fee_group_id, shift, amount, campus_id, hidden_id
+//   } = req.body;
+
+//   if (hidden_id) {
+//     // Update existing admission
+//     let updateQuery = `
+//       UPDATE fee_head_details
+//       SET
+//         fee_head_id = ?, category_id = ?, fee_group_id = ?, shift = ? ,amount = ?
+//        `;
+
+//     const updateValues = [
+//       fee_head_id, category_id, fee_group_id, shift, amount
+//     ];
+
+//     updateQuery += ` WHERE id = ?`;
+//     updateValues.push(hidden_id);
+
+//     connection.query(updateQuery, updateValues, (err, result) => {
+//       if (err) {
+//         console.error('Error updating data:', err);
+//         res.status(500).json({ error: 'Error updating data' });
+//       } else {
+//         res.json({ message: 'Data updated successfully!' });
+//       }
+//     });
+
+//   } else {
+
+//     console.log(req.body);
+//     // Insert new admission
+//     const insertQuery = `
+//       INSERT INTO fee_head_details (
+//          fee_head_id, category_id, fee_group_id, shift, amount, campus_id
+//       ) VALUES (?, ?, ?, ?, ?, ?)
+//     `;
+
+//     const insertValues = [
+//       fee_head_id, category_id, fee_group_id, shift, amount, campus_id
+//     ];
+
+//     connection.query(insertQuery, insertValues, (err, result) => {
+//       if (err) {
+//         console.error('Error inserting data:', err);
+//         res.status(500).json({ error: 'Error inserting data' });
+//       } else {
+//         res.json({ message: 'Data saved successfully!' });
+//       }
+//     });
+//   }
+// });
+
+// // Endpoint to receive category IDs and additional data
+// app.post('/insert-selected-categories', async (req, res) => {
+//   const { category_id, session_id, campus_id, user_id, hidden_id } = req.body;
+
+//   if (!category_id || !Array.isArray(category_id) || category_id.length === 0) {
+//     return res.status(400).json({ error: 'Invalid category IDs' });
+//   }
+
+//   if (!session_id || !campus_id || !user_id) {
+//     return res.status(400).json({ error: 'Missing required fields' });
+//   }
+
+//   try {
+//     // Check for existing categories in a single query
+//     const [rows] = await connection.query(
+//       'SELECT COUNT(*) as count FROM selected_categories_campuswise WHERE campus_id = ? AND category_id IN (?)',
+//       [campus_id, category_id]
+//     );
+
+//     // Log the results to debug
+//     const existingCount = rows.count;
+
+//     if (existingCount > 0) {
+//       return res.status(400).json({ error: 'Categories already exist' });
+//     }
+
+//     // Insert new categories using a single query
+//     const values = category_id.map(id => [id, campus_id]);
+//     await connection.query('INSERT INTO selected_categories_campuswise (category_id, campus_id) VALUES ?', [values]);
+
+//     res.status(200).json({ message: 'Data inserted successfully' });
+
+//   } catch (error) {
+//     console.error('Error inserting data:', error);
+//     res.status(500).json({ error: 'Internal server error' });
+//   }
+// });
+
+
+
+
+// Endpoint to receive category IDs and additional data
+app.post("/insert-selected-categories", async (req, res) => {
+  const { category_id, session_id, campus_id, user_id, hidden_id, update } =
+    req.body;
+
+  if (!category_id || !Array.isArray(category_id) || category_id.length === 0) {
+    return res.status(400).json({ error: "Invalid category IDs" });
+  }
+
+  if (!session_id || !campus_id || !user_id) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    if (hidden_id) {
+      // Update logic
+      const [existingRows] = await connection.query(
+        'SELECT COUNT(*) as count FROM selected_categories_campuswise WHERE status != "Off" AND campus_id = ? AND category_id = ? AND id != ?',
+        [campus_id, category_id[0], hidden_id]
+      );
+
+      const existingCount = existingRows.count;
+
+      if (existingCount > 0) {
+        return res
+          .status(400)
+          .json({ error: "Category already exists for another record" });
+      }
+
+      await connection.query(
+        "UPDATE selected_categories_campuswise SET category_id = ? WHERE id = ? AND campus_id = ?",
+        [category_id[0], hidden_id, campus_id]
+      );
+
+       logAction('UPDATE', 'selected_categories_campuswise', 'Update Category', hidden_id, user_id, campus_id, session_id);
+
+      return res.status(200).json({ message: "Category updated successfully" });
+    } else {
+      // Insert logic
+      const [rows] = await connection.query(
+        'SELECT COUNT(*) as count FROM selected_categories_campuswise WHERE status != "Off" AND campus_id = ? AND category_id IN (?)',
+        [campus_id, category_id]
+      );
+
+      const existingCount = rows.count;
+
+      if (existingCount > 0) {
+        return res.status(400).json({ error: "Categories already exist" });
+      }
+
+      const values = category_id.map((id) => [id, campus_id]);
+      await connection.query(
+        "INSERT INTO selected_categories_campuswise (category_id, campus_id) VALUES ?",
+        [values]
+      );
+
+      res.status(200).json({ message: "Data inserted successfully" });
+       logAction('CREATE', 'selected_categories_campuswise', 'Create Categories', 0, user_id, campus_id, session_id);
+    }
+  } catch (error) {
+    console.error("Error inserting/updating data:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+app.post("/insert-selected-subjects", async (req, res) => {
+  const { subject_id, class_id, section_id, campus_id, user_id, hidden_id } = req.body;
+
+  if (!subject_id || !Array.isArray(subject_id) || subject_id.length === 0) {
+    return res.status(400).json({ error: "Invalid subject IDs" });
+  }
+
+  if (!campus_id || !user_id || !class_id || !section_id) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    if (hidden_id) {
+      // Update logic
+      const [existingRows] = await connection.query(
+        'SELECT COUNT(*) as count FROM assing_subjects_class WHERE subject_id = ? AND class_id = ? AND section_id = ? AND campus_id = ? AND id != ?',
+        [subject_id[0], class_id, section_id, campus_id, hidden_id]
+      );
+
+      const existingCount = existingRows.count;
+
+      if (existingCount > 0) {
+        return res.status(400).json({ error: "Subject already exists for another record" });
+      }
+
+      await connection.query(
+        "UPDATE assing_subjects_class SET subject_id = ? WHERE id = ? AND campus_id = ?",
+        [subject_id[0], hidden_id, campus_id]
+      );
+
+      return res.status(200).json({ message: "Subject updated successfully" });
+    } else {
+      // Insert logic for bulk insert without using a loop
+      const values = subject_id.map(id => [id, class_id, section_id, campus_id]);
+      
+      // Check if any of the subjects already exist
+      const [rows] = await connection.query(
+        'SELECT COUNT(*) as count FROM assing_subjects_class WHERE campus_id = ? AND subject_id IN (?) AND class_id = ? AND section_id = ?',
+        [campus_id, subject_id, class_id, section_id]
+      );
+
+      const existingCount = rows.count;
+
+      if (existingCount > 0) {
+        return res.status(400).json({ error: "Some subjects already exist" });
+      }
+
+      // Perform bulk insert
+      await connection.query(
+        "INSERT INTO assing_subjects_class (subject_id, class_id, section_id, campus_id) VALUES ?",
+        [values]
+      );
+
+      res.status(200).json({ message: "Subjects inserted successfully" });
+    }
+  } catch (error) {
+    console.error("Error inserting/updating data:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+// app.post("/insert-assign-subject-teacher", async (req, res) => {
+//   const { subject_id, teacher_id, campus_id, session_id, hidden_id } = req.body;
+
+//   // Validate Subject IDs
+//   if (!subject_id || !Array.isArray(subject_id) || subject_id.length === 0) {
+//     return res.status(400).json({ error: "Invalid Subject IDs" });
+//   }
+
+//   // Validate Campus ID and Session ID
+//   if (!campus_id || !session_id) {
+//     return res.status(400).json({ error: "Missing required fields" });
+//   }
+
+//   try {
+//     // If hidden_id is provided, it means an update operation
+//     if (hidden_id) {
+//       // Check if the subject is already assigned to the teacher (for updating)
+//       const query = 'SELECT COUNT(*) as count FROM assing_subjects_class_teacher WHERE assign_subject_class_id = ? AND teacher_id = ? AND campus_id = ? AND session_id = ? AND id != ?';
+//       const params = [subject_id[0], teacher_id, campus_id, session_id, hidden_id];
+    
+//       const [existingRows] = await connection.query(query, params);
+//       const existingCount = existingRows[0].count;  // Make sure to access the count properly
+    
+//       if (existingCount > 0) {
+//         return res.status(400).json({ error: "Subject already assigned to another teacher" });
+//       }
+    
+//       // Perform the update operation
+//       const updateQuery = "UPDATE assing_subjects_class_teacher SET assign_subject_class_id = ?, teacher_id = ?, session_id = ?, campus_id = ? WHERE id = ?";
+//       const updateParams = [subject_id[0], teacher_id, session_id, campus_id, hidden_id];
+    
+//       await connection.query(updateQuery, updateParams);
+      
+//       return res.status(200).json({ message: "Subject updated successfully" });
+//     } else {
+//       // Check if any of the subjects are already assigned to the teacher
+//       const checkExistingQuery = 'SELECT COUNT(*) as count FROM assing_subjects_class_teacher WHERE teacher_id = ? AND assign_subject_class_id IN (?) AND campus_id = ? AND session_id = ?';
+//       const checkExistingParams = [teacher_id, subject_id, campus_id, session_id];
+    
+//       const [existingSubjects] = await connection.query(checkExistingQuery, checkExistingParams);
+      
+//       const existingSubjectCount = existingSubjects.count;  // Access the count correctly
+    
+//       if (existingSubjectCount > 0) {
+//         return res.status(400).json({ error: "Some subjects are already assigned to this teacher" });
+//       }
+    
+//       // Perform the bulk insert operation
+//       const values = subject_id.map(id => [id, teacher_id, campus_id, session_id]);
+//       const bulkInsertQuery = "INSERT INTO assing_subjects_class_teacher (assign_subject_class_id, teacher_id, campus_id, session_id) VALUES ?";
+    
+//       await connection.query(bulkInsertQuery, [values]);
+      
+//       return res.status(200).json({ message: "Subjects assigned successfully" });
+//     }
+//   } catch (error) {
+//     console.error("Error inserting/updating data:", error);
+//     res.status(500).json({ error: "Internal server error" });
+//   }
+// });
+
+
+
+
+app.post("/insert-assign-subject-teacher", async (req, res) => {
+  const { subject_id, teacher_id, campus_id, session_id, hidden_id, shift } = req.body;
+
+  // Validate Subject IDs
+  if (!subject_id || !Array.isArray(subject_id) || subject_id.length === 0) {
+    return res.status(400).json({ error: "Invalid Subject IDs" });
+  }
+
+  // Validate Campus ID and Session ID
+  if (!campus_id || !session_id) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+
+  try {
+    
+    if (hidden_id) {
+     
+    } else {
+            
+            const checkExistingQuery = `
+            SELECT asuc.id, subjects.subjects 
+            FROM assing_subjects_class_teacher AS ast
+            INNER JOIN assing_subjects_class AS asuc 
+                ON ast.assign_subject_class_id = asuc.id
+            INNER JOIN subjects AS subjects
+                ON asuc.subject_id = subjects.id
+            WHERE ast.teacher_id = ?
+                AND ast.assign_subject_class_id IN (?)
+                AND ast.campus_id = ? 
+                AND ast.session_id = ?
+                AND ast.shift = ?
+            `;
+
+        // Combine parameters (teacher_id, subject_id array, campus_id, session_id)
+        const checkExistingParams = [teacher_id, subject_id, campus_id, session_id, shift];
+
+        // Execute the query and return all rows
+        const existingSubjects = await connection.query(checkExistingQuery, checkExistingParams);
+
+        // Create an array of existing subject IDs for filtering
+        const existingSubjectIds = existingSubjects.map(row => row.id);
+
+        // console.log("Existing subject IDs:", existingSubjectIds);
+
+        // Filter out the existing subjects from the subject_id array
+        const remainingSubjects = subject_id.filter(id => !existingSubjectIds.includes(id));
+
+        // If there are remaining subjects to insert
+        if (remainingSubjects.length > 0) {
+            // Perform the bulk insert operation with only the remaining subjects
+            const values = remainingSubjects.map(id => [id, teacher_id, campus_id, session_id, shift]);
+            const bulkInsertQuery = "INSERT INTO assing_subjects_class_teacher (assign_subject_class_id, teacher_id, campus_id, session_id, shift) VALUES ?";
+
+            await connection.query(bulkInsertQuery, [values]);
+
+            return res.status(200).json({ message: "Subjects assigned successfully" });
+        } else {
+            // If no subjects are remaining to be inserted
+            return res.status(400).json({ error: "All selected subjects are already assigned to this teacher" });
+        }
+
+
+    }
+  } catch (error) {
+    console.error("Error inserting/updating data:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+
+
+
+
+
+// app.post('/insert-homework', upload.single('homework_file'), (req, res) => {
+
+//   const {
+//     admission_id,
+//     home_work_date,
+//     description,
+//     session_id,
+//     campus_id,
+//   } = req.body;
+
+//   // Validate required fields
+//   if (!admission_id && req.file !== undefined) {
+//     console.log("hitted");
+//     // Clean up uploaded file if validation fails
+//     if (req.file) {
+//       fs.unlink(req.file.path, (err) => {
+//         if (err) console.error('Error deleting file:', err);
+//       });
+//     }
+//     return res.status(400).json({ error: 'Missing required fields' });
+//   }
+//    let homework_file = '';
+//   // Get file path
+//   if( req.file !== undefined){
+//    homework_file = req.file.path;
+//   }else{
+//     homework_file = '';
+//   }
+ 
+
+//   // Insert homework into database
+//   const insertQuery = `
+//     INSERT INTO homework (
+//       assing_subjects_class_teacher_id,
+//       home_work_date,
+//       description,
+//       session_id,
+//       campus_id,
+//       homework_file
+//     ) VALUES (?, ?, ?, ?, ?, ?)
+//   `;
+
+//   const values = [
+//     admission_id,
+//     home_work_date,
+//     description,
+//     session_id,
+//     campus_id,
+//     homework_file
+//   ];
+
+//   connection.query(insertQuery, values, (err, result) => {
+//     if (err) {
+//       console.error('Error inserting homework:', err);
+//       // Delete the uploaded file if DB insert fails
+//       fs.unlink(homework_file, (unlinkErr) => {
+//         if (unlinkErr) console.error('Error deleting file:', unlinkErr);
+//       });
+//       return res.status(500).json({ error: 'Failed to insert homework' });
+//     }
+
+//     res.json({
+//       success: true,
+//       message: 'Homework submitted successfully',
+//       homework_id: result.insertId
+//     });
+//   });
+// });
+
+
+
+// app.post('/insert-homework', upload.single('homework_file'), (req, res) => {
+//   const {
+//     admission_id,
+//     home_work_date,
+//     description,
+//     session_id,
+//     campus_id,
+//   } = req.body;
+
+//   // Validate required fields
+//   if (!admission_id && req.file !== undefined) {
+//     console.log("hitted");
+//     // Clean up uploaded file if validation fails
+//     if (req.file) {
+//       fs.unlink(req.file.path, (err) => {
+//         if (err) console.error('Error deleting file:', err);
+//       });
+//     }
+//     return res.status(400).json({ error: 'Missing required fields' });
+//   }
+
+//   let homework_file = '';
+//   // Generate timestamp if file exists
+//   if (req.file !== undefined) {
+//     // Generate timestamp (you can format it as you prefer)
+//     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+//     homework_file = timestamp;
+    
+//     // Optional: Rename the file with the timestamp
+//     const newPath = path.join(path.dirname(req.file.path), timestamp + path.extname(req.file.path));
+//     fs.rename(req.file.path, newPath, (err) => {
+//       if (err) console.error('Error renaming file:', err);
+//     });
+//     // If you want to keep the original path but just store timestamp in DB:
+//     // homework_file = timestamp;
+//     // The file will remain with its original name on disk
+//   }
+
+//   // Insert homework into database
+//   const insertQuery = `
+//     INSERT INTO homework (
+//       assing_subjects_class_teacher_id,
+//       home_work_date,
+//       description,
+//       session_id,
+//       campus_id,
+//       homework_file
+//     ) VALUES (?, ?, ?, ?, ?, ?)
+//   `;
+
+//   const values = [
+//     admission_id,
+//     home_work_date,
+//     description,
+//     session_id,
+//     campus_id,
+//     homework_file
+//   ];
+
+//   connection.query(insertQuery, values, (err, result) => {
+//     if (err) {
+//       console.error('Error inserting homework:', err);
+//       // Delete the uploaded file if DB insert fails
+//       if (req.file) {
+//         fs.unlink(req.file.path, (unlinkErr) => {
+//           if (unlinkErr) console.error('Error deleting file:', unlinkErr);
+//         });
+//       }
+//       return res.status(500).json({ error: 'Failed to insert homework' });
+//     }
+
+//     res.json({
+//       success: true,
+//       message: 'Homework submitted successfully',
+//       homework_id: result.insertId
+//     });
+//   });
+// });
+
+
+
+// app.put('/update-homework/:id', upload.single('homework_file'), (req, res) => {
+//   const homeworkId = req.params.id;
+//   const {
+//     admission_id,
+//     home_work_date,
+//     description,
+//     session_id,
+//     campus_id,
+//     current_file    // To track existing file reference (now a timestamp)
+//   } = req.body;
+
+//   // Validate required fields
+//   if (!admission_id || !homeworkId) {
+//     // Clean up uploaded file if validation fails
+//     if (req.file) {
+//       fs.unlink(req.file.path, (err) => {
+//         if (err) console.error('Error deleting file:', err);
+//       });
+//     }
+//     return res.status(400).json({ error: 'Missing required fields' });
+//   }
+
+//   // Prepare update values
+//   let homework_file = current_file; // Default to existing timestamp
+//   let newFilePath = null;
+
+//   if (req.file) {
+//     // Generate new timestamp for the updated file
+//     const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+//     homework_file = timestamp;
+    
+//     // Rename the uploaded file with the timestamp
+//     newFilePath = path.join(path.dirname(req.file.path), timestamp + path.extname(req.file.path));
+//     fs.rename(req.file.path, newFilePath, (err) => {
+//       if (err) console.error('Error renaming file:', err);
+//     });
+//   }
+
+//   const updateQuery = `
+//     UPDATE homework
+//     SET
+//       assing_subjects_class_teacher_id = ?,
+//       home_work_date = ?,
+//       description = ?,
+//       session_id = ?,
+//       campus_id = ?,
+//       homework_file = ?
+//     WHERE id = ?
+//   `;
+
+//   const values = [
+//     admission_id,
+//     home_work_date,
+//     description,
+//     session_id,
+//     campus_id,
+//     homework_file,
+//     homeworkId
+//   ];
+
+//   connection.query(updateQuery, values, (err, result) => {
+//     if (err) {
+//       console.error('Error updating homework:', err);
+//       // Delete the new uploaded file if DB update fails
+//       if (newFilePath) {
+//         fs.unlink(newFilePath, (unlinkErr) => {
+//           if (unlinkErr) console.error('Error deleting new file:', unlinkErr);
+//         });
+//       }
+//       return res.status(500).json({ error: 'Failed to update homework' });
+//     }
+
+//     res.json({
+//       success: true,
+//       message: 'Homework updated successfully',
+//       homework_id: homeworkId
+//     });
+//   });
+// });
+
+
+
+
+app.post('/insert-homework', upload.single('homework_file'), (req, res) => {
+  const {
+    admission_id,
+    home_work_date,
+    description,
+    session_id,
+    campus_id,
+    class_id,
+    section_id,
+    shift,
+  } = req.body;
+
+  // Validate required fields
+  if (!admission_id && req.file !== undefined) {
+    console.log("hitted");
+    // Clean up uploaded file if validation fails
+    if (req.file) {
+      fs.unlink(req.file.path, (err) => {
+        if (err) console.error('Error deleting file:', err);
+      });
+    }
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  let homework_file = '';
+  // Generate timestamp if file exists
+  if (req.file !== undefined) {
+    // Generate timestamp (you can format it as you prefer)
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    // Get the file extension from the original file
+    const fileExtension = path.extname(req.file.originalname);
+    homework_file = timestamp + fileExtension;
+    
+    // Rename the file with the timestamp and original extension
+    const newPath = path.join(path.dirname(req.file.path), homework_file);
+    fs.rename(req.file.path, newPath, (err) => {
+      if (err) console.error('Error renaming file:', err);
+    });
+  }
+
+  // Rest of your code remains the same...
+  const insertQuery = `
+    INSERT INTO homework (
+      assing_subjects_class_teacher_id,
+      home_work_date,
+      description,
+      session_id,
+      campus_id,
+      class_id,
+      section_id,
+      shift,
+      homework_file
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `;
+
+  const values = [
+    admission_id,
+    home_work_date,
+    description,
+    session_id,
+    campus_id,
+    class_id,
+    section_id,
+    shift,
+    homework_file
+  ];
+
+  connection.query(insertQuery, values, (err, result) => {
+    if (err) {
+      console.error('Error inserting homework:', err);
+      return res.status(500).json({ error: 'Failed to insert homework' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Homework submitted successfully',
+      homework_id: result.insertId
+    });
+  });
+});
+
+
+
+
+app.put('/update-homework/:id', upload.single('homework_file'), (req, res) => {
+  const homeworkId = req.params.id;
+  const {
+    admission_id,
+    home_work_date,
+    description,
+    session_id,
+    campus_id,
+    class_id,
+    section_id,
+    shift,
+    current_file    // To track existing file reference (now a timestamp)
+  } = req.body;
+
+  // Validate required fields
+  if (!admission_id || !homeworkId) {
+    // Clean up uploaded file if validation fails
+    if (req.file) {
+      fs.unlink(req.file.path, (err) => {
+        if (err) console.error('Error deleting file:', err);
+      });
+    }
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+
+  // Prepare update values
+  let homework_file = current_file; // Default to existing timestamp
+  let newFilePath = null;
+
+  if (req.file) {
+    // Generate new timestamp for the updated file
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    // Get the file extension from the original file
+    const fileExtension = path.extname(req.file.originalname);
+    homework_file = timestamp + fileExtension;
+    
+    // Rename the uploaded file with the timestamp and extension
+    newFilePath = path.join(path.dirname(req.file.path), homework_file);
+    fs.rename(req.file.path, newFilePath, (err) => {
+      if (err) console.error('Error renaming file:', err);
+    });
+  }
+
+  // Rest of your code remains the same...
+  const updateQuery = `
+    UPDATE homework
+    SET
+      assing_subjects_class_teacher_id = ?,
+      home_work_date = ?,
+      description = ?,
+      session_id = ?,
+      campus_id = ?,
+      class_id = ?,
+      section_id = ?,
+      shift = ?,
+      homework_file = ?
+    WHERE id = ?
+  `;
+
+  const values = [
+    admission_id,
+    home_work_date,
+    description,
+    session_id,
+    campus_id,
+    class_id,
+    section_id,
+    shift,
+    homework_file,
+    homeworkId
+  ];
+
+  connection.query(updateQuery, values, (err, result) => {
+    if (err) {
+      console.error('Error updating homework:', err);
+      // Delete the new uploaded file if DB update fails
+      if (newFilePath) {
+        fs.unlink(newFilePath, (unlinkErr) => {
+          if (unlinkErr) console.error('Error deleting new file:', unlinkErr);
+        });
+      }
+      return res.status(500).json({ error: 'Failed to update homework' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Homework updated successfully',
+      homework_id: homeworkId
+    });
+  });
+});
+
+
+
+
+// app.get("/homework-list", (req, res) => {
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 10;
+//   const search = req.query.search || "";
+//   const search_date = req.query.search_date || "";
+//   const offset = (page - 1) * limit;
+//   const { campus_id, session_id } = req.query;
+
+//   const shift = req.query.shift || "";
+//   const class_id = req.query.class_id || "";
+//   const section_id = req.query.section_id || "";
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching homework list" });
+//       return;
+//     }
+
+//     // Base SQL with search conditions
+//     let sql = `
+//       SELECT hw.*, 
+//         c.class as class_name, 
+//         s.section_name, 
+//         sub.subjects
+//       FROM homework hw
+//       JOIN assing_subjects_class_teacher tch ON hw.assing_subjects_class_teacher_id = tch.id
+//       JOIN assing_subjects_class ascl ON tch.assign_subject_class_id = ascl.id
+//       JOIN subjects sub ON ascl.subject_id = sub.id
+//       JOIN classes c ON ascl.class_id = c.id
+//       JOIN sections s ON ascl.section_id = s.id
+//       WHERE hw.campus_id = ? AND hw.session_id = ?
+//     `;
+
+//     let countSql = `
+//       SELECT COUNT(*) as total
+//       FROM homework hw
+//       WHERE hw.campus_id = ? AND hw.session_id = ?
+//     `;
+
+//     // Parameters array for both queries
+//     let params = [campus_id, session_id];
+//     let countParams = [campus_id, session_id];
+
+//     // Add search conditions if search term is provided
+//     if (search) {
+//       sql += ` AND (sub.subjects LIKE ? OR c.class LIKE ? OR s.section_name LIKE ? OR hw.description LIKE ?)`;
+//       countSql += ` AND EXISTS (
+//         SELECT 1 FROM assing_subjects_class_teacher tch 
+//         JOIN assing_subjects_class ascl ON tch.assign_subject_class_id = ascl.id
+//         JOIN subjects sub ON ascl.subject_id = sub.id
+//         JOIN classes c ON ascl.class_id = c.id
+//         JOIN sections s ON ascl.section_id = s.id
+//         WHERE hw.assing_subjects_class_teacher_id = tch.id
+//         AND (sub.subjects LIKE ? OR c.class LIKE ? OR s.section_name LIKE ? OR hw.description LIKE ?)
+//       )`;
+      
+//       const searchTerm = `%${search}%`;
+//       params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+//       countParams.push(searchTerm, searchTerm, searchTerm, searchTerm);
+//     }
+
+//     // Add date search condition if search_date is provided
+//     if (search_date) {
+//       sql += ` AND DATE(hw.home_work_date) = ?`;
+//       countSql += ` AND DATE(hw.home_work_date) = ?`;
+//       params.push(search_date);
+//       countParams.push(search_date);
+//     }
+
+//     // Add sorting and pagination to main query
+//     sql += ` ORDER BY hw.id DESC LIMIT ? OFFSET ?`;
+//     params.push(limit, offset);
+
+//     // Execute the main query
+//     connection.query(sql, params, (error, results) => {
+//       if (error) {
+//         console.error("Error executing SQL query: ", error);
+//         res.status(500).json({ error: "Internal server error" });
+//         connection.release();
+//         return;
+//       }
+
+//       // Execute the count query
+//       connection.query(countSql, countParams, (countError, countResult) => {
+//         connection.release();
+
+//         if (countError) {
+//           console.error("Error executing count SQL query: ", countError);
+//           res.status(500).json({ error: "Internal server error" });
+//           return;
+//         }
+
+//         const total = countResult[0].total;
+//         const totalPages = Math.ceil(total / limit);
+
+//         // Send paginated results and pagination metadata as JSON
+//         res.json({
+//           success: true,
+//           data: results,
+//           total: total,
+//           page: page,
+//           totalPages: totalPages
+//         });
+//       });
+//     });
+//   });
+// });
+
+
+
+app.get("/homework-list", (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 10;
+  const search = req.query.search || "";
+  const search_date = req.query.search_date || "";
+  const offset = (page - 1) * limit;
+  const { campus_id, session_id } = req.query;
+
+  const shift = req.query.shift || "";
+  const class_id = req.query.class_id || "";
+  const section_id = req.query.section_id || "";
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching homework list" });
+      return;
+    }
+
+    // Base SQL with your original structure but filtering on homework table fields
+    let sql = `
+      SELECT hw.*, 
+        c.class as class_name, 
+        s.section_name, 
+        sub.subjects
+      FROM homework hw
+      JOIN assing_subjects_class_teacher tch ON hw.assing_subjects_class_teacher_id = tch.id
+      JOIN assing_subjects_class ascl ON tch.assign_subject_class_id = ascl.id
+      JOIN subjects sub ON ascl.subject_id = sub.id
+      JOIN classes c ON ascl.class_id = c.id
+      JOIN sections s ON ascl.section_id = s.id
+      WHERE hw.campus_id = ? AND hw.session_id = ?
+    `;
+
+    let countSql = `
+      SELECT COUNT(*) as total
+      FROM homework hw
+      WHERE hw.campus_id = ? AND hw.session_id = ?
+    `;
+
+    // Parameters array for both queries
+    let params = [campus_id, session_id];
+    let countParams = [campus_id, session_id];
+
+    // Add shift filter (from homework table)
+    if (shift) {
+      sql += ` AND hw.shift = ?`;
+      countSql += ` AND hw.shift = ?`;
+      params.push(shift);
+      countParams.push(shift);
+    }
+
+    // Add class_id filter (from homework table)
+    if (class_id) {
+      sql += ` AND hw.class_id = ?`;
+      countSql += ` AND hw.class_id = ?`;
+      params.push(class_id);
+      countParams.push(class_id);
+    }
+
+    // Add section_id filter (from homework table)
+    if (section_id) {
+      sql += ` AND hw.section_id = ?`;
+      countSql += ` AND hw.section_id = ?`;
+      params.push(section_id);
+      countParams.push(section_id);
+    }
+
+    // Add search conditions if search term is provided
+    if (search) {
+      sql += ` AND (sub.subjects LIKE ? OR c.class LIKE ? OR s.section_name LIKE ? OR hw.description LIKE ?)`;
+      countSql += ` AND EXISTS (
+        SELECT 1 FROM assing_subjects_class_teacher tch 
+        JOIN assing_subjects_class ascl ON tch.assign_subject_class_id = ascl.id
+        JOIN subjects sub ON ascl.subject_id = sub.id
+        JOIN classes c ON ascl.class_id = c.id
+        JOIN sections s ON ascl.section_id = s.id
+        WHERE hw.assing_subjects_class_teacher_id = tch.id
+        AND (sub.subjects LIKE ? OR c.class LIKE ? OR s.section_name LIKE ? OR hw.description LIKE ?)
+      )`;
+      
+      const searchTerm = `%${search}%`;
+      params.push(searchTerm, searchTerm, searchTerm, searchTerm);
+      countParams.push(searchTerm, searchTerm, searchTerm, searchTerm);
+    }
+
+    // Add date search condition if search_date is provided
+    if (search_date) {
+      sql += ` AND DATE(hw.home_work_date) = ?`;
+      countSql += ` AND DATE(hw.home_work_date) = ?`;
+      params.push(search_date);
+      countParams.push(search_date);
+    }
+
+    // Add sorting and pagination to main query
+    sql += ` ORDER BY hw.id DESC LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+
+    // Execute the main query
+    connection.query(sql, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release();
+        return;
+      }
+
+      // Execute the count query
+      connection.query(countSql, countParams, (countError, countResult) => {
+        connection.release();
+
+        if (countError) {
+          console.error("Error executing count SQL query: ", countError);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        const total = countResult[0].total;
+        const totalPages = Math.ceil(total / limit);
+
+        res.json({
+          success: true,
+          data: results,
+          total: total,
+          page: page,
+          totalPages: totalPages
+        });
+      });
+    });
+  });
+});
+
+
+// Route to fetch bank notes list
+app.get("/bank-notes-list", async (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+
+  try {
+    let sql = `SELECT id, note_title, note_description, status, session_id, campus_id, user_id, created_at, updated_at 
+               FROM bank_notes WHERE campus_id = ?`;
+    let countSql = `SELECT COUNT(*) AS total FROM bank_notes`;
+
+    const params = [];
+
+    if (search_data) {
+      sql += ` AND note_title LIKE ? OR note_description LIKE ?`;
+      countSql += ` WHERE note_title LIKE ? OR note_description LIKE ?`;
+      params.push(`%${search_data}%`, `%${search_data}%`);
+    }
+
+    sql += ` LIMIT ? OFFSET ?`;
+    params.push(campus_id, limit, offset);
+
+    const [dataResults, countResult] = await Promise.all([
+      connection.query(sql, params),
+      connection.query(countSql, params.slice(0, params.length - 2)), // Count query does not need limit and offset
+    ]);
+
+    const total = countResult[0].total;
+    const totalPages = Math.ceil(total / limit);
+
+    res.json({
+      total,
+      currentPage: page,
+      totalPages,
+      results: dataResults,
+    });
+  } catch (error) {
+    console.error("Error fetching bank notes:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.delete("/delete-bank-note/:id", (req, res) => {
+  const id_get = parseInt(req.params.id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+      d;
+    }
+
+    const sql = "DELETE FROM bank_notes WHERE id = ?";
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting:", error);
+        res.status(500).json({ error: "Error deleting" });
+      } else {
+        console.log("Deleted successfully");
+        res.status(200).json({ message: "Deleted successfully" });
+      }
+    });
+  });
+});
+
+app.get("/fee-head-details-get/:fee_head_detail_id", (req, res) => {
+  const fee_head_detail_id = parseInt(req.params.fee_head_detail_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+      d;
+    }
+
+    const sql = "SELECT * FROM fee_head_details WHERE id = ?";
+    const values = [fee_head_detail_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting:", error);
+        res.status(500).json(error);
+      } else {
+        console.log("Deleted successfully");
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+app.get("/fee-head-details-list", (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id;
+
+  console.log("this is campus_id", campus_id);
+
+  
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching data" });
+      return;
+    }
+
+    let sql = `SELECT fee_head_details.*, heads.head_name, school_categories.category, fee_groups.fee_group_name 
+               FROM fee_head_details
+               JOIN heads ON fee_head_details.fee_head_id = heads.id
+               JOIN school_categories ON fee_head_details.category_id = school_categories.id
+               JOIN fee_groups ON fee_head_details.fee_group_id = fee_groups.id`;
+
+    if (search_data) {
+      sql += ` WHERE (heads.head_name LIKE ? 
+                    OR school_categories.category LIKE ? 
+                    OR fee_groups.fee_group_name LIKE ?)`;
+    }
+
+    sql += ` AND fee_head_details.campus_id = ? 
+             ORDER BY fee_head_details.id ASC 
+             LIMIT ? OFFSET ?`;
+
+    // Parameters for main query
+    const queryParams = search_data
+      ? [
+          `%${search_data}%`,
+          `%${search_data}%`,
+          `%${search_data}%`,
+          campus_id, // Add campus_id here
+          limit,
+          offset,
+        ]
+      : [campus_id, limit, offset];
+
+    // Query to get total count of items
+    let countSql = `SELECT COUNT(*) AS total 
+                    FROM fee_head_details
+                    JOIN heads ON fee_head_details.fee_head_id = heads.id
+                    JOIN school_categories ON fee_head_details.category_id = school_categories.id
+                    JOIN fee_groups ON fee_head_details.fee_group_id = fee_groups.id`;
+
+    if (search_data) {
+      countSql += ` WHERE (heads.head_name LIKE ? 
+                        OR school_categories.category LIKE ? 
+                        OR fee_groups.fee_group_name LIKE ?)`;
+                      }
+
+    countSql += ` AND fee_head_details.campus_id = ?`;
+
+    const countParams = search_data
+      ? [`%${search_data}%`, `%${search_data}%`, `%${search_data}%`, campus_id]
+      : [campus_id];
+
+    // Execute queries in parallel
+    Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(sql, queryParams, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results);
+          }
+        });
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(countSql, countParams, (error, results) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve(results[0].total);
+          }
+        });
+      }),
+    ])
+      .then(([results, total]) => {
+        connection.release(); // Release the connection
+
+        const totalPages = Math.ceil(total / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          total,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      })
+      .catch((error) => {
+        connection.release(); // Release the connection
+        console.error("Error executing SQL queries: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      });
+  });
+});
+
+// app.get("/fee-head-details-list", (req, res) => {
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const search_data = req.query.search;
+
+//   const campus_id = req.query.campus_id;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching data" });
+//       return;
+//     }
+
+//     let sql = `SELECT fee_head_details.*, heads.head_name, school_categories.category, fee_groups.fee_group_name 
+//                FROM fee_head_details
+//               JOIN heads ON fee_head_details.fee_head_id = heads.id
+//                 JOIN school_categories ON fee_head_details.category_id = school_categories.id
+//                 JOIN fee_groups ON fee_head_details.fee_group_id = fee_groups.id `;
+
+//     if (search_data) {
+//       sql += ` WHERE heads.head_name LIKE ? 
+//                OR school_categories.category LIKE ?
+//                OR fee_groups.fee_group_name LIKE ?`;
+//     }
+
+//     sql += ` campus_id = ? ORDER BY fee_head_details.category_id ASC LIMIT ? OFFSET ?`;
+
+//     // Parameters for main query
+//     const queryParams = search_data
+//       ? [
+//           `%${search_data}%`,
+//           `%${search_data}%`,
+//           `%${search_data}%`,
+//           limit,
+//           offset,
+//         ]
+//       : [campus_id, limit, offset];
+
+//     // Query to get total count of items
+//     let countSql = `SELECT COUNT(*) AS total 
+//                     FROM fee_head_details
+//                      JOIN heads ON fee_head_details.fee_head_id = heads.id
+//                      JOIN school_categories ON fee_head_details.category_id = school_categories.id
+//                      JOIN fee_groups ON fee_head_details.fee_group_id = fee_groups.id`;
+
+//     if (search_data) {
+//       countSql += ` WHERE heads.head_name LIKE ? 
+//                    OR school_categories.category LIKE ?
+//                    OR fee_groups.fee_group_name LIKE ?`;
+//     }
+
+//     const countParams = search_data
+//       ? [`%${search_data}%`, `%${search_data}%`, `%${search_data}%`]
+//       : [];
+
+//     // Execute queries in parallel
+//     Promise.all([
+//       new Promise((resolve, reject) => {
+//         connection.query(sql, queryParams, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results);
+//           }
+//         });
+//       }),
+//       new Promise((resolve, reject) => {
+//         connection.query(countSql, countParams, (error, results) => {
+//           if (error) {
+//             reject(error);
+//           } else {
+//             resolve(results[0].total);
+//           }
+//         });
+//       }),
+//     ])
+//       .then(([results, total]) => {
+//         connection.release(); // Release the connection
+
+//         const totalPages = Math.ceil(total / limit);
+
+//         // Send paginated results and pagination metadata as JSON
+//         res.json({
+//           total,
+//           currentPage: page,
+//           totalPages,
+//           results,
+//         });
+//       })
+//       .catch((error) => {
+//         connection.release(); // Release the connection
+//         console.error("Error executing SQL queries: ", error);
+//         res.status(500).json({ error: "Internal server error" });
+//       });
+//   });
+// });
+
+// app.delete('/delete-fee-head-details/:id_get', (req, res) => {
+//   const id_get = parseInt(req.params.id_get);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error deleting' });
+//       return;
+//     }
+
+//     const sql = 'DELETE FROM fee_head_details WHERE id = ?';
+//     const values = [id_get];
+
+//     connection.query(sql, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error deleting:', error);
+//         res.status(500).json({ error: 'Error deleting' });
+//       } else {
+//         console.log('Deleted successfully');
+//         res.status(200).json({ message: 'Deleted successfully' });
+//       }
+//     });
+//   });
+// });
+
+app.delete("/soft-delete-fee-head-details/:id_get/:status", (req, res) => {
+  const id_get = parseInt(req.params.id_get);
+  const currentStatus = req.params.status;
+
+  // Determine the new status based on the current status
+  const newStatus = currentStatus === "On" ? "Off" : "On";
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    const sql = "UPDATE fee_head_details SET status = ? WHERE id = ?";
+    const values = [newStatus, id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating status:", error);
+        res.status(500).json({ error: "Error updating status" });
+      } else {
+        console.log("Status updated successfully");
+        res.status(200).json({ message: "Status updated successfully" });
+      }
+    });
+  });
+});
+
+app.get("/soft-delete-bank-notes/:id_get/:status", (req, res) => {
+  const id_get = parseInt(req.params.id_get);
+  const currentStatus = req.params.status;
+
+  // Determine the new status based on the current status
+  const newStatus = currentStatus === "On" ? "Off" : "On";
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    const sql = "UPDATE bank_notes SET status = ? WHERE id = ?";
+    const values = [newStatus, id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating status:", error);
+        res.status(500).json({ error: "Error updating status" });
+      } else {
+        console.log("Status updated successfully");
+        res.status(200).json({ message: "Status updated successfully" });
+      }
+    });
+  });
+});
+
+app.get("/soft-delete-heads/:id_get/:status", (req, res) => {
+  const id_get = parseInt(req.params.id_get);
+  const currentStatus = req.params.status;
+
+  // Determine the new status based on the current status
+  const newStatus = currentStatus === "On" ? "Off" : "On";
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    const sql = "UPDATE heads SET status = ? WHERE id = ?";
+    const values = [newStatus, id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating status:", error);
+        res.status(500).json({ error: "Error updating status" });
+      } else {
+        console.log("Status updated successfully");
+        res.status(200).json({ message: "Status updated successfully" });
+      }
+    });
+  });
+});
+
+app.delete("/soft-delete-bank-details/:id_get/:status", (req, res) => {
+  const id_get = parseInt(req.params.id_get);
+  const currentStatus = req.params.status;
+
+  // Determine the new status based on the current status
+  const newStatus = currentStatus === "On" ? "Off" : "On";
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    const sql = "UPDATE bank_details SET status = ? WHERE id = ?";
+    const values = [newStatus, id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating status:", error);
+        res.status(500).json({ error: "Error updating status" });
+      } else {
+        console.log("Status updated successfully");
+        res.status(200).json({ message: "Status updated successfully" });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.get("/get-banks", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching banks" });
+      return;
+    }
+    const sql = "SELECT * FROM banks";
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+// Updated endpoint to accept query parameters
+app.get("/get-bank_accounts", (req, res) => {
+  const { campus_id } = req.query; // Extract campus_id from query parameters
+
+  connection.getConnection((err, connection) => {
+      if (err) {
+          console.error("Error getting connection:", err);
+          res.status(500).json({ error: "Error fetching bank accounts" });
+          return;
+      }
+
+      // Base SQL query
+      let sql = "SELECT * FROM bank_details INNER JOIN banks on banks.id = bank_details.bank_id";
+      const sqlParams = [];
+
+      // Add WHERE clause if campus_id is provided
+      if (campus_id) {
+          sql += " WHERE campus_id = ?";
+          sqlParams.push(campus_id);
+      }
+
+      connection.query(sql, sqlParams, (error, results) => {
+          connection.release(); // Release the connection back to the pool
+
+          if (error) {
+              console.error("Error executing SQL query:", error);
+              res.status(500).json({ error: "Internal server error" });
+          } else {
+              res.json({ results });
+          }
+      });
+  });
+});
+
+
+
+
+
+
+
+app.get("/get-account-main-heads", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching main heads" });
+      return;
+    }
+    const sql = "SELECT * FROM main_head_coa";
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.post('/insert-charts-of-account-head', async (req, res) => {
+  const { main_head_id, code, level, name } = req.body;
+
+  // Validate inputs
+  if (!main_head_id || !level || !name) {
+      return res.status(400).json({ error: 'main_head_id, level, and name are required.' });
+  }
+
+  try {
+      let newCode;
+      let parentCode;
+
+      // Case 1: sub_head_id is empty
+      if (!code || code.trim() === '') { 
+          const rows = await connection.query(
+              'SELECT code FROM sub_head_coa WHERE main_head_id = ? AND level = ? ORDER BY code DESC LIMIT 1',
+              [main_head_id, level]
+          );
+          if (rows.length > 0) {
+              // Increment the last code
+              const lastCode = rows[0].code;
+              newCode = `${(lastCode + 1)}`;
+          } else {
+              // Generate the first code for this main_head_id
+              newCode = `${main_head_id}1`;
+          }
+          parentCode = main_head_id;
+      }
+
+      // Case 2: sub_head_id is not empty
+      else {
+          const rows = await connection.query(
+              'SELECT code FROM sub_head_coa WHERE main_head_id = ? AND parent_code = ? ORDER BY code DESC LIMIT 1',
+              [main_head_id, code]
+          );
+
+          if (rows.length > 0) {
+              // Increment the last code
+              const lastCode = rows[0].code;
+              newCode = `${lastCode + 1}`;
+          } else {
+              // Generate the first code for this main_head_id and sub_head_id
+              newCode = `${code}01`;
+          }
+
+          parentCode = code;
+      }
+
+      // Insert the new record
+      await connection.query(
+          'INSERT INTO sub_head_coa (main_head_id, level, parent_code, code, name) VALUES (?, ?, ?, ?, ?)',
+          [main_head_id, level, parentCode, newCode, name]
+      );
+
+      res.status(201).json({ message: 'Record inserted successfully', code: newCode });
+  } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: 'Failed to insert record' });
+  }
+});
+
+
+
+
+
+
+
+
+
+
+
+app.get("/get-account-sub-heads/:main_head_id", (req, res) => {
+  const main_head_id = req.params.main_head_id; // Destructure to avoid redundancy
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error establishing connection:", err);
+      res.status(500).json({ error: "Error fetching sub heads" });
+      return;
+    }
+
+    const sql = "SELECT * FROM sub_head_coa WHERE main_head_id = ? ORDER BY code ASC";
+
+    connection.query(sql, [main_head_id], (error, results) => {
+      // Release the connection immediately after querying
+      connection.release();
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.status(200).json({ results }); // Use status(200) explicitly for success
+      }
+    });
+  });
+});
+
+
+
+
+
+app.get("/get-pay-scale", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching pay scale" });
+      return;
+    }
+    const sql = "SELECT * FROM pay_scale";
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results });
+      }
+    });
+  });
+});
+
+app.get("/get-salary-data-scale-wise/:id", (req, res) => {
+  const id = req.params.id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching salary data" });
+      return;
+    }
+
+    const sql =
+      "SELECT * FROM pay_scale_wise_basic_salary WHERE pay_scale_id = ?";
+
+    connection.query(sql, [id], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching salary data" });
+      } else {
+        console.log("Fetch Successful");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+
+app.get("/get-sections/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching sections" });
+      return;
+    }
+
+    const sql = 'SELECT * FROM sections WHERE campus_id = ? AND status = "On"';
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching sections" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.post('/bulk-insert-timetable', (req, res) => {
+  const rows = req.body;
+
+  // Split rows into those needing updates and those needing inserts
+  const rowsToUpdate = rows.filter(row => row.id !== undefined && row.id !== null && row.id !== '');
+  const rowsToInsert = rows.filter(row => row.id === undefined || row.id === null ||  row.id == '');
+
+
+  console.log(rowsToUpdate, "for update");
+  console.log(rowsToInsert, "for insert");
+
+  // Get a connection from the pool
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error('Error getting connection:', err);
+      return res.status(500).send({ error: 'Database connection error.' });
+    }
+
+    // Begin a transaction
+    connection.beginTransaction(err => {
+      if (err) {
+        connection.release();
+        console.error('Transaction error:', err);
+        return res.status(500).send({ error: 'Could not start transaction.' });
+      }
+
+      // Create an array of update promises using callbacks wrapped in Promises.
+      const updatePromises = rowsToUpdate.map(row => {
+        return new Promise((resolve, reject) => {
+          const updateSql = `
+            UPDATE school_time_table 
+            SET subject_id = ?,
+                teacher_id = ?,
+                time_from = ?,
+                time_to = ?,
+                room_no = ?,
+                campus_id = ?,
+                session_id = ?,
+                shift = ?,
+                class_id = ?,
+                section_id = ?,
+                day = ?,
+                period = ?
+            WHERE id = ?`;
+          const updateData = [
+            row.subject,
+            row.teacher,
+            row.timeFrom,
+            row.timeTo,
+            row.roomNo,
+            row.campus_id,
+            row.session_id,
+            row.shift,
+            row.class_id,
+            row.section_id,
+            row.day,
+            row.period,
+            row.id
+          ];
+
+          connection.query(updateSql, updateData, (err, result) => {
+            if (err) {
+              return reject(err);
+            }
+            resolve(result);
+          });
+        });
+      });
+
+      // Execute update queries
+      Promise.all(updatePromises)
+        .then(() => {
+          // If we have rows to insert, prepare a bulk insert query
+          if (rowsToInsert.length > 0) {
+            // Prepare insert data
+            // Note: Adjust column names/order as per your table definition.
+            const insertValues = rowsToInsert.map(row => [
+              row.subject,
+              row.teacher,
+              row.timeFrom,
+              row.timeTo,
+              row.roomNo,
+              row.campus_id,
+              row.session_id,
+              row.shift,
+              row.class_id,
+              row.section_id,
+              row.day,
+              row.period
+            ]);
+            const insertSql = `
+              INSERT INTO school_time_table 
+                (subject_id, teacher_id, time_from, time_to, room_no, campus_id, session_id, shift, class_id, section_id, day, period)
+              VALUES ?`;
+
+            connection.query(insertSql, [insertValues], (err, result) => {
+              if (err) {
+                // Rollback on error
+                return connection.rollback(() => {
+                  connection.release();
+                  console.error('Insert error:', err);
+                  res.status(500).send({ error: err.message });
+                });
+              }
+
+              // Commit transaction if insert succeeds
+              connection.commit(err => {
+                if (err) {
+                  return connection.rollback(() => {
+                    connection.release();
+                    console.error('Commit error:', err);
+                    res.status(500).send({ error: err.message });
+                  });
+                }
+                connection.release();
+                res.send({ message: 'Timetable upserted successfully.' });
+              });
+            });
+          } else {
+            // If no inserts, just commit the transaction after updates
+            connection.commit(err => {
+              if (err) {
+                return connection.rollback(() => {
+                  connection.release();
+                  console.error('Commit error:', err);
+                  res.status(500).send({ error: err.message });
+                });
+              }
+              connection.release();
+              res.send({ message: 'Timetable upserted successfully.' });
+            });
+          }
+        })
+        .catch(err => {
+          // If any update fails, rollback the transaction
+          connection.rollback(() => {
+            connection.release();
+            console.error('Update error:', err);
+            res.status(500).send({ error: err.message });
+          });
+        });
+    });
+  });
+});
+
+
+// app.post('/bulk-insert-timetable', async (req, res) => {
+//   try {
+//       const timetableData = req.body;
+
+//       if (!Array.isArray(timetableData) || timetableData.length === 0) {
+//           return res.status(400).json({ message: "Invalid data format or empty array" });
+//       }
+
+//       // SQL INSERT (assumes MySQL or PostgreSQL)
+//       const values = timetableData.map(item => [
+//           item.subject,
+//           item.teacher,
+//           item.timeFrom || null,
+//           item.timeTo || null,
+//           item.roomNo || null,
+//           item.campus_id,
+//           item.session_id,
+//           item.shift,
+//           item.class_id,  
+//           item.section_id,
+//           item.day
+//       ]);
+
+//       const sql = `
+//           INSERT INTO school_time_table (subject_id, teacher_id, time_from, time_to, room_no, campus_id, session_id, shift, class_id, section_id, day)
+//           VALUES ?
+//       `;
+
+//       // For MySQL (bulk insert format)
+//       connection.query(sql, [values], (err, result) => {
+//           if (err) {
+//               console.error("Insert Error:", err);
+//               return res.status(500).json({ message: "Database error", error: err });
+//           }
+
+//           res.status(200).json({ message: "Timetable inserted successfully", insertedRows: result.affectedRows });
+//       });
+
+//   } catch (error) {
+//       console.error("Error:", error);
+//       res.status(500).json({ message: "Internal server error" });
+//   }
+// });
+
+
+
+
+
+app.get("/get-teachers-for-time-table/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching sections" });
+      return;
+    }
+
+    const sql = 'SELECT id, full_name, campus_id FROM school_employees WHERE status = "On" AND employee_post_id = 1 AND campus_id = ?';
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching sections" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+// app.get("/view-timetable/:class_id/:section_id/:shift/:teacher_id_get/:campus_id/:session_id", (req, res) => {
+  
+//   const teacher_id = req.params.teacher_id_get;
+//   const campus_id = req.params.campus_id;
+//   const session_id = req.params.session_id;
+
+//   const shift = req.params.shift;
+//   const class_id = req.params.class_id;
+//   const section_id = req.params.section_id;
+
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching sections" });
+//       return;
+//     }
+
+//     const sql = `
+//     SELECT * 
+//     FROM school_time_table 
+//     INNER JOIN subjects ON subjects.id = school_time_table.subject_id 
+//     INNER JOIN classes ON classes.id = school_time_table.class_id 
+//     INNER JOIN sections ON sections.id = school_time_table.section_id 
+//     WHERE school_time_table.teacher_id = ? 
+//       AND school_time_table.campus_id = ?
+//       AND school_time_table.session_id = ?
+//     ORDER BY period ASC`;
+
+//     connection.query(sql, [teacher_id, campus_id, session_id], (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error("Error:", error);
+//         res.status(500).json({ error: "Error fetching sections" });
+//       } else {
+//         console.log("Fetch Successfully");
+//         res.status(200).json({ results });
+//       }
+//     });
+//   });
+// });
+
+
+
+app.get("/view-timetable", (req, res) => {
+
+  const {
+    class_id,
+    section_id,
+    shift,
+    campus_id,
+    session_id,
+    teacher_id_get
+  } = req.query;
+
+   const teacher_id = teacher_id_get;
+  
+
+
+  // Start building the SQL query
+  let sql = `
+    SELECT * 
+    FROM school_time_table 
+    INNER JOIN school_employees ON school_time_table.teacher_id = school_employees.id 
+    INNER JOIN subjects ON subjects.id = school_time_table.subject_id 
+    INNER JOIN classes ON classes.id = school_time_table.class_id 
+    INNER JOIN sections ON sections.id = school_time_table.section_id 
+    WHERE school_time_table.campus_id = ? 
+      AND school_time_table.session_id = ?
+      AND school_time_table.shift = ?`;
+
+
+  // Array to hold the dynamic values for the query
+  let queryParams = [campus_id, session_id, shift];
+
+  // Dynamically append conditions based on the presence of shift, class_id, and section_id
+
+  if (teacher_id) {
+    sql += " AND school_time_table.teacher_id = ?";
+    queryParams.push(teacher_id);
+  }
+
+  // if (shift) {
+  //   sql += " AND school_time_table.shift = ?";
+  //   queryParams.push(shift);
+  // }
+
+  if (class_id) {
+    sql += " AND school_time_table.class_id = ?";
+    queryParams.push(class_id);
+  }
+
+  if (section_id) {
+    sql += " AND school_time_table.section_id = ?";
+    queryParams.push(section_id);
+  }
+
+  // Order the results by period
+  sql += " ORDER BY period ASC";
+
+  // Execute the query
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching timetable" });
+      return;
+    }
+
+    connection.query(sql, queryParams, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching timetable" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+app.get("/view-student-attendance", (req, res) => {
+
+  const {
+    student_id,
+    campus_id,
+    session_id,
+    teacher_id_get
+  } = req.query;
+
+
+  let sql = `
+    SELECT * 
+    FROM school_student_attendance 
+    WHERE  school_student_attendance.student_id = ? AND
+    school_student_attendance.campus_id = ? 
+    AND school_student_attendance.session_id = ?`;
+
+
+  // Array to hold the dynamic values for the query
+  let queryParams = [student_id, campus_id, session_id];
+
+ 
+
+  // Order the results by period
+  sql += " ORDER BY date ASC";
+
+  // Execute the query
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching timetable" });
+      return;
+    }
+
+    connection.query(sql, queryParams, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching timetable" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+app.get("/if-timetable-already-exist/:campus_id/:session_id/:class_id/:section_id/:shift/:day", (req, res) => {
+  const campus_id = req.params.campus_id;
+  const session_id = req.params.session_id;
+  const class_id = req.params.class_id;
+  const section_id = req.params.section_id;
+  const shift = req.params.shift;
+  const day = req.params.day;
+
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching sections" });
+      return;
+    }
+
+    const sql = 'SELECT school_time_table.id, school_time_table.subject_id, school_time_table.teacher_id, school_time_table.time_from, school_time_table.time_to, school_time_table.room_no   FROM school_time_table WHERE class_id = ? AND section_id = ? AND shift = ? AND day = ? AND campus_id = ? AND session_id = ? ORDER BY period ASC';
+
+    connection.query(sql, [class_id, section_id, shift, day, campus_id, session_id], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching sections" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+//
+
+app.get("/get-subjects-for-timetable/:campus_id/:class_id/:section_id", (req, res) => {
+
+  const campus_id = req.params.campus_id;
+  const class_id = req.params.class_id;
+  const section_id = req.params.section_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching sections" });
+      return;
+    }
+
+    const sql = `SELECT subjects.id, subjects.subjects, assing_subjects_class.campus_id
+FROM assing_subjects_class
+INNER JOIN subjects ON assing_subjects_class.subject_id = subjects.id
+WHERE status_on_off = "On"
+  AND assing_subjects_class.campus_id = ?
+  AND assing_subjects_class.class_id = ?
+  AND assing_subjects_class.section_id = ?
+`;
+
+    connection.query(sql, [campus_id, class_id, section_id], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching sections" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+
+
+app.get("/get-subjects-for-teacher/:campus_id", (req, res) => {
+
+  const campus_id = req.params.campus_id;
+  const class_id = req.params.class_id;
+  const section_id = req.params.section_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching sections" });
+      return;
+    }
+
+    const sql = `SELECT assing_subjects_class.id, subjects.subjects, classes.class as class_name, sections.section_name,  assing_subjects_class.campus_id
+    FROM assing_subjects_class
+    INNER JOIN subjects ON assing_subjects_class.subject_id = subjects.id
+    INNER JOIN classes ON assing_subjects_class.class_id = classes.id
+    INNER JOIN sections ON assing_subjects_class.section_id = sections.id
+    WHERE status_on_off = "On"
+      AND assing_subjects_class.campus_id = ?
+    `;
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching sections" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+app.get("/get-fee-groups/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching groups" });
+      return;
+    }
+
+    const sql = 'SELECT * FROM fee_groups WHERE campus_id = ? AND status="On" ';
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching groups" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+app.get("/get-parent-classes", (req, res) => {
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = 'SELECT * FROM parent_classes WHERE status="On" ';
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+app.get("/bank-details-list", (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search;
+  const campus_id = req.query.campus_id; // Use const for search_data since it's not reassigned
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    let sql = `SELECT bank_details.*, banks.bank_name 
+           FROM bank_details
+           LEFT JOIN banks ON banks.id = bank_details.bank_id WHERE bank_details.campus_id = ?`;
+
+    if (search_data) {
+      sql += `AND  banks.bank_name LIKE '%${search_data}%'`;
+    }
+
+    sql += ` LIMIT ${limit} OFFSET ${offset}`;
+
+    // Execute the query
+    connection.query(sql, [campus_id], (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+        return;
+      }
+
+      // Query to get total count of items
+      let countSql = `SELECT COUNT(*) AS total FROM bank_details
+      LEFT JOIN banks ON bank_details.bank_id = banks.id`;
+
+      if (search_data) {
+        countSql += ` WHERE banks.bank_name LIKE '%${search_data}%'`;
+      }
+
+      // Execute the count query
+      connection.query(countSql, (countError, countResult) => {
+        connection.release(); // Release the connection
+
+        if (countError) {
+          console.error("Error executing count SQL query: ", countError);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        const total = countResult[0].total;
+        const totalPages = Math.ceil(total / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          total,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      });
+    });
+  });
+});
+
+
+
+
+
+
+app.get("/get-sub-head-charts-of-account", (req, res) => {
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_data = req.query.search; // Use const for search_data since it's not reassigned
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    let sql = `SELECT sub_head_coa.id, sub_head_coa.name, main_head_coa.main_head_name, sub_head_coa.code AS sub_head_code, main_head_coa.code AS main_head_code, sub_head_coa.level  
+               FROM sub_head_coa
+               INNER JOIN main_head_coa ON main_head_coa.id = sub_head_coa.main_head_id 
+               ORDER BY sub_head_coa.code DESC`;
+
+    if (search_data) {
+      sql += ` WHERE sub_head_coa.name LIKE '%${search_data}%'`;
+    }
+
+    sql += ` LIMIT ${limit} OFFSET ${offset}`;
+
+    // Execute the query
+    connection.query(sql, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+        return;
+      }
+
+      // Query to get total count of items
+      let countSql = `SELECT COUNT(*) FROM sub_head_coa`;
+
+      if (search_data) {
+          countSql += ` WHERE sub_head_coa.name LIKE '%${search_data}%'`;
+      }
+
+      // Execute the count query
+      connection.query(countSql, (countError, countResult) => {
+        connection.release(); // Release the connection
+
+        if (countError) {
+          console.error("Error executing count SQL query: ", countError);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        const total = countResult[0].total;
+        const totalPages = Math.ceil(total / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          total,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      });
+    });
+  });
+});
+
+
+
+
+
+
+// app.get('/fee-vouchers-list', (req, res) => {
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const class_id = req.query.class_id;
+//   const section_id =  req.query.section_id;
+//   const search_data = req.query.search;
+//   const campus_id = parseInt(req.query.campus_id);
+//   const session_id = parseInt(req.query.session_id);
+
+//   if (!campus_id || !session_id) {
+//     return res.status(400).json({ error: 'campus_id and session_id are required' });
+//   }
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching' });
+//       return;
+//     }
+
+//     let sql = `
+//       SELECT fee_vouchers.*, students.register_no, students.old_register_no, students.full_name, classes.class, sections.section_name
+//       FROM fee_vouchers
+//       INNER JOIN students ON students.id = fee_vouchers.student_id
+//       LEFT JOIN classes ON classes.id = students.class_id
+//       LEFT JOIN sections ON sections.id = students.section_id
+//       WHERE fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ?`;
+
+//     let countSql = `
+//       SELECT COUNT(*) as total
+//       FROM fee_vouchers
+//       INNER JOIN students ON students.id = fee_vouchers.student_id
+//       LEFT JOIN classes ON classes.id = students.class_id
+//       LEFT JOIN sections ON sections.id = students.section_id
+//       WHERE fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ?`;
+
+//     let totalSql = `
+//       SELECT SUM(total_amount_data) as total_payable, SUM(arrears) as total_arrears
+//       FROM fee_vouchers
+//       INNER JOIN students ON students.id = fee_vouchers.student_id
+//       LEFT JOIN classes ON classes.id = students.class_id
+//       LEFT JOIN sections ON sections.id = students.section_id
+//       WHERE fee_vouchers.status = 'unpaid' AND fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ?`;
+
+//     const params = [session_id, campus_id];
+
+//     if (search_data) {
+//       const searchCondition = `
+//         AND (students.full_name LIKE ?
+//         OR students.register_no LIKE ?
+//         OR students.old_register_no LIKE ?)`;
+//       sql += searchCondition;
+//       countSql += searchCondition;
+//       totalSql += searchCondition;
+//       params.push(`%${search_data}%`, `%${search_data}%`, `%${search_data}%`);
+//     }
+
+//     sql += ` ORDER BY fee_vouchers.id LIMIT ? OFFSET ?`;
+//     params.push(limit, offset);
+
+//     // Execute the main query
+//     connection.query(sql, params, (error, results) => {
+//       if (error) {
+//         console.error('Error executing SQL query: ', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//         connection.release();
+//         return;
+//       }
+
+//       // Execute count and total queries in parallel
+//       const countParams = [session_id, campus_id];
+//       const totalParams = [session_id, campus_id];
+
+//       if (search_data) {
+//         countParams.push(`%${search_data}%`, `%${search_data}%`, `%${search_data}%`);
+//         totalParams.push(`%${search_data}%`, `%${search_data}%`, `%${search_data}%`);
+//       }
+
+//       Promise.all([
+//         new Promise((resolve, reject) => {
+//           connection.query(countSql, countParams, (countError, countResult) => {
+//             if (countError) return reject(countError);
+//             resolve(countResult);
+//           });
+//         }),
+//         new Promise((resolve, reject) => {
+//           connection.query(totalSql, totalParams, (totalError, totalResult) => {
+//             if (totalError) return reject(totalError);
+//             resolve(totalResult);
+//           });
+//         })
+//       ]).then(([countResult, totalResult]) => {
+//         connection.release();
+//         const total = countResult[0].total;
+//         const totalPages = Math.ceil(total / limit);
+//         const totalPayable = totalResult[0].total_payable;
+//         const totalArrears = totalResult[0].total_arrears;
+
+//         res.json({
+//           total,
+//           totalPayable,
+//           totalArrears,
+//           currentPage: page,
+//           totalPages,
+//           results
+//         });
+//       }).catch((parallelError) => {
+//         connection.release();
+//         console.error('Error executing parallel queries: ', parallelError);
+//         res.status(500).json({ error: 'Internal server error' });
+//       });
+//     });
+//   });
+// });
+
+// app.get('/fee-vouchers-list', (req, res) => {
+
+//   const from_month = req.query.from_month;
+//   const to_month = req.query.to_month;
+//   const class_id = req.query.class_id;
+//   const section_id = req.query.section_id;
+//   const shift = req.query.shift;
+//   const search_data = req.query.search;
+//   const campus_id = parseInt(req.query.campus_id);
+//   const session_id = parseInt(req.query.session_id);
+
+//   if (!campus_id || !session_id) {
+//     return res.status(400).json({ error: 'campus_id and session_id are required' });
+//   }
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching' });
+//       return;
+//     }
+
+//     let sql = `
+//       SELECT fee_vouchers.*, students.register_no, students.old_register_no, students.full_name, classes.class, sections.section_name
+//       FROM fee_vouchers
+//       INNER JOIN students ON students.id = fee_vouchers.student_id
+//       LEFT JOIN classes ON classes.id = students.class_id
+//       LEFT JOIN sections ON sections.id = students.section_id
+//       WHERE fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ?`;
+
+//     let countSql = `
+//       SELECT COUNT(*) as total
+//       FROM fee_vouchers
+//       INNER JOIN students ON students.id = fee_vouchers.student_id
+//       LEFT JOIN classes ON classes.id = students.class_id
+//       LEFT JOIN sections ON sections.id = students.section_id
+//       WHERE fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ?`;
+
+//     let totalSql = `
+//       SELECT SUM(total_amount_data) as total_payable, SUM(arrears) as total_arrears
+//       FROM fee_vouchers
+//       INNER JOIN students ON students.id = fee_vouchers.student_id
+//       LEFT JOIN classes ON classes.id = students.class_id
+//       LEFT JOIN sections ON sections.id = students.section_id
+//       WHERE fee_vouchers.status = 'unpaid' AND fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ?`;
+
+//     const params = [session_id, campus_id];
+
+//     if (from_month && to_month) {
+//       sql += ` AND for_the_month BETWEEN ? AND ?`;
+//       countSql += ` AND for_the_month BETWEEN ? AND ?`;
+//       totalSql += ` AND for_the_month BETWEEN ? AND ?`;
+//       params.push(from_month, to_month);
+//     } else if (from_month) {
+//       sql += ` AND for_the_month = ?`;
+//       countSql += ` AND for_the_month = ?`;
+//       totalSql += ` AND for_the_month = ?`;
+//       params.push(from_month);
+//     }
+
+//     if (class_id) {
+//       sql += ` AND students.class_id = ?`;
+//       countSql += ` AND students.class_id = ?`;
+//       totalSql += ` AND students.class_id = ?`;
+//       params.push(class_id);
+//     }
+
+//     if (section_id) {
+//       sql += ` AND students.section_id = ?`;
+//       countSql += ` AND students.section_id = ?`;
+//       totalSql += ` AND students.section_id = ?`;
+//       params.push(section_id);
+//     }
+
+//     if (shift) {
+//       sql += ` AND students.shift = ?`;
+//       countSql += ` AND students.shift = ?`;
+//       totalSql += ` AND students.shift = ?`;
+//       params.push(shift);
+//     }
+
+//     if (search_data) {
+//       const searchCondition = `
+//         AND (students.full_name LIKE ?
+//         OR students.register_no LIKE ?
+//         OR students.old_register_no LIKE ?)`;
+//       sql += searchCondition;
+//       countSql += searchCondition;
+//       totalSql += searchCondition;
+//       params.push(`%${search_data}%`, `%${search_data}%`, `%${search_data}%`);
+//     }
+
+//     // Execute the main query to fetch all records
+//     connection.query(sql, params, (error, results) => {
+//       if (error) {
+//         console.error('Error executing SQL query: ', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//         connection.release();
+//         return;
+//       }
+
+//       connection.query(countSql, params, (countError, countResult) => {
+//         if (countError) {
+//           console.error('Error executing count SQL query: ', countError);
+//           res.status(500).json({ error: 'Internal server error' });
+//           connection.release();
+//           return;
+//         }
+
+//         connection.query(totalSql, params, (totalError, totalResult) => {
+//           if (totalError) {
+//             console.error('Error executing total SQL query: ', totalError);
+//             res.status(500).json({ error: 'Internal server error' });
+//             connection.release();
+//             return;
+//           }
+
+//           connection.release();
+//           const total = countResult[0].total;
+//           const totalPayable = totalResult[0].total_payable;
+//           const totalArrears = totalResult[0].total_arrears;
+
+//           res.json({
+//             total,
+//             totalPayable,
+//             totalArrears,
+//             results
+//           });
+//         });
+//       });
+//     });
+//   });
+// });
+
+app.delete("/delete-employee-salary/:salary_record_id", (req, res) => {
+  const salary_record_id = parseInt(req.params.salary_record_id);
+
+  console.log(salary_record_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting salary record" });
+      return;
+    }
+
+    // Step 1: Fetch loan_deduct and security_deduct from employee_salary_records
+    const fetchDeductionsQuery =
+      "SELECT loan_deduct, security_deduct, employee_id FROM employee_salary_records WHERE id = ?";
+    connection.query(
+      fetchDeductionsQuery,
+      [salary_record_id],
+      (fetchError, results) => {
+        if (fetchError) {
+          connection.release();
+          console.error("Error fetching salary deductions:", fetchError);
+          res.status(500).json({ error: "Error fetching salary deductions" });
+          return;
+        }
+
+        if (results.length === 0) {
+          connection.release();
+          res.status(404).json({ error: "Salary record not found" });
+          return;
+        }
+
+        // Handle NULL values by converting them to 0
+        const loan_deduct = results[0].loan_deduct || 0;
+        const security_deduct = results[0].security_deduct || 0;
+        const employee_id = results[0].employee_id;
+
+        // Step 2: Subtract the loan_deduct and security_deduct from school_employees
+        const updateEmployeeQuery = `
+        UPDATE school_employees 
+        SET total_loan_deduct_from_salary = total_loan_deduct_from_salary - ?, 
+            total_security_deduct_from_salary = total_security_deduct_from_salary - ? 
+        WHERE id = ?
+      `;
+
+        connection.query(
+          updateEmployeeQuery,
+          [loan_deduct, security_deduct, employee_id],
+          (updateError) => {
+            if (updateError) {
+              connection.release();
+              console.error("Error updating employee deductions:", updateError);
+              res
+                .status(500)
+                .json({ error: "Error updating employee deductions" });
+              return;
+            }
+
+            // Step 3: Delete the employee salary record
+            const deleteSalaryRecordQuery =
+              "DELETE FROM employee_salary_records WHERE id = ?";
+            connection.query(
+              deleteSalaryRecordQuery,
+              [salary_record_id],
+              (deleteError) => {
+                connection.release(); // Release the connection after all queries
+
+                if (deleteError) {
+                  console.error("Error deleting salary record:", deleteError);
+                  res
+                    .status(500)
+                    .json({ error: "Error deleting salary record" });
+                } else {
+                  console.log("Salary record deleted successfully");
+                  res
+                    .status(200)
+                    .json({ message: "Salary record deleted successfully" });
+                }
+              }
+            );
+          }
+        );
+      }
+    );
+  });
+});
+
+app.get("/school-salary-list", (req, res) => {
+  const for_the_month = req.query.for_the_month; // The month for which to fetch salary records
+  const search_data = req.query.search; // Search query for employee name or registration number
+  const campus_id = parseInt(req.query.campus_id); // The campus ID to filter the records
+
+  // Ensure `campus_id` is provided
+  if (!campus_id) {
+    return res.status(400).json({ error: "campus_id is required" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      return res
+        .status(500)
+        .json({ error: "Error fetching database connection" });
+    }
+
+    // Base query for fetching salary records with employee details
+    let sql = `
+      SELECT employee_salary_records.*, 
+             school_employees.full_name, 
+             employee_posts.employee_post, 
+             employee_roles.employee_role, 
+             pay_scale.pay_scale,  pay_scale.job_type
+      FROM employee_salary_records
+      INNER JOIN school_employees ON school_employees.id = employee_salary_records.employee_id
+      INNER JOIN employee_posts ON employee_posts.id = employee_salary_records.employee_post_id
+      INNER JOIN employee_roles ON employee_roles.id = employee_salary_records.employee_role_id
+      INNER JOIN pay_scale ON pay_scale.id = employee_salary_records.pay_scale_id
+      WHERE employee_salary_records.campus_id = ?
+    `;
+
+    // Base query to count the total number of records
+    let countSql = `
+      SELECT COUNT(*) as total
+      FROM employee_salary_records
+      WHERE employee_salary_records.campus_id = ?
+    `;
+
+    const params = [campus_id];
+
+    // Filter by the month if provided
+    if (for_the_month) {
+      sql += ` AND employee_salary_records.for_the_month = ?`;
+      countSql += ` AND employee_salary_records.for_the_month = ?`;
+      params.push(for_the_month);
+    }
+
+    // Add search functionality for employee records in employee_salary_records
+    if (search_data) {
+      const searchCondition = `
+        AND (school_employees.full_name LIKE ? 
+        OR school_employees.mobile_no LIKE ?
+        OR school_employees.cnic LIKE ?)
+      `;
+      sql += searchCondition;
+      countSql += searchCondition;
+      params.push(`%${search_data}%`, `%${search_data}%`, `%${search_data}%`);
+    }
+
+    // Execute the main query to fetch salary records
+    connection.query(sql, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release();
+        return;
+      }
+
+      // Execute the count query to get the total number of matching records
+      connection.query(countSql, params, (countError, countResult) => {
+        if (countError) {
+          console.error("Error executing count SQL query:", countError);
+          res.status(500).json({ error: "Internal server error" });
+          connection.release();
+          return;
+        }
+
+        connection.release();
+        const total = countResult[0].total;
+
+        // Return the total count and the fetched results
+        res.json({
+          total,
+          results,
+        });
+      });
+    });
+  });
+});
+
+
+
+
+app.get("/get-salary-report", (req, res) => {
+  const for_the_month = req.query.for_the_month; // The month for which to fetch salary records
+
+  const campus_id = parseInt(req.query.campus_id); // The campus ID to filter the records
+
+  // Ensure `campus_id` is provided
+  if (!campus_id) {
+    return res.status(400).json({ error: "campus_id is required" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      return res
+        .status(500)
+        .json({ error: "Error fetching database connection" });
+    }
+
+    // Base query for fetching salary records with employee details
+    let sql = `
+      SELECT employee_salary_records.*, 
+             school_employees.full_name, 
+             employee_posts.employee_post, 
+             employee_roles.employee_role, 
+             pay_scale.pay_scale,  pay_scale.job_type
+      FROM employee_salary_records
+      INNER JOIN school_employees ON school_employees.id = employee_salary_records.employee_id
+      INNER JOIN employee_posts ON employee_posts.id = employee_salary_records.employee_post_id
+      INNER JOIN employee_roles ON employee_roles.id = employee_salary_records.employee_role_id
+      INNER JOIN pay_scale ON pay_scale.id = employee_salary_records.pay_scale_id
+      WHERE employee_salary_records.campus_id = ?`;
+
+    // Base query to count the total number of records
+    let countSql = `SELECT COUNT(*) as total
+      FROM employee_salary_records
+      WHERE employee_salary_records.campus_id = ?`;
+
+    const params = [campus_id];
+
+    // Filter by the month if provided
+    if (for_the_month) {
+      sql += ` AND employee_salary_records.for_the_month = ?`;
+      countSql += ` AND employee_salary_records.for_the_month = ?`;
+      params.push(for_the_month);
+    }
+
+    // Execute the main query to fetch salary records
+    connection.query(sql, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release();
+        return;
+      }
+
+      // Execute the count query to get the total number of matching records
+      connection.query(countSql, params, (countError, countResult) => {
+        if (countError) {
+          console.error("Error executing count SQL query:", countError);
+          res.status(500).json({ error: "Internal server error" });
+          connection.release();
+          return;
+        }
+
+        connection.release();
+        const total = countResult[0].total;
+
+        res.json({
+          total,
+          results,
+        });
+      });
+    });
+  });
+});
+
+app.get("/view-salary-slips", (req, res) => {
+  const for_the_month = req.query.for_the_month; // The month for which to fetch salary records
+  const campus_id = parseInt(req.query.campus_id); // The campus ID to filter the records
+
+  console.log(req.query.for_the_month, parseInt(req.query.campus_id));
+
+  // Ensure `campus_id` and `for_the_month` are provided
+  if (!campus_id || !for_the_month) {
+    return res
+      .status(400)
+      .json({ error: "campus_id and for_the_month are required" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      return res
+        .status(500)
+        .json({ error: "Error fetching database connection" });
+    }
+
+    // Base query for fetching salary records with employee details
+    let sql = `
+      SELECT employee_salary_records.*, 
+             school_employees.full_name, 
+             employee_posts.employee_post, 
+             employee_roles.employee_role, 
+             pay_scale.pay_scale,  
+             pay_scale.job_type
+      FROM employee_salary_records
+      INNER JOIN school_employees ON school_employees.id = employee_salary_records.employee_id
+      INNER JOIN employee_posts ON employee_posts.id = employee_salary_records.employee_post_id
+      INNER JOIN employee_roles ON employee_roles.id = employee_salary_records.employee_role_id
+      INNER JOIN pay_scale ON pay_scale.id = employee_salary_records.pay_scale_id
+      WHERE employee_salary_records.campus_id = ?
+      AND employee_salary_records.for_the_month = ?
+    `;
+
+    const params = [campus_id, for_the_month];
+
+    // Execute the main query to fetch salary records
+    connection.query(sql, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release();
+        return;
+      }
+
+      // Release the connection and return the results
+      connection.release();
+      res.json({
+        results,
+      });
+    });
+  });
+});
+
+//dont remove this code...........
+// app.get('/fee-vouchers-list', (req, res) => {
+//   const from_month = req.query.from_month;
+//   const to_month = req.query.to_month;
+//   const class_id = req.query.class_id;
+//   const section_id = req.query.section_id;
+//   const shift = req.query.shift;
+//   const search_data = req.query.search;
+//   const campus_id = parseInt(req.query.campus_id);
+//   const session_id = parseInt(req.query.session_id);
+
+//   if (!campus_id || !session_id) {
+//     return res.status(400).json({ error: 'campus_id and session_id are required' });
+//   }
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching' });
+//       return;
+//     }
+
+//     let sql = `
+//       SELECT fee_vouchers.*, students.register_no, students.old_register_no, students.full_name, classes.class, sections.section_name
+//       FROM fee_vouchers
+//       INNER JOIN students ON students.id = fee_vouchers.student_id
+//       LEFT JOIN classes ON classes.id = students.class_id
+//       LEFT JOIN sections ON sections.id = students.section_id
+//       WHERE fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ?`;
+
+//     let countSql = `
+//       SELECT COUNT(*) as total
+//       FROM fee_vouchers
+//       INNER JOIN students ON students.id = fee_vouchers.student_id
+//       LEFT JOIN classes ON classes.id = students.class_id
+//       LEFT JOIN sections ON sections.id = students.section_id
+//       WHERE fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ?`;
+
+//     const params = [session_id, campus_id];
+
+//     if (from_month && to_month) {
+//       sql += ` AND for_the_month BETWEEN ? AND ?`;
+//       countSql += ` AND for_the_month BETWEEN ? AND ?`;
+//       params.push(from_month, to_month);
+//     } else if (from_month) {
+//       sql += ` AND for_the_month = ?`;
+//       countSql += ` AND for_the_month = ?`;
+//       params.push(from_month);
+//     }
+
+//     if (class_id) {
+//       sql += ` AND students.class_id = ?`;
+//       countSql += ` AND students.class_id = ?`;
+//       params.push(class_id);
+//     }
+
+//     if (section_id) {
+//       sql += ` AND students.section_id = ?`;
+//       countSql += ` AND students.section_id = ?`;
+//       params.push(section_id);
+//     }
+
+//     if (shift) {
+//       sql += ` AND students.shift = ?`;
+//       countSql += ` AND students.shift = ?`;
+//       params.push(shift);
+//     }
+
+//     if (search_data) {
+//       const searchCondition = `
+//         AND (students.full_name LIKE ?
+//         OR students.register_no LIKE ?
+//         OR students.old_register_no LIKE ?)`;
+//       sql += searchCondition;
+//       countSql += searchCondition;
+//       params.push(`%${search_data}%`, `%${search_data}%`, `%${search_data}%`);
+//     }
+
+//     // Execute the main query to fetch all records
+//     connection.query(sql, params, (error, results) => {
+//       if (error) {
+//         console.error('Error executing SQL query: ', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//         connection.release();
+//         return;
+//       }
+
+//       connection.query(countSql, params, (countError, countResult) => {
+//         if (countError) {
+//           console.error('Error executing count SQL query: ', countError);
+//           res.status(500).json({ error: 'Internal server error' });
+//           connection.release();
+//           return;
+//         }
+
+//         connection.release();
+//         const total = countResult[0].total;
+
+//         res.json({
+//           total,
+//           results
+//         });
+//       });
+//     });
+//   });
+// });
+
+app.get("/fee-vouchers-list", (req, res) => {
+  const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const shift = req.query.shift;
+  const search_data = req.query.search;
+  const campus_id = parseInt(req.query.campus_id);
+  const session_id = parseInt(req.query.session_id);
+
+  if (!campus_id || !session_id) {
+    return res
+      .status(400)
+      .json({ error: "campus_id and session_id are required" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    let sql = `
+      SELECT fee_vouchers.*, students.register_no, students.old_register_no, students.full_name, classes.class, sections.section_name
+      FROM fee_vouchers
+      INNER JOIN students ON students.id = fee_vouchers.student_id
+      LEFT JOIN classes ON classes.id = students.class_id
+      LEFT JOIN sections ON sections.id = students.section_id
+      WHERE fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ?`;
+
+    let countSql = `
+      SELECT COUNT(*) as total
+      FROM fee_vouchers
+      INNER JOIN students ON students.id = fee_vouchers.student_id
+      LEFT JOIN classes ON classes.id = students.class_id
+      LEFT JOIN sections ON sections.id = students.section_id
+      WHERE fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ?`;
+
+    let lastMonthSql = `
+      SELECT for_the_month
+      FROM fee_vouchers
+      WHERE session_id = ? AND campus_id = ? and voucher_created_form != "Single"
+      ORDER BY id DESC
+      LIMIT 1`;
+
+    const params = [session_id, campus_id];
+
+    if (from_month && to_month) {
+      sql += ` AND fee_vouchers.for_the_month BETWEEN ? AND ?`;
+      countSql += ` AND fee_vouchers.for_the_month BETWEEN ? AND ?`;
+      params.push(from_month, to_month);
+    } else if (from_month) {
+      sql += ` AND fee_vouchers.for_the_month = ?`;
+      countSql += ` AND fee_vouchers.for_the_month = ?`;
+      params.push(from_month);
+    }
+
+    if (class_id) {
+      sql += ` AND fee_vouchers.class_id = ?`;
+      countSql += ` AND fee_vouchers.class_id = ?`;
+      params.push(class_id);
+    }
+
+    if (section_id) {
+      sql += ` AND fee_vouchers.section_id = ?`;
+      countSql += ` AND fee_vouchers.section_id = ?`;
+      params.push(section_id);
+    }
+
+    if (shift) {
+      sql += ` AND fee_vouchers.shift = ?`;
+      countSql += ` AND fee_vouchers.shift = ?`;
+      params.push(shift);
+    }
+
+    if (search_data) {
+      const searchCondition = `
+        AND (students.full_name LIKE ? 
+        OR students.register_no LIKE ?
+        OR students.old_register_no LIKE ?)`;
+      sql += searchCondition;
+      countSql += searchCondition;
+      params.push(`%${search_data}%`, `%${search_data}%`, `%${search_data}%`);
+    }
+
+
+    sql += ` ORDER BY fee_vouchers.invoice_no DESC`;
+
+    // Execute the main query to fetch all records
+    connection.query(sql, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release();
+        return;
+      }
+
+      connection.query(countSql, params, (countError, countResult) => {
+        if (countError) {
+          console.error("Error executing count SQL query: ", countError);
+          res.status(500).json({ error: "Internal server error" });
+          connection.release();
+          return;
+        }
+
+        connection.query(
+          lastMonthSql,
+          [session_id, campus_id],
+          (lastMonthError, lastMonthResult) => {
+            if (lastMonthError) {
+              console.error(
+                "Error executing last month SQL query: ",
+                lastMonthError
+              );
+              res.status(500).json({ error: "Internal server error" });
+              connection.release();
+              return;
+            }
+
+            connection.release();
+            const total = countResult[0].total;
+            const lastMonth =
+              lastMonthResult.length > 0
+                ? lastMonthResult[0].for_the_month
+                : null;
+
+            res.json({
+              total,
+              results,
+              last_month: lastMonth,
+            });
+          }
+        );
+      });
+    });
+  });
+});
+
+
+
+
+
+app.get("/datewise-posting-report", (req, res) => {
+
+  const from_month = req.query.from_month;
+  const campus_id = parseInt(req.query.campus_id);
+  const session_id = parseInt(req.query.session_id);
+
+  const shift = req.query.shift;
+
+  if (!campus_id || !session_id) {
+    return res
+      .status(400)
+      .json({ error: "campus_id and session_id are required" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    // Main SQL query
+    let sql = `
+      SELECT fee_vouchers.*, students.register_no, students.old_register_no, students.full_name, classes.class, sections.section_name
+      FROM fee_vouchers
+      LEFT JOIN students ON students.id = fee_vouchers.student_id
+      LEFT JOIN classes ON classes.id = students.class_id
+      LEFT JOIN sections ON sections.id = students.section_id
+      WHERE fee_vouchers.for_the_month = ? AND fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ? AND fee_vouchers.status = 'paid'`;
+
+    const params = [from_month, session_id, campus_id];
+
+    if (shift) {
+      sql += `  AND fee_vouchers.shift = ?`;
+      params.push(shift);
+    }
+
+    // const [year, month] = from_month.split("-").map(Number);
+
+    // let nextYear = year;
+    // let nextMonth = month + 1;
+
+    // if (nextMonth > 12) {
+    //   nextMonth = 1;  // Reset to January
+    //   nextYear += 1;  // Increment the year
+    // }
+
+    // const next_month = `${nextYear}-${String(nextMonth).padStart(2, "0")}`;
+    // // console.log(next_month); // Outputs "2024-11"
+
+
+    // // Add date filtering to SQL query if from_date or to_date is present
+    // if (from_month) {
+    //   const from_month_start = `${from_month}-01`;
+    //   const next_month_start = `${next_month}-01`; // calculate next_month based on your logic
+    //   sql += ` AND payment_date >= ? AND payment_date < ?`;
+    //   params.push(from_month_start, next_month_start);
+    // } 
+
+    // Comment out last month SQL query
+    // let lastMonthSql = `
+    //   SELECT for_the_month
+    //   FROM fee_vouchers
+    //   WHERE session_id = ? AND campus_id = ? and voucher_created_form != "Single"
+    //   ORDER BY id DESC
+    //   LIMIT 1`;
+
+    // Execute the main query to fetch records
+    connection.query(sql, params, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release();
+        return;
+      }
+
+      // Count the number of records returned from the main query
+      const totalCount = results.length;
+
+      // Commented out the last month query execution
+      // connection.query(
+      //   lastMonthSql,
+      //   [session_id, campus_id],
+      //   (lastMonthError, lastMonthResult) => {
+      //     if (lastMonthError) {
+      //       console.error(
+      //         "Error executing last month SQL query: ",
+      //         lastMonthError
+      //       );
+      //       res.status(500).json({ error: "Internal server error" });
+      //       connection.release();
+      //       return;
+      //     }
+
+      connection.release();
+      // const lastMonth =
+      //   lastMonthResult.length > 0
+      //     ? lastMonthResult[0].for_the_month
+      //     : null;
+
+      // Respond with the results, the total count, and last month data
+      res.json({
+        total_count: totalCount, // Send total count of records
+        results, // Send the main query results
+         last_month: 0
+      });
+    });
+  });
+});
+
+
+
+
+
+
+// app.get("/datewise-posting-report", (req, res) => {
+//   const from_date = req.query.from_date;
+//   const to_date = req.query.to_date;
+//   const campus_id = parseInt(req.query.campus_id);
+//   const session_id = parseInt(req.query.session_id);
+
+//   if (!campus_id || !session_id) {
+//     return res
+//       .status(400)
+//       .json({ error: "campus_id and session_id are required" });
+//   }
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching" });
+//       return;
+//     }
+
+//     // Main SQL query
+//     let sql = `
+//       SELECT fee_vouchers.*, students.register_no, students.old_register_no, students.full_name, classes.class, sections.section_name
+//       FROM fee_vouchers
+//       LEFT JOIN students ON students.id = fee_vouchers.student_id
+//       LEFT JOIN classes ON classes.id = students.class_id
+//       LEFT JOIN sections ON sections.id = students.section_id
+//       WHERE fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ? AND fee_vouchers.status = 'paid'`;
+
+//     const params = [session_id, campus_id];
+
+//     // Add date filtering to SQL query if from_date or to_date is present
+//     if (from_date && to_date) {
+//       sql += ` AND payment_date BETWEEN ? AND ?`;
+//       params.push(from_date, to_date);
+//     } else if (from_date) {
+//       sql += ` AND payment_date = ?`;
+//       params.push(from_date);
+//     }
+
+//     // Query to get the last month
+//     // let lastMonthSql = `
+//     //   SELECT for_the_month
+//     //   FROM fee_vouchers
+//     //   WHERE session_id = ? AND campus_id = ? and voucher_created_form != "Single"
+//     //   ORDER BY id DESC
+//     //   LIMIT 1`;
+
+//     // Execute the main query to fetch records
+//     connection.query(sql, params, (error, results) => {
+//       if (error) {
+//         console.error("Error executing SQL query: ", error);
+//         res.status(500).json({ error: "Internal server error" });
+//         connection.release();
+//         return;
+//       }
+
+//       // Count the number of records returned from the main query
+//       const totalCount = results.length;
+
+//       // Execute the query to get the last month
+//       connection.query(
+//         lastMonthSql,
+//         [session_id, campus_id],
+//         (lastMonthError, lastMonthResult) => {
+//           if (lastMonthError) {
+//             console.error(
+//               "Error executing last month SQL query: ",
+//               lastMonthError
+//             );
+//             res.status(500).json({ error: "Internal server error" });
+//             connection.release();
+//             return;
+//           }
+
+//           connection.release();
+//           const lastMonth =
+//             lastMonthResult.length > 0
+//               ? lastMonthResult[0].for_the_month
+//               : null;
+
+//           // Respond with the results, the total count, and last month data
+//           res.json({
+//             total_count: totalCount, // Send total count of records
+//             results, // Send the main query results
+//             last_month: lastMonth, // Send last month information
+//           });
+//         }
+//       );
+//     });
+//   });
+// });
+
+
+
+
+
+app.get("/bank-detail-get/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT * FROM bank_details WHERE id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+app.get("/get-sub-head/:id_get", (req, res) => {
+  const id_get = req.params.id_get;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `SELECT * FROM sub_head_coa WHERE id = ?`;
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+
+
+app.get("/bank-detail-campuse-wise/:campus_id", (req, res) => {
+  const campus_id = req.params.campus_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `
+      SELECT bd.*, b.bank_name
+      FROM bank_details bd
+      JOIN banks b ON bd.bank_id = b.id
+      WHERE bd.campus_id = ?
+    `;
+    const values = [campus_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+// app.get('/check-voucher-exist/:type_set/:voucher_no_or_class/:campus_id/:session_id/:for_the_month/:payment_date', (req, res) => {
+//   const { type_set, voucher_no_or_class, campus_id, session_id, for_the_month, payment_date } = req.params;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error connecting to the database' });
+//       return;
+//     }
+
+//     let query = `SELECT
+//           fee_vouchers.student_id,
+//           students.full_name,
+//           classes.class as class_name,
+//           sections.section_name,
+//           fee_vouchers.invoice_no,
+//           fee_vouchers.arrears,
+//           fee_vouchers.arrears_not_cleared,
+//           fee_vouchers.for_the_month,
+//           fee_vouchers.due_date,
+//           fee_vouchers.first_advance_payment,
+//           CASE
+//               WHEN fee_vouchers.due_date >= CURDATE() THEN fee_vouchers.total_amount_data
+//               ELSE fee_vouchers.after_due_date_amount
+//           END as amount,
+//           fee_vouchers.status,
+//           fee_vouchers.id
+//           FROM fee_vouchers
+//           JOIN students ON fee_vouchers.student_id = students.id
+//           JOIN classes ON students.class_id = classes.id
+//           JOIN sections ON students.section_id = sections.id
+//           WHERE fee_vouchers.campus_id = ?
+//           AND fee_vouchers.session_id = ?`;
+
+//     const values = [campus_id, session_id];
+
+//     if (for_the_month !== "month_not_set") {
+//       query += ' AND fee_vouchers.for_the_month = ?';
+//       values.push(for_the_month);
+//     }
+
+//     if (type_set === 'voucher') {
+//       query += ' AND fee_vouchers.invoice_no = ?';
+//       values.push(voucher_no_or_class);
+//       query += ' LIMIT 1'; // Limit to 1 result for 'voucher' type
+//     } else if (type_set === 'class') {
+//       query += ' AND students.class_id = ? AND fee_vouchers.status IN("unpaid", "partially paid")';
+//       values.push(voucher_no_or_class);
+//       // No limit for 'class' type
+//     } else {
+//       res.status(400).json({ error: 'Invalid type_set value' });
+//       connection.release(); // Release the connection if the type_set is invalid
+//       return;
+//     }
+
+//     connection.query(query, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error executing query:', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//         return;
+//       }
+
+//       console.log('Query results:', results.length);
+
+//       if (results.length > 0) {
+//         console.log("length is okay");
+//         console.log('Voucher(s) found:', results);
+
+//         if (type_set === 'voucher') {
+//           const voucher = results[0]; // Access the first (and presumably only) result
+//           if (voucher.status === 'unpaid') {
+//             return res.status(200).json({ success: true, get_voucher: voucher });
+//           } else if (voucher.status === 'paid') {
+//             return res.status(200).json({ error: 'Voucher is paid' });
+//           }
+//         } else if (type_set === 'class') {
+//           return res.status(200).json({ success: true, get_vouchers: results });
+//         }
+//       } else {
+//         console.log('No voucher found for the provided parameters');
+//         res.status(404).json({ error: 'Fee voucher does not exist' });
+//       }
+//     });
+//   });
+// });
+
+// app.get('/check-voucher-exist/:type_set/:voucher_no_or_class/:campus_id/:session_id', (req, res) => {
+//   const {type_set, voucher_no_or_class, campus_id, session_id } = req.params;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error connecting to the database' });
+//       return;
+//     }
+
+//     const query = `SELECT
+//           students.full_name,
+//           classes.class as class_name,
+//           sections.section_name,
+//           fee_vouchers.invoice_no,
+//           fee_vouchers.arrears,
+//           fee_vouchers.arrears_not_cleared,
+//           fee_vouchers.for_the_month,
+//           fee_vouchers.due_date,
+//           fee_vouchers.first_advance_payment,
+//           CASE
+//               WHEN fee_vouchers.due_date >= CURDATE() THEN fee_vouchers.total_amount_data
+//               ELSE fee_vouchers.after_due_date_amount
+//           END as amount,
+//           fee_vouchers.status,
+//           fee_vouchers.id
+//           FROM fee_vouchers
+//           JOIN students ON fee_vouchers.student_id = students.id
+//           JOIN classes ON students.class_id = classes.id
+//           JOIN sections ON students.section_id = sections.id
+//           WHERE fee_vouchers.invoice_no = ?
+//           AND fee_vouchers.campus_id = ?
+//           AND fee_vouchers.session_id = ?
+//           LIMIT 1`;
+
+//     const values = [voucher_no_or_class, campus_id, session_id];
+
+//     connection.query(query, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error executing query:', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//         return;
+//       }
+
+//       console.log('Query results:', results.length);
+
+//       if (results.length > 0) {
+//         console.log("length is okay");
+//         const voucher = results[0]; // Access the first (and presumably only) result
+//         console.log('Voucher found:', voucher);
+
+//         if (voucher.status === 'unpaid') {
+//           return res.status(200).json({ success: true, get_voucher: voucher });
+//         } else if (voucher.status === 'paid') {
+//           return res.status(200).json({ error: 'Voucher is paid' });
+//         }
+//       } else {
+//         console.log('No voucher found for the provided parameters');
+//         res.status(404).json({ error: 'Fee voucher does not exist' });
+//       }
+//     });
+//   });
+// });
+
+// app.get('/check-voucher-exist/:voucher_no/:campus_id/:session_id', (req, res) => {
+//   const { voucher_no, campus_id, session_id } = req.params;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error connecting to the database' });
+//       return;
+//     }
+
+//     const query = `SELECT
+//           students.full_name,
+//           classes.class as class_name,
+//           sections.section_name,
+//           fee_vouchers.invoice_no,
+//           fee_vouchers.arrears,
+//           fee_vouchers.arrears_not_cleared,
+//           fee_vouchers.for_the_month,
+//           fee_vouchers.due_date,
+//           fee_vouchers.first_advance_payment
+//           CASE
+//               WHEN fee_vouchers.due_date > CURDATE() THEN fee_vouchers.total_amount_data
+//               ELSE fee_vouchers.after_due_date_amount
+//           END as amount,
+//           fee_vouchers.status,
+//           fee_vouchers.id
+//           FROM fee_vouchers
+//           JOIN students ON fee_vouchers.student_id = students.id
+//           JOIN classes ON students.class_id = classes.id
+//           JOIN sections ON students.section_id = sections.id
+//           WHERE fee_vouchers.invoice_no = ?
+//           AND fee_vouchers.campus_id = ?
+//           AND fee_vouchers.session_id = ?
+//           LIMIT 1`;
+
+//     const values = [voucher_no, campus_id, session_id];
+
+//     connection.query(query, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error executing query:', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//         return;
+//       }
+
+//       console.log('Query results:', results.length);
+
+//       if (results.length > 0) {
+//         console.log("length is okay");
+//         const voucher = results[0]; // Access the first (and presumably only) result
+//         console.log('Voucher found:', voucher);
+
+//         if (voucher.status === 'unpaid') {
+//           return res.status(200).json({ success: true, get_voucher: voucher });
+//         } else {
+//           return res.status(400).json({ error: 'Voucher already paid' });
+//         }
+//       } else {
+//         console.log('No voucher found for the provided parameters');
+//         res.status(404).json({ error: 'Voucher does not exist' });
+//       }
+//     });
+//   });
+// });
+
+// app.post('/submit-recieved-vouchers', (req, res) => {
+//   const { vouchers, payment_date, scroll_no, bank_id } = req.body;
+
+//   if (!vouchers || vouchers.length === 0) {
+//     res.status(400).send('No vouchers provided');
+//     return;
+//   }
+
+//   const ids = vouchers.map(voucher => voucher.id);
+//   const cases = vouchers.map(voucher => `WHEN id = ${voucher.id} THEN ${voucher.amount + voucher.arrears}`).join(' ');
+
+//   const query = `
+//     UPDATE fee_vouchers
+//     SET
+//       status = 'paid',
+//       recieved_payment = CASE ${cases} END,
+//       payment_received_through_bank = ?,
+//       scroll_no = ?,
+//       arrears_not_cleared = '[]',
+//       arrears = "0",
+//       payment_date = ?
+//     WHERE id IN (?)
+//   `;
+
+//   const values = [bank_id, scroll_no, payment_date, ids];
+
+//   connection.query(query, values, (error, results) => {
+//     if (error) {
+//       console.error('Error updating fee_vouchers:', error.stack);
+//       res.status(500).send('Error updating fee vouchers');
+//       return;
+//     }
+//     res.status(200).send('Fee vouchers updated successfully');
+//   });
+// });
+
+// app.post('/submit-recieved-vouchers', (req, res) => {
+//   const { vouchers, payment_date, scroll_no, bank_id } = req.body;
+
+//   if (!vouchers || vouchers.length === 0) {
+//     res.status(400).send('No vouchers provided');
+//     return;
+//   }
+
+//   // Assuming all vouchers have the same arrears_not_cleared field
+//   let fee_voucher_arrears = vouchers[0].arrears_not_cleared;
+//   fee_voucher_arrears = JSON.parse(fee_voucher_arrears);
+//   console.log(fee_voucher_arrears);
+
+//   const ids = vouchers.map(voucher => voucher.id).concat(fee_voucher_arrears);
+//   const cases = vouchers.map(voucher => `WHEN id = ? THEN ?`).join(' ');
+
+//   // Create an array of values for the `CASE` statement
+//   const caseValues = vouchers.reduce((arr, voucher) => {
+//     arr.push(voucher.id, voucher.amount + voucher.arrears + voucher.first_advance_payment);
+//     return arr;
+//   }, []);
+
+//   const query = `
+//     UPDATE fee_vouchers
+//     SET
+//       status = 'paid',
+//       recieved_payment = CASE ${cases} END,
+//       payment_received_through_bank = ?,
+//       scroll_no = ?,
+//       payment_date = ?
+//     WHERE id IN (?)
+//   `;
+
+//   // arrears_not_cleared = '[]',
+//   // arrears = "0",
+
+//   // Combine caseValues with the other parameters
+//   const values = [...caseValues, bank_id, scroll_no, payment_date, ids];
+
+//   connection.query(query, values, (error, results) => {
+//     if (error) {
+//       console.error('Error updating fee_vouchers:', error.stack);
+//       res.status(500).send('Error updating fee vouchers');
+//       return;
+//     }
+//     res.status(200).send('Fee vouchers updated successfully');
+//   });
+// });
+
+// app.post('/submit-recieved-vouchers', (req, res) => {
+//   const { vouchers, payment_date, scroll_no, bank_id } = req.body;
+
+//   if (!vouchers || vouchers.length === 0) {
+//     res.status(400).send('No vouchers provided');
+//     return;
+//   }
+
+//   // Initialize an empty array to collect all arrears_not_cleared values
+//   let fee_voucher_arrears = [];
+//   vouchers.forEach(voucher => {
+//     if (voucher.arrears_not_cleared) {
+//       fee_voucher_arrears = fee_voucher_arrears.concat(JSON.parse(voucher.arrears_not_cleared));
+//     }
+//   });
+//   console.log(fee_voucher_arrears);
+
+//   const ids = vouchers.map(voucher => voucher.id).concat(fee_voucher_arrears);
+//   const cases = vouchers.map(voucher => `WHEN id = ? THEN ?`).join(' ');
+
+//   // Create an array of values for the `CASE` statement
+//   const caseValues = vouchers.reduce((arr, voucher) => {
+//     arr.push(voucher.id, voucher.amount + voucher.arrears + (voucher.first_advance_payment || 0));
+//     return arr;
+//   }, []);
+
+//   const query = `
+//     UPDATE fee_vouchers
+//     SET
+//       status = 'paid',
+//       recieved_payment = CASE ${cases} END,
+//       payment_received_through_bank = ?,
+//       scroll_no = ?,
+//       payment_date = ?
+//     WHERE id IN (?)
+//   `;
+
+//   // Combine caseValues with the other parameters
+//   const values = [...caseValues, bank_id, scroll_no, payment_date, ids];
+
+//   connection.query(query, values, (error, results) => {
+//     if (error) {
+//       console.error('Error updating fee_vouchers:', error.stack);
+//       res.status(500).send('Error updating fee vouchers');
+//       return;
+//     }
+//     res.status(200).send('Fee vouchers updated successfully');
+//   });
+// });
+
+// app.get('/check-voucher-exist/:type_set/:voucher_no_or_class/:campus_id/:session_id/:for_the_month/:payment_date', (req, res) => {
+//   const { type_set, voucher_no_or_class, campus_id, session_id, for_the_month, payment_date } = req.params;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error connecting to the database' });
+//       return;
+//     }
+
+//     let query = `SELECT
+//           fee_vouchers.student_id,
+//           students.full_name,
+//           classes.class as class_name,
+//           sections.section_name,
+//           fee_vouchers.invoice_no,
+//           fee_vouchers.arrears,
+//           fee_vouchers.arrears_not_cleared,
+//           fee_vouchers.for_the_month,
+//           fee_vouchers.due_date,
+//           fee_vouchers.first_advance_payment,
+//           CASE
+//               WHEN fee_vouchers.due_date >= ? THEN fee_vouchers.total_amount_data
+//               ELSE fee_vouchers.after_due_date_amount
+//           END as amount,
+//           fee_vouchers.status,
+//           fee_vouchers.id
+//           FROM fee_vouchers
+//           JOIN students ON fee_vouchers.student_id = students.id
+//           JOIN classes ON students.class_id = classes.id
+//           JOIN sections ON students.section_id = sections.id
+//           WHERE fee_vouchers.campus_id = ?
+//           AND fee_vouchers.session_id = ?`;
+
+//     const values = [payment_date, campus_id, session_id];
+
+//     if (for_the_month !== "month_not_set") {
+//       query += ' AND fee_vouchers.for_the_month = ?';
+//       values.push(for_the_month);
+//     }
+
+//     if (type_set === 'voucher') {
+//       query += 'AND fee_vouchers.is_arrear = "" AND fee_vouchers.invoice_no = ?';
+//       values.push(voucher_no_or_class);
+//       query += ' LIMIT 1'; // Limit to 1 result for 'voucher' type
+//     } else if (type_set === 'class') {
+//       query += ' AND students.class_id = ? AND fee_vouchers.status IN("unpaid", "partially paid")';
+//       values.push(voucher_no_or_class);
+//       // No limit for 'class' type
+//     } else {
+//       res.status(400).json({ error: 'Invalid type_set value' });
+//       connection.release(); // Release the connection if the type_set is invalid
+//       return;
+//     }
+
+//     connection.query(query, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error executing query:', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//         return;
+//       }
+
+//       console.log('Query results:', results.length);
+
+//       if (results.length > 0) {
+//         console.log("length is okay");
+//         console.log('Voucher(s) found:', results);
+
+//         if (type_set === 'voucher') {
+//           const voucher = results[0]; // Access the first (and presumably only) result
+//           if (voucher.status === 'unpaid') {
+//             return res.status(200).json({ success: true, get_voucher: voucher });
+//           } else if (voucher.status === 'paid') {
+//             return res.status(200).json({ error: 'Voucher is paid' });
+//           }
+//         } else if (type_set === 'class') {
+//           return res.status(200).json({ success: true, get_vouchers: results });
+//         }
+//       } else {
+//         console.log('No voucher found for the provided parameters');
+//         res.status(404).json({ error: 'Fee voucher does not exist' });
+//       }
+//     });
+//   });
+// });
+
+
+
+app.get(
+  "/check-voucher-exist/:type_set/:voucher_no_or_class/:campus_id/:session_id/:for_the_month/:payment_date",
+  (req, res) => {
+    const {
+      type_set,
+      voucher_no_or_class,
+      campus_id,
+      session_id,
+      for_the_month,
+      payment_date,
+    } = req.params;
+
+    connection.getConnection((err, connection) => {
+      if (err) {
+        console.error("Error:", err);
+        res.status(500).json({ error: "Error connecting to the database" });
+        return;
+      }
+
+      let query = `
+      SELECT 
+        fee_vouchers.student_unique_id,
+        fee_vouchers.student_id, 
+        students.full_name, 
+        classes.class as class_name, 
+        sections.section_name, 
+        fee_vouchers.invoice_no,
+        fee_vouchers.arrears,  
+        fee_vouchers.arrears_not_cleared,  
+        fee_vouchers.for_the_month, 
+        fee_vouchers.due_date, 
+        fee_vouchers.first_advance_payment,
+        fee_vouchers.fine,
+        fee_vouchers.arrears_fine,
+        CASE 
+            WHEN fee_vouchers.due_date >= ? THEN fee_vouchers.total_amount_data 
+            ELSE fee_vouchers.after_due_date_amount 
+        END as amount, 
+        fee_vouchers.total_amount_data ,
+        fee_vouchers.after_due_date_amount,
+        fee_vouchers.status, 
+        fee_vouchers.id,
+        fee_vouchers.is_arrear
+      FROM fee_vouchers
+      JOIN students ON fee_vouchers.student_id = students.id
+      JOIN classes ON students.class_id = classes.id
+      JOIN sections ON students.section_id = sections.id
+      WHERE fee_vouchers.campus_id = ? 
+      AND fee_vouchers.session_id = ?`;
+
+      const values = [payment_date, campus_id, session_id];
+
+      if (for_the_month !== "month_not_set") {
+        query += " AND fee_vouchers.for_the_month = ?";
+        values.push(for_the_month);
+      }
+
+      if (type_set === "voucher") {
+        query += " AND fee_vouchers.invoice_no = ?";
+        values.push(voucher_no_or_class);
+        // query += " LIMIT 1";  // LIMIT should come at the end for 'voucher'
+      } else if (type_set === "class") {
+        query += ' AND students.class_id = ? AND fee_vouchers.status IN("unpaid", "partially paid")';
+        values.push(voucher_no_or_class);
+        query += " ORDER BY students.class_id DESC";  // ORDER BY for 'class' type
+      } else {
+        res.status(400).json({ error: "Invalid type_set value" });
+        connection.release();
+        return;
+      }
+
+      // Removed the extra ORDER BY here
+      connection.query(query, values, (error, results) => {
+        connection.release();
+
+        if (error) {
+          console.error("Error executing query:", error);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        if (results.length > 0) {
+          if (type_set === "voucher") {
+            const voucher = results[0];
+
+            if (voucher.status === "unpaid") {
+              return res
+                .status(200)
+                .json({ success: true, get_voucher: voucher });
+            } else if (voucher.status === "paid") {
+              return res.status(200).json({ error: "Voucher is paid" });
+            }
+          } else if (type_set === "class") {
+            return res
+              .status(200)
+              .json({ success: true, get_vouchers: results });
+          }
+        } else {
+          res.status(404).json({ error: "Fee voucher does not exist" });
+        }
+      });
+    });
+  }
+);
+
+
+//for posting fee vouchers
+// app.get(
+//   "/check-voucher-exist/:type_set/:voucher_no_or_class/:campus_id/:session_id/:for_the_month/:payment_date",
+//   (req, res) => {
+//     const {
+//       type_set,
+//       voucher_no_or_class,
+//       campus_id,
+//       session_id,
+//       for_the_month,
+//       payment_date,
+//     } = req.params;
+
+//     connection.getConnection((err, connection) => {
+//       if (err) {
+//         console.error("Error:", err);
+//         res.status(500).json({ error: "Error connecting to the database" });
+//         return;
+//       }
+
+//       let query = `
+//       SELECT 
+//         fee_vouchers.student_id, 
+//         students.full_name, 
+//         classes.class as class_name, 
+//         sections.section_name, 
+//         fee_vouchers.invoice_no,
+//         fee_vouchers.arrears,  
+//         fee_vouchers.arrears_not_cleared,  
+//         fee_vouchers.for_the_month, 
+//         fee_vouchers.due_date, 
+//         fee_vouchers.first_advance_payment,
+//         CASE 
+//             WHEN fee_vouchers.due_date >= ? THEN fee_vouchers.total_amount_data 
+//             ELSE fee_vouchers.after_due_date_amount 
+//         END as amount, 
+//         fee_vouchers.status, 
+//         fee_vouchers.id,
+//         fee_vouchers.is_arrear
+//       FROM fee_vouchers
+//       JOIN students ON fee_vouchers.student_id = students.id
+//       JOIN classes ON students.class_id = classes.id
+//       JOIN sections ON students.section_id = sections.id
+//       WHERE fee_vouchers.campus_id = ? 
+//       AND fee_vouchers.session_id = ?`;
+
+//       const values = [payment_date, campus_id, session_id];
+
+//       if (for_the_month !== "month_not_set") {
+//         query += " AND fee_vouchers.for_the_month = ?";
+//         values.push(for_the_month);
+//       }
+
+//       if (type_set === "voucher") {
+//         query += " AND fee_vouchers.invoice_no = ?";
+//         values.push(voucher_no_or_class);
+//         query += " LIMIT 1";
+//       } else if (type_set === "class") {
+//         query +=
+//           ' AND students.class_id = ? AND fee_vouchers.status IN("unpaid", "partially paid")';
+//         values.push(voucher_no_or_class);
+//       } else {
+//         res.status(400).json({ error: "Invalid type_set value" });
+//         connection.release();
+//         return;
+//       }
+//       query += " ORDER BY students.class_id DESC";
+
+//       connection.query(query, values, (error, results) => {
+//         connection.release();
+
+//         if (error) {
+//           console.error("Error executing query:", error);
+//           res.status(500).json({ error: "Internal server error" });
+//           return;
+//         }
+
+//         if (results.length > 0) {
+//           if (type_set === "voucher") {
+//             const voucher = results[0];
+
+//             // Check if is_arrear equals the keyword "arrears"
+//             // if (voucher.is_arrear === "arrears") {
+//             //   return res.status(400).json({ error: 'Please first remove arrears in next month voucher' });
+//             // }
+
+//             if (voucher.status === "unpaid") {
+//               return res
+//                 .status(200)
+//                 .json({ success: true, get_voucher: voucher });
+//             } else if (voucher.status === "paid") {
+//               return res.status(200).json({ error: "Voucher is paid" });
+//             }
+//           } else if (type_set === "class") {
+//             return res
+//               .status(200)
+//               .json({ success: true, get_vouchers: results });
+//           }
+//         } else {
+//           res.status(404).json({ error: "Fee voucher does not exist" });
+//         }
+//       });
+//     });
+//   }
+// );
+
+// app.post('/submit-recieved-vouchers', (req, res) => {
+//   const { vouchers, payment_date, scroll_no, bank_id } = req.body;
+
+//   if (!vouchers || vouchers.length === 0) {
+//     res.status(400).send('No vouchers provided');
+//     return;
+//   }
+
+//   // Initialize an empty array to collect all arrears_not_cleared values
+//   let fee_voucher_arrears = [];
+//   vouchers.forEach(voucher => {
+//     if (voucher.arrears_not_cleared) {
+//       fee_voucher_arrears = fee_voucher_arrears.concat(JSON.parse(voucher.arrears_not_cleared));
+//     }
+//   });
+//   console.log(fee_voucher_arrears);
+
+//   const ids = vouchers.map(voucher => voucher.id).concat(fee_voucher_arrears);
+//   const cases = vouchers.map(voucher => `WHEN id = ? THEN ?`).join(' ');
+
+//   // Create an array of values for the `CASE` statement
+//   const caseValues = vouchers.reduce((arr, voucher) => {
+//     arr.push(voucher.id, voucher.amount + voucher.arrears + (voucher.first_advance_payment || 0));
+//     return arr;
+//   }, []);
+
+//   const query = `
+//     UPDATE fee_vouchers
+//     SET
+//       status = 'paid',
+//       recieved_payment = CASE ${cases} END,
+//       payment_received_through_bank = ?,
+//       scroll_no = ?,
+//       payment_date = ?
+//     WHERE id IN (?)
+//   `;
+
+//   //  is_arrear = ""
+
+//   // Combine caseValues with the other parameters
+//   const values = [...caseValues, bank_id, scroll_no, payment_date, ids];
+
+//   connection.query(query, values, (error, results) => {
+//     if (error) {
+//       console.error('Error updating fee_vouchers:', error.stack);
+//       res.status(500).send('Error updating fee vouchers');
+//       return;
+//     }
+
+//     // Check if any student needs to have their status updated
+//     const studentsToUpdate = vouchers.filter(voucher => {
+//       return voucher.arrears_not_cleared && JSON.parse(voucher.arrears_not_cleared).length > 1;
+//     }).map(voucher => voucher.student_id);
+
+//     if (studentsToUpdate.length > 0) {
+//       const updateStudentStatusQuery = `
+//         UPDATE students
+//         SET status_for_pendings = 'On'
+//         WHERE id IN (?)
+//       `;
+//       connection.query(updateStudentStatusQuery, [studentsToUpdate], (error, results) => {
+//         if (error) {
+//           console.error('Error updating student status:', error.stack);
+//           res.status(500).send('Error updating student status');
+//           return;
+//         }
+//         res.status(200).send('Fee vouchers and student statuses updated successfully');
+//       });
+//     } else {
+//       res.status(200).send('Fee vouchers updated successfully');
+//     }
+//   });
+// });
+
+// app.post('/submit-recieved-vouchers', (req, res) => {
+//   const { vouchers, payment_date, scroll_no, bank_id } = req.body;
+
+//   if (!vouchers || vouchers.length === 0) {
+//     res.status(400).send('No vouchers provided');
+//     return;
+//   }
+
+//   // Initialize an empty array to collect all arrears_not_cleared values
+//   let fee_voucher_arrears = [];
+//   vouchers.forEach(voucher => {
+//     if (voucher.arrears_not_cleared) {
+//       fee_voucher_arrears = fee_voucher_arrears.concat(JSON.parse(voucher.arrears_not_cleared));
+//     }
+//   });
+//   console.log(fee_voucher_arrears);
+
+//   const ids = vouchers.map(voucher => voucher.id).concat(fee_voucher_arrears);
+//   const cases = vouchers.map(voucher => `WHEN id = ? THEN ?`).join(' ');
+
+//   // Create an array of values for the `CASE` statement
+//   const caseValues = vouchers.reduce((arr, voucher) => {
+//     const paymentValue = fee_voucher_arrears.includes(voucher.id)
+//       ? 0 // Set recieved_payment to 0 for arrears_not_cleared vouchers
+//       : voucher.amount + voucher.arrears + (voucher.first_advance_payment || 0);
+//     arr.push(voucher.id, paymentValue);
+//     return arr;
+//   }, []);
+
+//   const query = `
+//     UPDATE fee_vouchers
+//     SET
+//       status = 'paid',
+//       recieved_payment = CASE ${cases} END,
+//       payment_received_through_bank = ?,
+//       scroll_no = ?,
+//       payment_date = ?,
+//       due_date = ?,
+//       is_arrear = CASE
+//                     WHEN id IN (${fee_voucher_arrears.length > 0 ? fee_voucher_arrears.map(() => '?').join(', ') : 'NULL'}) THEN 'arrears'
+//                     ELSE NULL
+//                   END
+//     WHERE id IN (${ids.map(() => '?').join(', ')})
+//   `;
+
+//   // Combine caseValues with the other parameters, including ids for arrears_not_cleared to set is_arrear to 'arrears'
+//   const values = [...caseValues, bank_id, scroll_no, payment_date, payment_date, ...fee_voucher_arrears, ...ids];
+
+//   connection.query(query, values, (error, results) => {
+//     if (error) {
+//       console.error('Error updating fee_vouchers:', error.stack);
+//       res.status(500).send('Error updating fee vouchers');
+//       return;
+//     }
+
+//     // Check if any student needs to have their status updated
+//     const studentsToUpdate = vouchers.filter(voucher => {
+//       return voucher.arrears_not_cleared && JSON.parse(voucher.arrears_not_cleared).length > 1;
+//     }).map(voucher => voucher.student_id);
+
+//     if (studentsToUpdate.length > 0) {
+//       const updateStudentStatusQuery = `
+//         UPDATE students
+//         SET status_for_pendings = 'On'
+//         WHERE id IN (?)
+//       `;
+//       connection.query(updateStudentStatusQuery, [studentsToUpdate], (error, results) => {
+//         if (error) {
+//           console.error('Error updating student status:', error.stack);
+//           res.status(500).send('Error updating student status');
+//           return;
+//         }
+//         res.status(200).send('Fee vouchers and student statuses updated successfully');
+//       });
+//     } else {
+//       res.status(200).send('Fee vouchers updated successfully');
+//     }
+//   });
+// });
+
+
+
+
+
+
+// // .............this is 100% correct..................dont delete it
+// app.post("/submit-recieved-vouchers", (req, res) => {
+//   const { vouchers, payment_date, scroll_no, bank_id } = req.body;
+
+//   if (!vouchers || vouchers.length === 0) {
+//     res.status(400).send("No vouchers provided");
+//     return;
+//   }
+
+//   // Initialize an empty array to collect all arrears_not_cleared values
+//   let fee_voucher_arrears = [];
+//   vouchers.forEach((voucher) => {
+//     if (voucher.arrears_not_cleared) {
+//       fee_voucher_arrears = fee_voucher_arrears.concat(
+//         JSON.parse(voucher.arrears_not_cleared)
+//       );
+//     }
+//   });
+//   console.log(fee_voucher_arrears);
+
+//   const ids = vouchers.map((voucher) => voucher.id).concat(fee_voucher_arrears);
+//   const cases = vouchers.map((voucher) => `WHEN id = ? THEN ?`).join(" ");
+
+//   // const cases = vouchers.map((voucher) => `WHEN id = ? THEN ?`).join(" ") + " ELSE recieved_payment";
+
+//   const caseValues = vouchers.reduce((arr, voucher) => {
+//     const paymentValue = fee_voucher_arrears.includes(voucher.id)
+//       ? 0 // Set recieved_payment to 0 for arrears_not_cleared vouchers
+//       : voucher.amount + voucher.arrears + (voucher.first_advance_payment || 0);
+//     arr.push(voucher.id, paymentValue);
+//     return arr;
+//   }, []);
+
+
+
+
+//   const query = `
+//     UPDATE fee_vouchers
+//     SET 
+//       status = 'paid',
+//       recieved_payment = CASE ${cases} END,
+//       payment_received_through_bank = ?,
+//       scroll_no = ?,
+//       payment_date = ?,
+//       is_arrear = CASE 
+//                     WHEN id IN (${
+//                       fee_voucher_arrears.length > 0
+//                         ? fee_voucher_arrears.map(() => "?").join(", ")
+//                         : "NULL"
+//                     }) THEN 'arrears'
+//                     ELSE NULL
+//                   END
+//     WHERE id IN (${ids.map(() => "?").join(", ")})`;
+
+//   // Combine caseValues with the other parameters, including ids for arrears_not_cleared to set is_arrear to 'arrears'
+//   const values = [
+//     ...caseValues,
+//     bank_id,
+//     scroll_no,
+//     payment_date,
+//     ...fee_voucher_arrears,
+//     ...ids,
+//   ];
+  
+
+//   connection.query(query, values, (error, results) => {
+//     if (error) {
+//       console.error("Error updating fee_vouchers:", error.stack);
+//       res.status(500).send("Error updating fee vouchers");
+//       return;
+//     }
+
+//     // If there are arrears, run a second query to update the due_date for those vouchers
+//     if (fee_voucher_arrears.length > 0) {
+//       const updateDueDateQuery = `
+//         UPDATE fee_vouchers
+//         SET due_date = ?
+//         WHERE id IN (${fee_voucher_arrears.map(() => "?").join(", ")})
+//       `;
+//       const updateDueDateValues = [payment_date, ...fee_voucher_arrears];
+
+//       connection.query(
+//         updateDueDateQuery,
+//         updateDueDateValues,
+//         (error, results) => {
+//           if (error) {
+//             console.error("Error updating due_date:", error.stack);
+//             res.status(500).send("Error updating due_date");
+//             return;
+//           }
+//           updateStudentStatuses(); // Call a function to update student statuses after both queries are done
+//         }
+//       );
+//     } else {
+//       updateStudentStatuses(); // If no arrears, just update student statuses
+//     }
+
+//     // Function to update student statuses
+//     function updateStudentStatuses() {
+//       // Check if any student needs to have their status updated
+//       const studentsToUpdate = vouchers
+//         .filter((voucher) => {
+//           return (
+//             voucher.arrears_not_cleared &&
+//             JSON.parse(voucher.arrears_not_cleared).length > 1
+//           );
+//         })
+//         .map((voucher) => voucher.student_id);
+
+//       if (studentsToUpdate.length > 0) {
+//         const updateStudentStatusQuery = `
+//           UPDATE students
+//           SET status_for_pendings = 'On'
+//           WHERE id IN (?)
+//         `;
+//         connection.query(
+//           updateStudentStatusQuery,
+//           [studentsToUpdate],
+//           (error, results) => {
+//             if (error) {
+//               console.error("Error updating student status:", error.stack);
+//               res.status(500).send("Error updating student status");
+//               return;
+//             }
+//             res
+//               .status(200)
+//               .send(
+//                 "Fee vouchers, due_date, and student statuses updated successfully"
+//               );
+//           }
+//         );
+//       } else {
+//         res.status(200).send("Fee vouchers updated successfully");
+//       }
+//     }
+//   });
+// });
+
+
+
+
+
+// ......correct code..............
+// app.post("/submit-recieved-vouchers", (req, res) => {
+//   const { vouchers, payment_date, scroll_no, bank_id } = req.body;
+
+//   if (!vouchers || vouchers.length === 0) {
+//     res.status(400).send("No vouchers provided");
+//     return;
+//   }
+
+//   // Initialize an empty array to collect all arrears_not_cleared values
+//   let fee_voucher_arrears = [];
+//   vouchers.forEach((voucher) => {
+//     if (voucher.arrears_not_cleared) {
+//       fee_voucher_arrears = fee_voucher_arrears.concat(
+//         JSON.parse(voucher.arrears_not_cleared)
+//       );
+//     }
+//   });
+
+//   const ids = vouchers.map((voucher) => voucher.id).concat(fee_voucher_arrears);
+//   const cases = vouchers.map((voucher) => `WHEN id = ? THEN ?`).join(" ");
+
+//   const caseValues = vouchers.reduce((arr, voucher) => {
+//     const paymentValue = fee_voucher_arrears.includes(voucher.id)
+//       ? 0
+//       : (voucher.amount || 0) + (voucher.arrears || 0) + (voucher.first_advance_payment || 0);
+//     arr.push(voucher.id, paymentValue);
+//     return arr;
+//   }, []);
+
+//   const query = `
+//     UPDATE fee_vouchers
+//     SET 
+//       status = 'paid',
+//       recieved_payment = CASE ${cases} END,
+//       payment_received_through_bank = ?,
+//       scroll_no = ?,
+//       payment_date = ?,
+//       is_arrear = CASE 
+//                     WHEN id IN (${
+//                       fee_voucher_arrears.length > 0
+//                         ? fee_voucher_arrears.map(() => "?").join(", ")
+//                         : "NULL"
+//                     }) THEN 'arrears'
+//                     ELSE NULL
+//                  END
+//     WHERE id IN (${ids.map(() => "?").join(", ")})
+//   `;
+
+//   const values = [
+//     ...caseValues,
+//     bank_id,
+//     scroll_no,
+//     payment_date,
+//     ...fee_voucher_arrears,
+//     ...ids,
+//   ];
+
+//   connection.query(query, values, (error, results) => {
+//     if (error) {
+//       console.error("Error updating fee_vouchers:", error.stack);
+//       res.status(500).send("Error updating fee vouchers");
+//       return;
+//     }
+
+//     if (fee_voucher_arrears.length > 0) {
+//       const updateDueDateQuery = `
+//         UPDATE fee_vouchers
+//         SET due_date = ?
+//         WHERE id IN (${fee_voucher_arrears.map(() => "?").join(", ")})
+//       `;
+//       const updateDueDateValues = [payment_date, ...fee_voucher_arrears];
+
+//       connection.query(updateDueDateQuery, updateDueDateValues, (error) => {
+//         if (error) {
+//           console.error("Error updating due_date:", error.stack);
+//           res.status(500).send("Error updating due_date");
+//           return;
+//         }
+//         handleArrearAdjustments(); // New step
+//       });
+//     } else {
+//       handleArrearAdjustments(); // New step
+//     }
+
+//     // ✅ This stays the same
+//     function updateStudentStatuses() {
+//       const studentsToUpdate = vouchers
+//         .filter((voucher) => {
+//           return (
+//             voucher.arrears_not_cleared &&
+//             JSON.parse(voucher.arrears_not_cleared).length > 1
+//           );
+//         })
+//         .map((voucher) => voucher.student_id);
+
+//       if (studentsToUpdate.length > 0) {
+//         const updateStudentStatusQuery = `
+//           UPDATE students
+//           SET status_for_pendings = 'On'
+//           WHERE id IN (?)
+//         `;
+//         connection.query(
+//           updateStudentStatusQuery,
+//           [studentsToUpdate],
+//           (error) => {
+//             if (error) {
+//               console.error("Error updating student status:", error.stack);
+//               res.status(500).send("Error updating student status");
+//               return;
+//             }
+//             res.status(200).send(
+//               "Fee vouchers, due_date, arrears cleanup, and student statuses updated successfully"
+//             );
+//           }
+//         );
+//       } else {
+//         res
+//           .status(200)
+//           .send("Fee vouchers, due_date, and arrears cleanup updated successfully");
+//       }
+//     }
+
+//     // ✅ New function: Arrears cleanup & deduction
+//     function handleArrearAdjustments() {
+//       const arrearsMap = {};
+//       vouchers.forEach((v) => {
+//         if (v.is_arrear === "arrears") {
+//           arrearsMap[v.id] = {
+//             arears_id_get : v.arrear_not_cleared,
+//             studentId: parseInt(v.student_id),
+//             forMonth: v.for_the_month,
+//             amount: parseFloat(
+//               (v.after_due_date_amount || 0) +
+//               (v.first_advance_payment || 0) +
+//               (v.arrears || 0)
+//             ),
+//           };
+//         }
+//       });
+
+//       const arrearsList = Object.entries(arrearsMap).map(([id, data]) => ({
+//         arrearId: parseInt(id),
+//         studentId: data.studentId,
+//         forMonth: data.forMonth,
+//         amount: data.amount,
+//       }));
+
+//       if (arrearsList.length === 0) {
+//         updateStudentStatuses();
+//         return;
+//       }
+
+//       const conditions = arrearsList
+//         .map(() => `(student_id = ? AND for_the_month > ?)`)
+//         .join(" OR ");
+//       const values = arrearsList.flatMap((a) => [a.studentId, a.forMonth]);
+
+//       const selectQuery = `
+//         SELECT id, student_id, for_the_month, arrears_not_cleared, arrears 
+//         FROM fee_vouchers 
+//         WHERE ${conditions}
+//       `;
+
+//       connection.query(selectQuery, values, (selectErr, rows) => {
+//         if (selectErr) {
+//           console.error("Error fetching future vouchers:", selectErr.stack);
+//           res.status(500).send("Error fetching future vouchers");
+//           return;
+//         }
+
+//         const updateData = [];
+
+//         rows.forEach((row) => {
+//           let arr = [];
+//           try {
+//             arr = JSON.parse(row.arrears_not_cleared || "[]");
+//             if (!Array.isArray(arr)) return;
+//           } catch (e) {
+//             console.error(`Invalid JSON in arrears_not_cleared (ID ${row.id})`);
+//             return;
+//           }
+
+//           let cleaned = [...arr];
+//           let totalToSubtract = 0;
+
+//           arrearsList.forEach((arrear) => {
+//             if (
+//               row.student_id === arrear.studentId &&
+//               row.for_the_month > arrear.forMonth
+//             ) {
+//               if (cleaned.some((id) => parseInt(id) === arrear.arrearId)) {
+//                 cleaned = cleaned.filter((id) => parseInt(id) !== arrear.arrearId);
+//               }
+//               totalToSubtract += arrear.amount;
+//             }
+//           });
+
+//           const newArrears = Math.max(0, parseFloat(row.arrears || 0) - totalToSubtract);
+
+//           updateData.push({
+//             id: row.id,
+//             arrears: newArrears,
+//             arrears_not_cleared: JSON.stringify(cleaned),
+//           });
+//         });
+
+//         if (updateData.length === 0) {
+//           updateStudentStatuses();
+//           return;
+//         }
+
+//         const updateIds = updateData.map((d) => d.id);
+//         const caseArrears = updateData
+//           .map((d) => `WHEN id = ${d.id} THEN ${connection.escape(d.arrears)}`)
+//           .join(" ");
+//         const caseANC = updateData
+//           .map((d) => `WHEN id = ${d.id} THEN ${connection.escape(d.arrears_not_cleared)}`)
+//           .join(" ");
+
+//         const updateQuery = `
+//           UPDATE fee_vouchers
+//           SET 
+//             arrears = CASE ${caseArrears} END,
+//             arrears_not_cleared = CASE ${caseANC} END
+//           WHERE id IN (${updateIds.join(",")})
+//         `;
+
+//         connection.query(updateQuery, (err) => {
+//           if (err) {
+//             console.error("Error updating arrears cleanup:", err.stack);
+//             res.status(500).send("Error updating arrears cleanup");
+//             return;
+//           }
+//           updateStudentStatuses(); // Final step
+//         });
+//       });
+//     }
+//   });
+// });
+
+
+
+
+
+
+
+app.post("/submit-recieved-vouchers", (req, res) => {
+  let { vouchers, payment_date, scroll_no, bank_id, session_id, user_id, campus_id } = req.body;
+
+  payment_date = payment_date.trim();
+  scroll_no = scroll_no.trim();
+  bank_id = bank_id.trim();
+
+  console.log(payment_date, scroll_no, bank_id);
+
+  if (!vouchers || vouchers.length === 0) {
+    res.status(400).send("No vouchers provided");
+    return;
+  }
+
+  // Initialize an empty array to collect all arrears_not_cleared values
+  let fee_voucher_arrears = [];
+  vouchers.forEach((voucher) => {
+    if (voucher.arrears_not_cleared) {
+      fee_voucher_arrears = fee_voucher_arrears.concat(
+        JSON.parse(voucher.arrears_not_cleared)
+      );
+    }
+  });
+
+  const ids = vouchers.map((voucher) => voucher.id).concat(fee_voucher_arrears);
+  const parentVoucherIds = vouchers.map((voucher) => voucher.id); // Store parent voucher IDs
+  const cases = vouchers.map((voucher) => `WHEN id = ? THEN ?`).join(" ");
+
+  const caseValues = vouchers.reduce((arr, voucher) => {
+    const paymentValue = fee_voucher_arrears.includes(voucher.id)
+      ? 0
+      : (voucher.amount || 0) + (voucher.arrears || 0) + (voucher.first_advance_payment || 0);
+    arr.push(voucher.id, paymentValue);
+    return arr;
+  }, []);
+
+
+  let postedByCases = '';
+  if (fee_voucher_arrears.length > 0) {
+    const arrearsToParentMap = {};
+    vouchers.forEach((voucher) => {
+      if (voucher.arrears_not_cleared) {
+        JSON.parse(voucher.arrears_not_cleared).forEach((arrearId) => {
+          arrearsToParentMap[arrearId] = voucher.id;
+        });
+      }
+    });
+    // Build CASE statement for posted_by_this_id
+    postedByCases = Object.entries(arrearsToParentMap)
+      .map(([arrearId, parentId]) => `WHEN id = ${arrearId} THEN ${parentId}`)
+      .join(" ");
+  }
+
+  // const query = `
+  //   UPDATE fee_vouchers
+  //   SET 
+  //     status = 'paid',
+  //     session_end = CASE 
+  //                   WHEN id IN (${parentVoucherIds.map(() => "?").join(",")}) THEN 'no'
+  //                   ELSE session_end
+  //                 END,
+  //     recieved_payment = CASE ${cases} END,
+  //     payment_received_through_bank = ?,
+  //     scroll_no = ?,
+  //     payment_date = ?,
+  //     is_arrear = CASE 
+  //                   WHEN id IN (${
+  //                     fee_voucher_arrears.length > 0
+  //                       ? fee_voucher_arrears.map(() => "?").join(", ")
+  //                       : "NULL"
+  //                   }) THEN 'arrears'
+  //                   ELSE NULL
+  //                END
+  //   WHERE id IN (${ids.map(() => "?").join(",")})
+  // `;
+
+
+   const query = `
+    UPDATE fee_vouchers
+    SET 
+      status = 'paid',
+      session_end = CASE 
+                    WHEN id IN (${parentVoucherIds.map(() => "?").join(",")}) THEN 'no'
+                    ELSE session_end
+                  END,
+      recieved_payment = CASE ${cases} END,
+      payment_received_through_bank = ?,
+      scroll_no = ?,
+      payment_date = ?,
+      is_arrear = CASE 
+                    WHEN id IN (${
+                      fee_voucher_arrears.length > 0
+                        ? fee_voucher_arrears.map(() => "?").join(", ")
+                        : "NULL"
+                    }) THEN 'arrears'
+                    ELSE NULL
+                  END
+      ${fee_voucher_arrears.length > 0 ? `, posted_by_this_id = CASE ${postedByCases} ELSE NULL END` : ''}
+    WHERE id IN (${ids.map(() => "?").join(",")})
+  `;
+  
+
+const values = [
+    ...parentVoucherIds, // For session_end CASE
+    ...caseValues,
+    bank_id,
+    scroll_no,
+    payment_date,
+    ...fee_voucher_arrears, // For is_arrear CASE
+    ...ids,
+  ];
+
+  connection.query(query, values, (error, results) => {
+    if (error) {
+      console.error("Error updating fee_vouchers:", error.stack);
+      res.status(500).send("Error updating fee vouchers");
+      return;
+    }
+
+    if (fee_voucher_arrears.length > 0) {
+      const updateDueDateQuery = `
+        UPDATE fee_vouchers
+        SET due_date = ?
+        WHERE id IN (${fee_voucher_arrears.map(() => "?").join(",")})
+      `;
+      const updateDueDateValues = [payment_date, ...fee_voucher_arrears];
+
+      connection.query(updateDueDateQuery, updateDueDateValues, (error) => {
+        if (error) {
+          console.error("Error updating due_date:", error.stack);
+          res.status(500).send("Error updating due_date");
+          return;
+        }
+        handleArrearAdjustments(); // New step
+      });
+    } else {
+      handleArrearAdjustments(); // New step
+    }
+
+    // ✅ This stays the same
+    function updateStudentStatuses() {
+      const studentsToUpdate = vouchers
+        .filter((voucher) => {
+          return (
+            voucher.arrears_not_cleared &&
+            JSON.parse(voucher.arrears_not_cleared).length > 1
+          );
+        })
+        .map((voucher) => voucher.student_id);
+
+      if (studentsToUpdate.length > 0) {
+        const updateStudentStatusQuery = `
+          UPDATE students
+          SET status_for_pendings = 'On'
+          WHERE id IN (?)
+        `;
+        connection.query(
+          updateStudentStatusQuery,
+          [studentsToUpdate],
+          (error) => {
+            if (error) {
+              console.error("Error updating student status:", error.stack);
+              res.status(500).send("Error updating student status");
+              return;
+            }
+            res.status(200).send(
+              "Fee vouchers, due_date, arrears cleanup, and student statuses updated successfully"
+            );
+            logAction('POSTING', 'fee_vouchers',  "Fee Post", 0, user_id, campus_id, session_id);
+          }
+        );
+      } else {
+        res
+          .status(200)
+          .send("Fee vouchers, due_date, and arrears cleanup updated successfully");
+          logAction('POSTING', 'fee_vouchers',  "Fee Post", 0, user_id, campus_id, session_id);
+      }
+    }
+
+    // ✅ New function: Arrears cleanup & deduction
+    function handleArrearAdjustments() {
+      const arrearsMap = {};
+      vouchers.forEach((v) => {
+        if (v.is_arrear === "arrears") {
+          arrearsMap[v.id] = {
+            arears_id_get: v.arrear_not_cleared,
+             studentId: parseInt(v.student_unique_id),
+            // studentId: parseInt(v.student_id),
+            forMonth: v.for_the_month,
+            amount: parseFloat(
+              (v.after_due_date_amount || 0) +
+              (v.first_advance_payment || 0) +
+              (v.arrears || 0)
+            ),
+            arrearFine: parseInt(v.arrears_fine + v.fine || 0), // Add this line to include arrear_fine
+          };
+        }
+      });
+
+      const arrearsList = Object.entries(arrearsMap).map(([id, data]) => ({
+        arrearId: parseInt(id),
+        studentId: data.studentId,
+        forMonth: data.forMonth,
+        amount: data.amount,
+        arrearFine:data.arrearFine
+      }));
+
+      if (arrearsList.length === 0) {
+        updateStudentStatuses();
+        return;
+      }
+
+      // Collect the combined list of arrears_not_cleared values (including current voucher id)
+      const arrearsToRemove = vouchers
+        .map((v) => [v.id, ...JSON.parse(v.arrears_not_cleared || "[]")])
+        .flat();
+// student_id = ? AND 
+      const conditions = arrearsList
+        .map(() => `(student_unique_id = ? AND for_the_month > ?)`)
+
+      .join(" OR ");
+      const values = arrearsList.flatMap((a) => [a.studentId, a.forMonth]);
+      // const values = arrearsList.flatMap((a) => [a.forMonth]);
+
+      // console.log(conditions, values);
+      // return false;
+
+      const selectQuery = `
+        SELECT id, student_unique_id, for_the_month, arrears_not_cleared, arrears, arrears_fine
+        FROM fee_vouchers 
+        WHERE ${conditions}
+      `;
+
+      connection.query(selectQuery, values, (selectErr, rows) => {
+        if (selectErr) {
+          console.error("Error fetching future vouchers:", selectErr.stack);
+          res.status(500).send("Error fetching future vouchers");
+          return;
+        }
+
+        const updateData = [];
+
+        rows.forEach((row) => {
+          let arr = [];
+          try {
+            arr = JSON.parse(row.arrears_not_cleared || "[]");
+            if (!Array.isArray(arr)) return;
+          } catch (e) {
+            console.error(`Invalid JSON in arrears_not_cleared (ID ${row.id})`);
+            return;
+          }
+
+          let cleaned = [...arr];
+          let totalToSubtract = 0;
+          let totalArrearFineSubtract = 0;
+
+          arrearsList.forEach((arrear) => {
+            if (
+              row.student_unique_id === arrear.studentId &&
+              row.for_the_month > arrear.forMonth
+            ) {
+              // Remove current voucher's ID and other arrear IDs from future vouchers
+              cleaned = cleaned.filter((id) => !arrearsToRemove.includes(parseInt(id)));
+              totalToSubtract += arrear.amount;
+              totalArrearFineSubtract += arrear.arrearFine; // Add this line to include arrear_fine
+            }
+          });
+
+          // console.log(totalArrearFineSubtract, "arrear fine");
+
+          const newArrears = Math.max(0, parseFloat(row.arrears || 0) - totalToSubtract);
+          const newArrearFine = Math.max(0, parseFloat(row.arrears_fine || 0) - totalArrearFineSubtract);
+
+          updateData.push({
+            id: row.id,
+            arrears: newArrears,
+            arrears_fine_get: newArrearFine,
+            arrears_not_cleared: JSON.stringify(cleaned),
+          });
+        });
+
+        // console.log(updateData);
+
+        if (updateData.length === 0) {
+          updateStudentStatuses();
+          return;
+        }
+
+        const updateIds = updateData.map((d) => d.id);
+        const caseArrears = updateData
+          .map((d) => `WHEN id = ${d.id} THEN ${connection.escape(d.arrears)}`)
+          .join(" ");
+
+          const caseFine = updateData
+          .map((d) => `WHEN id = ${d.id} THEN ${connection.escape(d.arrears_fine_get)}`)
+          .join(" ");
+
+        const caseANC = updateData
+          .map((d) => `WHEN id = ${d.id} THEN ${connection.escape(d.arrears_not_cleared)}`)
+          .join(" ");
+
+        const updateQuery = `
+          UPDATE fee_vouchers
+          SET 
+            arrears = CASE ${caseArrears} END,
+            arrears_fine = CASE ${caseFine} END,
+            arrears_not_cleared = CASE ${caseANC} END
+          WHERE id IN (${updateIds.join(",")})
+        `;
+
+        connection.query(updateQuery, (err) => {
+          if (err) {
+            console.error("Error updating arrears cleanup:", err.stack);
+            res.status(500).send("Error updating arrears cleanup");
+            return;
+          }
+          updateStudentStatuses(); // Final step
+        });
+      });
+    }
+  });
+});
+
+
+
+
+
+
+app.delete("/delete-bank-details/:id_get", (req, res) => {
+  const id_get = parseInt(req.params.id_get);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting" });
+      return;
+    }
+
+    const sql = "DELETE FROM bank_details WHERE id = ?";
+    const values = [id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting:", error);
+        res.status(500).json({ error: "Error deleting" });
+      } else {
+        console.log("Item deleted successfully");
+        res.status(200).json({ message: "Deleted successfully" });
+      }
+    });
+  });
+});
+
+// app.get('/attendance/:date/:campus_id/:session_id', (req, res) => {
+//   const { date, campus_id, session_id } = req.params;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error connecting to the database' });
+//       return;
+//     }
+
+//     const sql = 'SELECT * FROM school_employee_attendance WHERE date = ? AND campus_id = ? AND session_id = ?';
+
+//     connection.query(sql, [date, campus_id, session_id], (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error fetching attendance data:', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//       } else {
+//         res.json({ results });
+//       }
+//     });
+//   });
+// });
+
+
+
+// ....employee attendance Route...........
+app.get("/attendance/:date/:campus_id/:session_id", (req, res) => {
+  const { date, campus_id, session_id } = req.params;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // First query to get all attendance records
+    const sqlAllRecords =
+      "SELECT * FROM school_employee_attendance WHERE date = ? AND campus_id = ? AND session_id = ?";
+
+    // Second query to count and group by status
+    const sqlGroupedCount = `
+      SELECT employee_id, status, COUNT(*) as count
+      FROM school_employee_attendance
+      WHERE campus_id = ? AND session_id = ?
+      GROUP BY employee_id, status
+    `;
+
+    // Execute both queries concurrently
+    Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(
+          sqlAllRecords,
+          [date, campus_id, session_id],
+          (error, results) => {
+            if (error) reject(error);
+            else resolve(results);
+          }
+        );
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(
+          sqlGroupedCount,
+          [campus_id, session_id],
+          (error, results) => {
+            if (error) reject(error);
+            else resolve(results);
+          }
+        );
+      }),
+    ])
+      .then(([results, groupedCount]) => {
+        connection.release(); // Release the connection
+        res.json({ results, groupedCount });
+      })
+      .catch((error) => {
+        connection.release(); // Release the connection
+        console.error("Error executing queries:", error);
+        res.status(500).json({ error: "Internal server error" });
+      });
+  });
+});
+
+
+
+app.get("/student-attendance/:date/:campus_id/:session_id/:class_id/:section_id/:shift", (req, res) => {
+  const { date, campus_id, session_id, class_id, section_id, shift } = req.params;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // First query to get all attendance records
+    const sqlAllRecords =
+      "SELECT * FROM school_student_attendance WHERE class_id = ? AND section_id = ? AND date = ? AND campus_id = ? AND session_id = ? AND shift = ?";
+
+    // Second query to count and group by status
+    const sqlGroupedCount = `
+      SELECT student_id, status, COUNT(*) as count
+      FROM school_student_attendance
+      WHERE campus_id = ? AND session_id = ?  AND class_id = ? AND section_id = ?  AND shift = ?
+      GROUP BY student_id, status
+    `;
+
+    // Execute both queries concurrently
+    Promise.all([
+      new Promise((resolve, reject) => {
+        connection.query(
+          sqlAllRecords,
+          [ class_id, section_id, date, campus_id, session_id, shift],
+          (error, results) => {
+            if (error) reject(error);
+            else resolve(results);
+          }
+        );
+      }),
+      new Promise((resolve, reject) => {
+        connection.query(
+          sqlGroupedCount,
+          [campus_id, session_id, class_id, section_id, shift],
+          (error, results) => {
+            if (error) reject(error);
+            else resolve(results);
+          }
+        );
+      }),
+    ])
+      .then(([results, groupedCount]) => {
+        connection.release(); // Release the connection
+        res.json({ results, groupedCount });
+      })
+      .catch((error) => {
+        connection.release(); // Release the connection
+        console.error("Error executing queries:", error);
+        res.status(500).json({ error: "Internal server error" });
+      });
+  });
+});
+
+
+// app.post('/submit-attendance', (req, res) => {
+//   const { date, attendanceData } = req.body;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error connecting to the database' });
+//       return;
+//     }
+
+//     // First, fetch existing attendance data for the date
+//     const fetchSql = 'SELECT employee_id FROM attendance WHERE date = ?';
+//     connection.query(fetchSql, [date], (fetchError, fetchResults) => {
+//       if (fetchError) {
+//         connection.release();
+//         console.error('Error fetching existing attendance:', fetchError);
+//         res.status(500).json({ error: 'Internal server error' });
+//         return;
+//       }
+
+//       // Extract existing employee IDs
+//       const existingEmployeeIds = fetchResults.map(result => result.employee_id);
+
+//       // Separate data into updates and inserts
+//       const updateData = [];
+//       const insertData = [];
+
+//       attendanceData.forEach(item => {
+//         if (existingEmployeeIds.includes(item.employee_id)) {
+//           updateData.push([item.status, item.remarks, item.employee_id, date]);
+//         } else {
+//           insertData.push([item.employee_id, date, item.status, item.remarks]);
+//         }
+//       });
+
+//       // Perform updates if any
+//       if (updateData.length > 0) {
+//         const updateSql = 'UPDATE attendance SET status = ?, remarks = ? WHERE employee_id = ? AND date = ?';
+//         updateData.forEach(data => {
+//           connection.query(updateSql, data, (updateError) => {
+//             if (updateError) {
+//               connection.release();
+//               console.error('Error updating attendance data:', updateError);
+//               res.status(500).json({ error: 'Internal server error' });
+//               return;
+//             }
+//           });
+//         });
+//       }
+
+//       // Perform inserts if any
+//       if (insertData.length > 0) {
+//         const insertSql = 'INSERT INTO attendance (employee_id, date, status, remarks) VALUES ?';
+//         connection.query(insertSql, [insertData], (insertError) => {
+//           if (insertError) {
+//             connection.release();
+//             console.error('Error inserting attendance data:', insertError);
+//             res.status(500).json({ error: 'Internal server error' });
+//             return;
+//           }
+//         });
+//       }
+
+//       // Ensure the connection is released only once after all operations are complete
+//       connection.release();
+//       res.json({ message: 'Attendance data saved/updated successfully!' });
+//     });
+//   });
+// });
+
+// app.post('/submit-attendance', (req, res) => {
+//   const { date, attendanceData } = req.body;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error connecting to the database' });
+//       return;
+//     }
+
+//     // First, fetch existing attendance data for the date
+//     const fetchSql = 'SELECT employee_id FROM attendance WHERE date = ?';
+//     connection.query(fetchSql, [date], (fetchError, fetchResults) => {
+//       if (fetchError) {
+//         connection.release();
+//         console.error('Error fetching existing attendance:', fetchError);
+//         res.status(500).json({ error: 'Internal server error' });
+//         return;
+//       }
+
+//       // Extract existing employee IDs
+//       const existingEmployeeIds = fetchResults.map(result => result.employee_id);
+
+//       // Separate data into updates and inserts
+//       const updateData = [];
+//       const insertData = [];
+
+//       attendanceData.forEach(item => {
+//         if (existingEmployeeIds.includes(item.employee_id)) {
+//           updateData.push([item.status, item.remarks, item.employee_id, date]);
+//         } else {
+//           insertData.push([item.employee_id, date, item.status, item.remarks]);
+//         }
+//       });
+
+//       // Use Promise.all to handle both updates and inserts
+//       const updateQueries = updateData.map(data => {
+//         return new Promise((resolve, reject) => {
+//           const updateSql = 'UPDATE school_employee_attendance SET status = ?, remarks = ? WHERE employee_id = ? AND date = ?';
+//           connection.query(updateSql, data, (updateError) => {
+//             if (updateError) {
+//               return reject(updateError);
+//             }
+//             resolve();
+//           });
+//         });
+//       });
+
+//       const insertQuery = new Promise((resolve, reject) => {
+//         if (insertData.length > 0) {
+//           const insertSql = 'INSERT INTO school_employee_attendance (employee_id, date, status, remarks) VALUES ?';
+//           connection.query(insertSql, [insertData], (insertError) => {
+//             if (insertError) {
+//               return reject(insertError);
+//             }
+//             resolve();
+//           });
+//         } else {
+//           resolve();
+//         }
+//       });
+
+//       // Execute all queries and release the connection when done
+//       Promise.all([...updateQueries, insertQuery])
+//         .then(() => {
+//           connection.release(); // Release the connection only once after all operations
+//           res.json({ message: 'Attendance data saved/updated successfully!' });
+//         })
+//         .catch((error) => {
+//           connection.release();
+//           console.error('Error during attendance operation:', error);
+//           res.status(500).json({ error: 'Internal server error' });
+//         });
+//     });
+//   });
+// });
+
+
+
+
+app.post("/submit-attendance", async (req, res) => {
+  const { date, attendanceData, user_id, campus_id, session_id } = req.body;
+
+  const updateQueries = [];
+  const insertQueries = [];
+
+  // Iterate through the attendanceData array
+  attendanceData.forEach((attendance) => {
+    if (attendance.hidden_id) {
+      // If hidden_id exists, create an UPDATE query
+      const updateQuery = `
+        UPDATE school_employee_attendance 
+        SET 
+          employee_id = ${attendance.employee_id}, 
+          status = '${attendance.status}', 
+          remarks = '${attendance.remarks}', 
+          date = '${date}'
+        WHERE id = ${attendance.hidden_id}
+      `;
+      updateQueries.push(connection.query(updateQuery)); // Assuming db.query() is your query execution function
+    } else {
+      // If no hidden_id, create an INSERT query
+      const insertQuery = `
+        INSERT INTO school_employee_attendance (employee_id, status, remarks, date, user_id, campus_id, session_id)
+        VALUES (${attendance.employee_id}, '${attendance.status}', '${attendance.remarks}', '${date}', '${user_id}', '${campus_id}', '${session_id}')
+      `;
+      insertQueries.push(connection.query(insertQuery));
+    }
+  });
+
+  try {
+    // Run both update and insert queries in parallel
+    await Promise.all([...updateQueries, ...insertQueries]);
+    res
+      .status(200)
+      .json({ message: "Attendance data updated/inserted successfully" });
+       logAction('CREATE', 'school_employee_attendance' ,'Employee Attendance', 0, user_id, campus_id, session_id);
+  } catch (error) {
+    console.error("Error processing attendance data:", error);
+    res.status(500).json({ message: "Error processing attendance data" });
+  }
+});
+
+
+
+
+app.post("/submit-student-attendance", async (req, res) => {
+  const { date, attendanceData, user_id, campus_id, session_id, class_id, section_id, shift } = req.body;
+
+  const updateQueries = [];
+  const insertQueries = [];
+
+  // Iterate through the attendanceData array
+  attendanceData.forEach((attendance) => {
+    if (attendance.hidden_id) {
+      // If hidden_id exists, create an UPDATE query
+      const updateQuery = `
+        UPDATE school_student_attendance 
+        SET 
+          student_id = ${attendance.student_id}, 
+          status = '${attendance.status}', 
+          remarks = '${attendance.remarks}', 
+          class_id = '${class_id}', 
+          section_id = '${section_id}', 
+          shift = '${shift}', 
+          date = '${date}'
+        WHERE id = ${attendance.hidden_id}
+      `;
+      updateQueries.push(connection.query(updateQuery)); // Assuming db.query() is your query execution function
+    } else {
+      // If no hidden_id, create an INSERT query
+      const insertQuery = `
+        INSERT INTO school_student_attendance (student_id, status, remarks, date, user_id, campus_id, session_id, class_id, section_id, shift)
+        VALUES (${attendance.student_id}, '${attendance.status}', '${attendance.remarks}', '${date}', '${user_id}', '${campus_id}', '${session_id}', '${class_id}', '${section_id}', '${shift}')
+      `;
+      insertQueries.push(connection.query(insertQuery));
+    }
+  });
+
+  try {
+    // Run both update and insert queries in parallel
+    await Promise.all([...updateQueries, ...insertQueries]);
+    res
+      .status(200)
+      .json({ message: "Attendance data updated/inserted successfully" });
+
+       logAction('CREATE', 'school_student_attendance' ,'STUDENT ATTENDANCE', 0, user_id, campus_id, session_id, {class_id:class_id, section_id:section_id, shift:shift});
+
+  } catch (error) {
+    console.error("Error processing attendance data:", error);
+    res.status(500).json({ message: "Error processing attendance data" });
+  }
+});
+
+
+
+
+
+
+app.get("/employee-list-for-attendance/:campus_id", (req, res) => {
+  const { campus_id } = req.params;
+
+  // Validate the required parameters
+  if (!campus_id) {
+    return res.status(400).json({ error: "Missing campus_id" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      return res.status(500).json({ error: "Error connecting to the database" });
+    }
+
+    const sql = `
+      SELECT 
+        e.id, 
+        e.full_name, 
+        ep.employee_post, 
+        ps.pay_scale, 
+        ps.job_type
+      FROM school_employees e
+      LEFT JOIN employee_posts ep ON e.employee_post_id = ep.id
+      LEFT JOIN pay_scale ps ON e.pay_scale_id = ps.id
+      WHERE e.campus_id = ? 
+    `;
+
+    connection.query(sql, [campus_id], (error, results) => {
+      connection.release(); // Always release the connection when done
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+
+      // Check if no results were found
+      if (results.length === 0) {
+        return res.status(404).json({ message: "No employees found for the given campus and session" });
+      }
+
+      return res.json({ results });
+    });
+  });
+});
+
+
+
+
+
+
+app.get("/student-list-for-attendance", (req, res) => {
+  const { class_id, section_id, campus_id, session_id, shift } = req.query;
+
+  // console.log("class" + class_id);
+  // console.log("section" + section_id);
+  // console.log("campus" + campus_id);
+  // console.log("session" + session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+    
+    let sql = `
+        SELECT 
+            students.id,
+            students.shift,
+            students.register_no,
+            students.old_register_no,
+            students.full_name,
+            classes.class,
+            sections.section_name,
+            students.father_name,
+            students.father_cnic,
+            school_categories.category,
+            students.mobile_no,
+            students.status,
+            students.campus_id,
+            students.session_id
+        FROM 
+            students
+        LEFT JOIN 
+            classes ON students.class_id = classes.id 
+        LEFT JOIN 
+            sections ON students.section_id = sections.id
+        LEFT JOIN 
+            school_categories ON students.category_id = school_categories.id
+        WHERE 
+            students.status_on_off = 'On' 
+            AND students.status IN ('New Admission', 'Promoted')
+            AND students.class_id = ? 
+            AND students.section_id = ?
+            AND students.session_id = ? 
+            AND students.campus_id = ?
+            AND students.shift = ?`;
+
+    // Pass the parameters in an array to bind them to the placeholders
+    connection.query(sql, [class_id, section_id, session_id, campus_id, shift], (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+
+app.post("/school-employee-attendance", (req, res) => {
+  const { date, attendanceData } = req.body;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // First, fetch existing attendance data for the date
+    const fetchSql =
+      "SELECT employee_id FROM school_employee_attendance WHERE date = ?";
+    connection.query(fetchSql, [date], (fetchError, fetchResults) => {
+      if (fetchError) {
+        connection.release();
+        console.error("Error fetching existing attendance:", fetchError);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      // Extract existing employee IDs
+      const existingEmployeeIds = fetchResults.map(
+        (result) => result.employee_id
+      );
+
+      // Separate data into updates and inserts
+      const updateData = [];
+      const insertData = [];
+
+      attendanceData.forEach((item) => {
+        if (existingEmployeeIds.includes(item.employee_id)) {
+          updateData.push([item.status, item.remarks, item.employee_id, date]);
+        } else {
+          insertData.push([item.employee_id, date, item.status, item.remarks]);
+        }
+      });
+
+      // Perform updates if any
+      if (updateData.length > 0) {
+        const updateSql =
+          "UPDATE school_employee_attendance SET status = ?, remarks = ? WHERE employee_id = ? AND date = ?";
+        updateData.forEach((data) => {
+          connection.query(updateSql, data, (updateError) => {
+            if (updateError) {
+              connection.release();
+              console.error("Error updating attendance data:", updateError);
+              res.status(500).json({ error: "Internal server error" });
+              return;
+            }
+          });
+        });
+      }
+
+      // Perform inserts if any
+      if (insertData.length > 0) {
+        const insertSql =
+          "INSERT INTO attendance (employee_id, date, status, remarks) VALUES ?";
+        connection.query(insertSql, [insertData], (insertError) => {
+          if (insertError) {
+            connection.release();
+            console.error("Error inserting attendance data:", insertError);
+            res.status(500).json({ error: "Internal server error" });
+            return;
+          }
+        });
+      }
+
+      // Ensure the connection is released only once after all operations are complete
+      connection.release();
+      res.json({ message: "Attendance data saved/updated successfully!" });
+    });
+  });
+});
+
+// app.get('/employee-list-for-attendance', (req, res) => {
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error connecting to the database:', err);
+//       res.status(500).json({ error: 'Error connecting to the database' });
+//       return;
+//     }
+
+//     const sql = 'SELECT * FROM employees';
+
+//     connection.query(sql, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error executing SQL query:', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//       } else {
+//         res.json({ results });
+//       }
+//     });
+//   });
+// });
+
+
+
+
+// app.get("/view-admission/:admission_id/:campus_id/:session_id", (req, res) => {
+//   const admission_id = parseInt(req.params.admission_id);
+//   const campus_id = parseInt(req.params.campus_id);
+//   const session_id = parseInt(req.params.session_id);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error getting students" });
+//       return;
+//     }
+
+//     const sql = `SELECT 
+//       students.*, users.username,
+//       classes.class AS class_name,
+//       sections.section_name,
+//       school_categories.category AS category_name,
+//       sessions.session_name,
+//       campuses.campus_name,
+//       fee_vouchers.for_the_month,
+//       fee_vouchers.arrears,
+//       fee_vouchers.first_advance_payment,
+//       fee_vouchers.recieved_payment,
+//       fee_vouchers.status as fee_status,
+//       fee_vouchers.due_date,
+//       fee_vouchers.payment_date,
+//       house.house_or_club_name as house_name,
+//       club.house_or_club_name as club_name,
+//       CASE 
+//         WHEN fee_vouchers.payment_date > fee_vouchers.due_date 
+//         THEN fee_vouchers.total_amount_data + COALESCE(fee_vouchers.fine, 0) -- Handle potential NULL fine
+//         ELSE fee_vouchers.total_amount_data
+//       END AS total_amount
+//     FROM 
+//       students  -- Fully qualify the table once here
+//     LEFT JOIN 
+//       classes ON students.class_id = classes.id
+//     LEFT JOIN 
+//       sections ON students.section_id = sections.id
+//     LEFT JOIN 
+//       school_categories ON students.category_id = school_categories.id
+//     LEFT JOIN 
+//       sessions ON students.session_id = sessions.id
+//     LEFT JOIN 
+//       campuses ON students.campus_id = campuses.id
+//     LEFT JOIN 
+//       house_or_club as house ON students.house_id = house.id
+//     LEFT JOIN 
+//       house_or_club as club ON students.club_id = club.id
+//     LEFT JOIN 
+//       fee_vouchers ON fee_vouchers.student_id = students.id
+//     LEFT JOIN users ON users.user_id = students.student_unique_id
+//     WHERE 
+//       students.id = ? 
+//       AND students.campus_id = ?  -- Ensure this is the correct fixed campus ID
+//       AND students.session_id = ?  -- Ensure this is the correct fixed session ID
+//     ORDER BY 
+//       fee_vouchers.for_the_month DESC;
+//     `;
+
+//     const values = [admission_id, campus_id, session_id];
+    
+
+//     connection.query(sql, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error("Error getting students:", error);
+//         res.status(500).json({ error: "Error getting students" });
+//       } else {
+//         res.status(200).json({ results:result });
+//       }
+//     });
+//   });
+// });
+
+
+
+
+
+// app.get("/view-admission/:admission_id/:campus_id/:session_id", (req, res) => {
+//   const admission_id = parseInt(req.params.admission_id);
+//   const campus_id = parseInt(req.params.campus_id);
+//   const session_id = parseInt(req.params.session_id);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error getting connection" });
+//       return;
+//     }
+
+//     // First query: Get student admission details
+//     const admissionSql = `SELECT 
+//       students.*, users.username,
+//       classes.class AS class_name,
+//       sections.section_name,
+//       school_categories.category AS category_name,
+//       sessions.session_name,
+//       campuses.campus_name,
+//       fee_vouchers.for_the_month,
+//       fee_vouchers.arrears,
+//       fee_vouchers.first_advance_payment,
+//       fee_vouchers.recieved_payment,
+//       fee_vouchers.status as fee_status,
+//       fee_vouchers.due_date,
+//       fee_vouchers.payment_date,
+//       house.house_or_club_name as house_name,
+//       club.house_or_club_name as club_name,
+//       CASE 
+//         WHEN fee_vouchers.payment_date > fee_vouchers.due_date 
+//         THEN fee_vouchers.total_amount_data + COALESCE(fee_vouchers.fine, 0) + COALESCE(fee_vouchers.first_advance_payment, 0)
+//         ELSE fee_vouchers.total_amount_data + COALESCE(fee_vouchers.first_advance_payment, 0)
+//       END AS total_amount
+//     FROM 
+//       students
+//     LEFT JOIN 
+//       classes ON students.class_id = classes.id
+//     LEFT JOIN 
+//       sections ON students.section_id = sections.id
+//     LEFT JOIN 
+//       school_categories ON students.category_id = school_categories.id
+//     LEFT JOIN 
+//       sessions ON students.session_id = sessions.id
+//     LEFT JOIN 
+//       campuses ON students.campus_id = campuses.id
+//     LEFT JOIN 
+//       house_or_club as house ON students.house_id = house.id
+//     LEFT JOIN 
+//       house_or_club as club ON students.club_id = club.id
+//     LEFT JOIN 
+//       fee_vouchers ON fee_vouchers.student_id = students.id
+//     LEFT JOIN users ON users.user_id = students.student_unique_id
+//     WHERE 
+//       students.id = ? 
+//       AND students.campus_id = ?
+//       AND students.session_id = ?
+//     ORDER BY 
+//       fee_vouchers.for_the_month DESC;
+//     `;
+
+//     // Second query: Get student activities
+//     const activitiesSql = `SELECT *
+//     FROM 
+//       student_activities
+//     WHERE 
+//       student_activities.student_id = ?
+//       AND student_activities.campus_id = ?
+//       AND student_activities.session_id = ?
+//     ORDER BY 
+//       student_activities.id DESC;
+//     `;
+
+//     const values = [admission_id, campus_id, session_id];
+
+//     // Execute both queries in parallel
+//     connection.query(admissionSql, values, (error, admissionResults) => {
+//       if (error) {
+//         connection.release();
+//         console.error("Error getting admission details:", error);
+//         return res.status(500).json({ error: "Error getting admission details" });
+//       }
+
+//       connection.query(activitiesSql, values, (activityError, activityResults) => {
+//         connection.release(); // Release the connection
+
+//         if (activityError) {
+//           console.error("Error getting activities:", activityError);
+//           return res.status(500).json({ 
+//             error: "Error getting activities",
+//             admission: admissionResults || null 
+//           });
+//         }
+
+//         res.status(200).json({ 
+//           results: admissionResults || null,
+//           activities: activityResults 
+//         });
+//       });
+//     });
+//   });
+// });
+
+
+
+app.get("/view-admission/:admission_id/:campus_id/:session_id", (req, res) => {
+  const admission_id = parseInt(req.params.admission_id);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  // Validate parameters
+  if (isNaN(admission_id) || isNaN(campus_id) || isNaN(session_id)) {
+    return res.status(400).json({ error: "Invalid parameters" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      return res.status(500).json({ error: "Database connection error" });
+    }
+
+    // First query: Get student admission details
+    const admissionSql = `SELECT 
+      students.*, users.username,
+      classes.class AS class_name,
+      sections.section_name,
+      school_categories.category AS category_name,
+      sessions.session_name,
+      campuses.campus_name,
+      fee_vouchers.for_the_month,
+      fee_vouchers.arrears,
+      fee_vouchers.first_advance_payment,
+      fee_vouchers.recieved_payment,
+      fee_vouchers.status as fee_status,
+      fee_vouchers.due_date,
+      fee_vouchers.payment_date,
+      house.house_or_club_name as house_name,
+      club.house_or_club_name as club_name,
+     CASE 
+    WHEN fee_vouchers.payment_date > fee_vouchers.due_date 
+    THEN fee_vouchers.total_amount_data + COALESCE(fee_vouchers.fine, 0) + COALESCE(fee_vouchers.first_advance_payment, 0) + 
+         CASE 
+             WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears
+             ELSE 0
+         END
+    ELSE fee_vouchers.total_amount_data + COALESCE(fee_vouchers.first_advance_payment, 0) + 
+         CASE 
+             WHEN fee_vouchers.first_arrear = 'yes' THEN fee_vouchers.arrears
+             ELSE 0
+         END
+END AS total_amount
+    FROM 
+      students
+    LEFT JOIN 
+      classes ON students.class_id = classes.id
+    LEFT JOIN 
+      sections ON students.section_id = sections.id
+    LEFT JOIN 
+      school_categories ON students.category_id = school_categories.id
+    LEFT JOIN 
+      sessions ON students.session_id = sessions.id
+    LEFT JOIN 
+      campuses ON students.campus_id = campuses.id
+    LEFT JOIN 
+      house_or_club as house ON students.house_id = house.id
+    LEFT JOIN 
+      house_or_club as club ON students.club_id = club.id
+    LEFT JOIN 
+      fee_vouchers ON fee_vouchers.student_id = students.id
+    LEFT JOIN users ON users.user_id = students.student_unique_id
+    WHERE 
+      students.id = ? 
+      AND students.campus_id = ?
+      AND students.session_id = ?
+    ORDER BY 
+      fee_vouchers.for_the_month ASC;
+    `;
+
+    // Second query: Get student activities
+    const activitiesSql = `SELECT *
+    FROM 
+      student_activities
+    WHERE 
+      student_activities.student_id = ?
+      AND student_activities.campus_id = ?
+      AND student_activities.session_id = ?
+    ORDER BY 
+      student_activities.id DESC;
+    `;
+
+    // Third query: Get student discipline records
+    const disciplineSql = `SELECT 
+      sd.*,
+      DATE_FORMAT(sd.date_of_incident, '%Y-%m-%d') AS formatted_date
+    FROM 
+      student_discipline sd
+    WHERE 
+      sd.student_id = ?
+      AND sd.campus_id = ?
+      AND sd.session_id = ?
+    ORDER BY 
+      sd.date_of_incident DESC;
+    `;
+
+    const values = [admission_id, campus_id, session_id];
+
+    // Execute all three queries
+    connection.query(admissionSql, values, (error, admissionResults) => {
+      if (error) {
+        connection.release();
+        console.error("Error getting admission details:", error);
+        return res.status(500).json({ error: "Error getting admission details" });
+      }
+
+      connection.query(activitiesSql, values, (activityError, activityResults) => {
+        if (activityError) {
+          connection.release();
+          console.error("Error getting activities:", activityError);
+          return res.status(500).json({ 
+            error: "Error getting activities",
+            admission: admissionResults || null 
+          });
+        }
+
+        connection.query(disciplineSql, values, (disciplineError, disciplineResults) => {
+          connection.release(); // Release the connection
+
+          if (disciplineError) {
+            console.error("Error getting discipline records:", disciplineError);
+            return res.status(500).json({ 
+              error: "Error getting discipline records",
+              admission: admissionResults || null,
+              activities: activityResults || null
+            });
+          }
+
+          res.status(200).json({ 
+            results: admissionResults || null,
+            activities: activityResults || [],
+            discipline: disciplineResults || []
+          });
+        });
+      });
+    });
+  });
+});
+
+
+
+
+
+// app.get('/view-employee/:employee_id/:campus_id', (req, res) => {
+
+//   const employee_id = parseInt(req.params.employee_id);
+//   const campus_id = parseInt(req.params.campus_id);
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error getting students' });
+//       return;
+//     }
+
+//     const sql = `
+//    SELECT
+//             school_employees.*,
+//             service_book.*,
+//             employee_roles.employee_role,
+//             employee_posts.employee_post,
+//             pay_scale.pay_scale,
+//             pay_scale.job_type
+//         FROM
+//             school_employees
+//          JOIN
+//             employee_roles ON school_employees.employee_role_id = employee_roles.id
+//          JOIN
+//             employee_posts ON school_employees.employee_post_id = employee_posts.id
+//          JOIN
+//             pay_scale ON school_employees.pay_scale_id = pay_scale.id
+//          WHERE
+//           school_employees.soft_delete = 'On' AND school_employees.id = ? AND school_employees.campus_id = ?
+//   `;
+
+//     const values = [employee_id, campus_id];
+
+//     connection.query(sql, values, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error getting data:', error);
+//         res.status(500).json({ error: 'Error getting data' });
+//       } else {
+//         res.status(200).json({ results });
+//       }
+//     });
+//   });
+// });
+
+// app.get("/view-employee/:employee_id/:campus_id", (req, res) => {
+//   const employee_id = parseInt(req.params.employee_id);
+//   const campus_id = parseInt(req.params.campus_id);
+
+//   // Establish database connection
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error getting connection:", err);
+//       return res.status(500).json({ error: "Error getting connection" });
+//     }
+
+//     // Query to fetch the employee details
+//     const employeeSql = `
+//           SELECT 
+//                school_employees.*,
+//              employee_roles.employee_role,
+//              employee_posts.employee_post,
+//              pay_scale.pay_scale,
+//              pay_scale.job_type
+//           FROM 
+//               school_employees
+//           JOIN 
+//               employee_roles ON school_employees.employee_role_id = employee_roles.id 
+//           JOIN 
+//               employee_posts ON school_employees.employee_post_id = employee_posts.id
+//           JOIN 
+//               pay_scale ON school_employees.pay_scale_id = pay_scale.id
+//           WHERE 
+//               school_employees.soft_delete = 'On' 
+//               AND school_employees.id = ? 
+//               AND school_employees.campus_id = ?
+//       `;
+
+//     // Query to fetch the service book entries for the employee
+//     const serviceBookSql = `
+//           SELECT *
+//           FROM 
+//               service_book
+//           WHERE 
+//               employee_id = ?
+//           ORDER BY 
+//               id DESC
+//       `;
+
+//     // Fetch employee data
+//     connection.query(
+//       employeeSql,
+//       [employee_id, campus_id],
+//       (employeeError, employeeResults) => {
+//         if (employeeError) {
+//           connection.release();
+//           console.error("Error fetching employee data:", employeeError);
+//           return res
+//             .status(500)
+//             .json({ error: "Error fetching employee data" });
+//         }
+
+//         // Check if employee data was found
+//         if (employeeResults.length === 0) {
+//           connection.release();
+//           return res.status(404).json({ message: "No employee data found." });
+//         }
+
+//         // Fetch service book data
+//         connection.query(
+//           serviceBookSql,
+//           [employee_id],
+//           (serviceBookError, serviceBookResults) => {
+//             // Release the connection after both queries are done
+//             connection.release();
+
+//             if (serviceBookError) {
+//               console.error(
+//                 "Error fetching service book data:",
+//                 serviceBookError
+//               );
+//               return res
+//                 .status(500)
+//                 .json({ error: "Error fetching service book data" });
+//             }
+
+//             // Combine the employee data and service book data
+//             const employeeData = {
+//               ...employeeResults[0], // Main employee data
+//               serviceBook: serviceBookResults, // Service book data as a block
+//             };
+
+//             // Send the structured response
+//             res.status(200).json({ employeeData });
+//           }
+//         );
+//       }
+//     );
+//   });
+// });
+
+
+app.get("/view-employee/:employee_id/:campus_id", (req, res) => {
+  const employee_id = parseInt(req.params.employee_id);
+  const campus_id = parseInt(req.params.campus_id);
+
+  // Establish database connection
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      return res.status(500).json({ error: "Error getting connection" });
+    }
+
+    // Query to fetch the employee details
+    const employeeSql = `
+      SELECT 
+        school_employees.*,
+        employee_roles.employee_role,
+        employee_posts.employee_post,
+        pay_scale.pay_scale,
+        pay_scale.job_type
+      FROM 
+        school_employees
+      JOIN 
+        employee_roles ON school_employees.employee_role_id = employee_roles.id 
+      JOIN 
+        employee_posts ON school_employees.employee_post_id = employee_posts.id
+      JOIN 
+        pay_scale ON school_employees.pay_scale_id = pay_scale.id
+      WHERE 
+        school_employees.soft_delete = 'On' 
+        AND school_employees.id = ? 
+        AND school_employees.campus_id = ?
+    `;
+
+    // Query to fetch the service book entries for the employee
+    const serviceBookSql = `
+      SELECT *
+      FROM 
+        service_book
+      WHERE 
+        employee_id = ?
+      ORDER BY 
+        id DESC
+    `;
+
+    // NEW: Query to fetch employee discipline records
+    const disciplineSql = `
+      SELECT *
+      FROM 
+        employee_discipline
+      WHERE 
+        employee_id = ?
+      ORDER BY 
+        date_of_incident DESC
+    `;
+
+    // Fetch employee data
+    connection.query(
+      employeeSql,
+      [employee_id, campus_id],
+      (employeeError, employeeResults) => {
+        if (employeeError) {
+          connection.release();
+          console.error("Error fetching employee data:", employeeError);
+          return res.status(500).json({ error: "Error fetching employee data" });
+        }
+
+        // Check if employee data was found
+        if (employeeResults.length === 0) {
+          connection.release();
+          return res.status(404).json({ message: "No employee data found." });
+        }
+
+        // Fetch service book data
+        connection.query(
+          serviceBookSql,
+          [employee_id],
+          (serviceBookError, serviceBookResults) => {
+            if (serviceBookError) {
+              connection.release();
+              console.error("Error fetching service book data:", serviceBookError);
+              return res.status(500).json({ error: "Error fetching service book data" });
+            }
+
+            // NEW: Fetch discipline data
+            connection.query(
+              disciplineSql,
+              [employee_id],
+              (disciplineError, disciplineResults) => {
+                // Release the connection after all queries are done
+                connection.release();
+
+                if (disciplineError) {
+                  console.error("Error fetching discipline data:", disciplineError);
+                  return res.status(500).json({ error: "Error fetching discipline data" });
+                }
+
+                // Combine all the data
+                const employeeData = {
+                  ...employeeResults[0], // Main employee data
+                  serviceBook: serviceBookResults, // Service book data
+                  disciplineRecords: disciplineResults // Discipline records
+                };
+
+                // Send the structured response
+                res.status(200).json({ employeeData });
+              }
+            );
+          }
+        );
+      }
+    );
+  });
+});
+
+
+
+app.get("/view-SLC/:admission_id/:campus_id/:session_id", (req, res) => {
+  const admission_id = parseInt(req.params.admission_id);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error getting students" });
+      return;
+    }
+
+    const sql = `
+    SELECT 
+      students.*,
+      classes.class AS class_name,
+      sections.section_name,
+      school_categories.category AS category_name,
+      sessions.session_name,
+      campuses.campus_name,
+      fv.for_the_month
+    FROM 
+      students
+    LEFT JOIN classes ON students.class_id = classes.id
+    LEFT JOIN sections ON students.section_id = sections.id
+    LEFT JOIN school_categories ON students.category_id = school_categories.id
+    LEFT JOIN sessions ON students.session_id = sessions.id
+    LEFT JOIN campuses ON students.campus_id = campuses.id
+    LEFT JOIN (
+        SELECT 
+          fv1.*
+        FROM fee_vouchers fv1
+        WHERE fv1.id = (
+            SELECT fv2.id FROM fee_vouchers fv2
+            WHERE fv2.student_id = fv1.student_id
+            ORDER BY fv2.for_the_month DESC 
+            LIMIT 1
+        )
+    ) AS fv ON students.id = fv.student_id
+    WHERE 
+      students.id = ? 
+      AND students.campus_id = ? 
+      AND students.session_id = ?`;
+
+    const values = [admission_id, campus_id, session_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error getting students:", error);
+        res.status(500).json({ error: "Error getting students" });
+      } else {
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+// app.get('/employee-list', (req, res) => {
+//   console.log("yes this is route");
+
+//   const page = parseInt(req.query.page) || 1;
+//   const limit = parseInt(req.query.limit) || 5;
+//   const offset = (page - 1) * limit;
+//   const search = req.query.search;
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching employees' });
+//       return;
+//     }
+
+//     let sql = `SELECT * FROM school_employees`;
+//     if (search) {
+//       sql += ` WHERE full_name LIKE '%${search}%' OR mobile_no LIKE '%${search}%' OR cnic LIKE '%${search}%'`;
+//     }
+//     sql += ` LIMIT ${limit} OFFSET ${offset}`;
+
+//     console.log(sql);
+
+//     connection.query(sql, (error, results) => {
+//       if (error) {
+//         console.error('Error executing SQL query: ', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//         connection.release();
+//         return;
+//       }
+
+//       const countSql = 'SELECT COUNT(*) as total FROM school_employees';
+
+//       connection.query(countSql, (countError, countResult) => {
+//         connection.release();
+
+//         if (countError) {
+//           console.error('Error executing count SQL query: ', countError);
+//           res.status(500).json({ error: 'Internal server error' });
+//           return;
+//         }
+
+//         const totalCategories = countResult[0].total;
+//         const totalPages = Math.ceil(totalCategories / limit);
+
+//         res.json({
+//           totalCategories,
+//           currentPage: page,
+//           totalPages,
+//           results
+//         });
+//       });
+//     });
+//   });
+// });
+
+app.delete("/delete-employee/:employee_id_get", (req, res) => {
+  const employee_id = parseInt(req.params.employee_id_get);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting employee" });
+      return;
+    }
+
+    const sql = "DELETE FROM employees WHERE id = ?";
+    const values = [employee_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting category:", error);
+        res.status(500).json({ error: "Error deleting employee" });
+      } else {
+        console.log("Item deleted successfully");
+        res.status(200).json({ message: "Employee deleted successfully" });
+      }
+    });
+  });
+});
+
+// Handle form submission
+app.post("/submit", upload.single("employee_image"), (req, res) => {
+  console.log("File:", req.file); // Debug line
+  console.log("Body:", req.body); // Debug line
+  if (!req.file) {
+    return res.status(400).send("No file uploaded.");
+  }
+
+  const {
+    employee_name,
+    dob,
+    gender,
+    phone_no,
+    address,
+    employee_status,
+    cnic,
+    account_no,
+  } = req.body;
+  const employee_image = req.file.filename;
+
+  const query =
+    "INSERT INTO employees (employee_name, dob, gender, phone_no, address, employment_status, cnic, account_no, employee_image) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+  const values = [
+    employee_name,
+    dob,
+    gender,
+    phone_no,
+    address,
+    employee_status,
+    cnic,
+    account_no,
+    employee_image,
+  ];
+
+  connection.query(query, values, (err, result) => {
+    if (err) throw err;
+    res.json({ message: "Employee data saved successfully!" });
+  });
+});
+
+app.delete("/delete-category/:category_id", (req, res) => {
+  const category = parseInt(req.params.category_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting category" });
+      return;
+    }
+
+    const sql = "DELETE FROM categories WHERE id = ?";
+    const values = [category];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting category:", error);
+        res.status(500).json({ error: "Error deleting category" });
+      } else {
+        console.log("Item deleted successfully");
+        res.status(200).json({ message: "Category deleted successfully" });
+      }
+    });
+  });
+});
+
+app.put("/update-category/:id", (req, res) => {
+  const itemId = parseInt(req.params.id); // Corrected to req.params.id
+  const { category } = req.body; // Updated item data from the request body
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error updating category" });
+      return;
+    }
+
+    // Build the UPDATE query with all the columns to be updated
+    const sql = "UPDATE categories SET category = ? WHERE id = ?";
+    const values = [category, itemId];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating category:", error);
+        res.status(500).json({ error: "Error updating category" });
+      } else {
+        console.log("Category updated successfully");
+        res.status(200).json({ message: "Category updated successfully" });
+      }
+    });
+  });
+});
+
+// process.env.REACT_APP_API_BASE_URL+`/update-employee
+
+app.put("/update-employee/:id", upload.single("employee_image"), (req, res) => {
+  const employee_id = parseInt(req.params.id); // Parse the employee ID from the request parameters
+  const {
+    employee_name,
+    dob,
+    gender,
+    phone_no,
+    address,
+    employee_status,
+    cnic,
+    account_no,
+  } = req.body; // Destructure updated employee data from the request body
+
+  // Check if a file is provided
+  const employee_image = req.file ? req.file.filename : null;
+
+  console.log("File:", req.file); // Debug line
+  console.log("Body:", req.body); // Debug line
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    // Build the UPDATE query with all the columns to be updated
+    let sql =
+      "UPDATE employees SET employee_name = ?, dob = ?, gender = ?, phone_no = ?, address = ?, employment_status = ?, cnic = ?, account_no = ?";
+    const values = [
+      employee_name,
+      dob,
+      gender,
+      phone_no,
+      address,
+      employee_status,
+      cnic,
+      account_no,
+    ];
+
+    // Append the employee_image column only if a file is provided
+    if (employee_image) {
+      sql += ", employee_image = ?";
+      values.push(employee_image);
+    }
+
+    sql += " WHERE id = ?";
+    values.push(employee_id);
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating employee:", error);
+        res.status(500).json({ error: "Error updating employee" });
+      } else {
+        console.log("Employee updated successfully");
+        res.status(200).json({ message: "Employee updated successfully" });
+      }
+    });
+  });
+});
+
+app.get("/employee-list-for-attendance", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error connecting to the database:", err);
+      res.status(500).json({ error: "Error connecting to the database" });
+      return;
+    }
+
+    const sql = "SELECT * FROM employees";
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query:", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({ results });
+      }
+    });
+  });
+});
+
+app.get("/get-employee-data/:id", (req, res) => {
+  const id = req.params.id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching Data" });
+      return;
+    }
+
+    const sql = `SELECT * FROM employees WHERE id = ?`;
+    const values = [id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        console.log(results);
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+app.get("/category-get/:category", (req, res) => {
+  const category = req.params.category;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching item" });
+      return;
+    }
+
+    const sql = `SELECT * FROM categories WHERE id = ?`;
+    const values = [category];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+app.get("/employee-get/:employee", (req, res) => {
+  const employee_id = req.params.employee;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching employees" });
+      return;
+    }
+
+    const sql = `SELECT * FROM employees WHERE id = ? ORDER BY employee_name DESC`;
+    const values = [employee_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+app.get("/categories", (req, res) => {
+  // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const search_category = req.query.search;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching categories" });
+      return;
+    }
+
+    // SQL query to select paginated results
+    let sql = `SELECT * FROM categories`;
+    if (search_category) {
+      sql += ` WHERE category LIKE '%${search_category}%' `;
+    }
+    sql += ` LIMIT ${limit} OFFSET ${offset}`;
+
+    // Execute the query
+    connection.query(sql, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+        return;
+      }
+
+      // Query to get total count of items
+      const countSql = "SELECT COUNT(*) as total FROM categories";
+
+      // Execute the count query
+      connection.query(countSql, (countError, countResult) => {
+        connection.release(); // Release the connection
+
+        if (countError) {
+          console.error("Error executing count SQL query: ", countError);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        const totalCategories = countResult[0].total;
+
+        // Calculate total pages based on total count and limit
+        const totalPages = Math.ceil(totalCategories / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          totalCategories,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      });
+    });
+  });
+});
+
+
+
+
+app.post("/insert-category", (req, res) => {
+  const sql = "INSERT INTO categories (category) VALUES (?)";
+  const values = [req.body.category];
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error inserting data" });
+      return;
+    }
+
+    connection.query(sql, values, (err, result) => {
+      connection.release(); // Release the connection
+
+      if (err) {
+        console.error("Error inserting data:", err);
+        res.status(500).json({ error: "Error inserting data" });
+      } else {
+        console.log("Data inserted successfully");
+        res.status(200).json({ message: "Data inserted successfully" });
+      }
+    });
+  });
+});
+
+
+
+app.post("/student-activities", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      return res.status(500).json({ error: "Database connection error" });
+    }
+
+    // Check if this is an update (has activity_id) or insert (no activity_id)
+    if (req.body.hidden_id) {
+      // Update existing activity
+      const updateSql = `
+        UPDATE student_activities 
+        SET 
+          student_id = ?, 
+          name = ?, 
+          activity_type = ?, 
+          remarks = ?, 
+          activity_date = ?, 
+          position = ?, 
+          campus_id = ?, 
+          session_id = ?
+        WHERE id = ?
+      `;
+      
+      const updateValues = [
+        req.body.student_id,
+        req.body.name,
+        req.body.activity_type,
+        req.body.remarks,
+        req.body.activity_date,
+        req.body.position,
+        req.body.campus_id,
+        req.body.session_id,
+        req.body.hidden_id
+      ];
+
+      connection.query(updateSql, updateValues, (err, result) => {
+        connection.release();
+
+        if (err) {
+          console.error("Error updating activity:", err);
+          return res.status(500).json({ error: "Error updating activity data" });
+        }
+
+        if (result.affectedRows === 0) {
+          return res.status(404).json({ error: "Activity not found" });
+        }
+
+        console.log("Activity updated successfully, ID:", req.body.hidden_id);
+        res.status(200).json({ 
+          message: "Activity updated successfully",
+          activity_id: req.body.hidden_id
+        });
+      });
+    } else {
+      // Insert new activity
+      const insertSql = `
+        INSERT INTO student_activities 
+        (student_id, name, activity_type, remarks, activity_date, position, campus_id, session_id) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `;
+      
+      const insertValues = [
+        req.body.student_id,
+        req.body.name,
+        req.body.activity_type,
+        req.body.remarks,
+        req.body.activity_date,
+        req.body.position,
+        req.body.campus_id,
+        req.body.session_id
+      ];
+
+      connection.query(insertSql, insertValues, (err, result) => {
+        connection.release();
+
+        if (err) {
+          console.error("Error inserting activity:", err);
+          return res.status(500).json({ error: "Error inserting activity data" });
+        }
+
+        console.log("Activity recorded successfully, ID:", result.insertId);
+        res.status(201).json({ 
+          message: "Activity recorded successfully",
+          activity_id: result.insertId
+        });
+      });
+    }
+  });
+});
+
+
+
+
+
+app.post("/student-discipline", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      return res.status(500).json({ error: "Database connection error" });
+    }
+
+    // Check if this is an update (has hidden_id) or insert (no hidden_id)
+    if (req.body.hidden_id) {
+      // Update existing discipline record
+      const updateSql = `
+        UPDATE student_discipline 
+        SET 
+          student_id = ?, 
+          date_of_incident = ?, 
+          type_of_incident = ?, 
+          action_taken = ?, 
+          description = ?, 
+          reporting_teacher = ?
+        WHERE id = ?
+      `;
+      
+      const updateValues = [
+        req.body.student_id,
+        req.body.date_of_incident,
+        req.body.type_of_incident,
+        req.body.action_taken,
+        req.body.description,
+        req.body.reporting_teacher,
+        req.body.hidden_id
+      ];
+
+      connection.query(updateSql, updateValues, (err, result) => {
+        connection.release(); // Release the connection
+
+        if (err) {
+          console.error("Error updating discipline record:", err);
+          return res.status(500).json({ error: "Error updating discipline data" });
+        }
+
+        if (result.affectedRows === 0) {
+          return res.status(404).json({ error: "Discipline record not found" });
+        }
+
+        console.log("Discipline record updated successfully, ID:", req.body.hidden_id);
+        res.status(200).json({ 
+          message: "Discipline record updated successfully",
+          discipline_id: req.body.hidden_id
+        });
+      });
+    } else {
+      // Insert new discipline record
+      const insertSql = `
+        INSERT INTO student_discipline 
+        (student_id, date_of_incident, type_of_incident, action_taken, description, 
+         reporting_teacher, campus_id, session_id) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `;
+      
+      const insertValues = [
+        req.body.student_id,
+        req.body.date_of_incident,
+        req.body.type_of_incident,
+        req.body.action_taken,
+        req.body.description,
+        req.body.reporting_teacher,
+        req.body.campus_id,
+        req.body.session_id
+      ];
+
+      connection.query(insertSql, insertValues, (err, result) => {
+        connection.release(); // Release the connection
+
+        if (err) {
+          console.error("Error inserting discipline record:", err);
+          return res.status(500).json({ error: "Error inserting discipline data" });
+        }
+
+        console.log("Discipline record created successfully, ID:", result.insertId);
+        res.status(201).json({ 
+          message: "Discipline record created successfully",
+          discipline_id: result.insertId
+        });
+      });
+    }
+  });
+});
+
+
+
+
+app.post("/employee-discipline", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error getting connection:", err);
+      return res.status(500).json({ error: "Database connection error" });
+    }
+
+    // Check if this is an update (has hidden_id) or insert (no hidden_id)
+    if (req.body.hidden_id) {
+      // Update existing discipline record
+      const updateSql = `
+        UPDATE employee_discipline 
+        SET 
+          employee_id = ?, 
+          date_of_incident = ?, 
+          type_of_incident = ?, 
+          action_taken = ?, 
+          description = ?
+        WHERE id = ?
+      `;
+      
+      const updateValues = [
+        req.body.student_id,
+        req.body.date_of_incident,
+        req.body.type_of_incident,
+        req.body.action_taken,
+        req.body.description,
+        req.body.hidden_id
+      ];
+
+      connection.query(updateSql, updateValues, (err, result) => {
+        connection.release(); // Release the connection
+
+        if (err) {
+          console.error("Error updating discipline record:", err);
+          return res.status(500).json({ error: "Error updating discipline data" });
+        }
+
+        if (result.affectedRows === 0) {
+          return res.status(404).json({ error: "Discipline record not found" });
+        }
+
+        console.log("Discipline record updated successfully, ID:", req.body.hidden_id);
+        res.status(200).json({ 
+          message: "Discipline record updated successfully",
+          discipline_id: req.body.hidden_id
+        });
+      });
+    } else {
+      // Insert new discipline record
+      const insertSql = `
+        INSERT INTO employee_discipline 
+        (employee_id, date_of_incident, type_of_incident, action_taken, description, campus_id) 
+        VALUES (?, ?, ?, ?, ?, ?)
+      `;
+      
+      const insertValues = [
+        req.body.student_id,
+        req.body.date_of_incident,
+        req.body.type_of_incident,
+        req.body.action_taken,
+        req.body.description,
+        req.body.campus_id
+      ];
+
+      connection.query(insertSql, insertValues, (err, result) => {
+        connection.release(); // Release the connection
+
+        if (err) {
+          console.error("Error inserting discipline record:", err);
+          return res.status(500).json({ error: "Error inserting discipline data" });
+        }
+
+        console.log("Discipline record created successfully, ID:", result.insertId);
+        res.status(201).json({ 
+          message: "Discipline record created successfully",
+          discipline_id: result.insertId
+        });
+      });
+    }
+  });
+});
+
+
+
+
+app.get("/item-rate-list", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching rate list" });
+      return;
+    }
+
+    const sql = "SELECT * FROM items";
+
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching categories" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+app.get("/excel-report", async (req, res) => {
+  try {
+    let from_date = req.query.from_date;
+    let to_date = req.query.to_date;
+
+    // SQL query to select data within the specified date range
+
+    const sql = `SELECT 
+    invoice.*,
+    items.items 
+    FROM 
+      invoice 
+    INNER JOIN 
+      items ON invoice.item = items.id 
+    WHERE 
+    invoice.created_at >= '${from_date}' AND invoice.created_at <= '${to_date}'`;
+
+    // Execute the query
+    connection.query(sql, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      // Generate Excel file
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet("Report");
+
+      // Add column headers
+      worksheet.columns = [
+        { header: "Invoice", key: "col1", width: 10 },
+        { header: "Item", key: "col2", width: 10 },
+        { header: "Price", key: "col3", width: 10 },
+        { header: "Quantity", key: "col4", width: 10 },
+        { header: "Discount", key: "col5", width: 10 },
+        { header: "Total", key: "col6", width: 10 },
+      ];
+
+      // Add rows from the database results
+      results.forEach((result) => {
+        worksheet.addRow({
+          col1: result.invoice_no,
+          col2: result.items.items,
+          col3: result.price,
+          col4: result.quantity,
+          col5: result.discount,
+          col6: result.total,
+        });
+        // Add more columns and values as needed
+      });
+
+      // Set response headers
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      res.setHeader("Content-Disposition", "attachment; filename=report.xlsx");
+
+      // Write Excel file to response
+      workbook.xlsx.write(res).then(() => {
+        res.end();
+      });
+    });
+  } catch (error) {
+    console.error("Error generating Excel report:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// app.get('/generate-excel-report', async (req, res) => {
+
+//   let from_date= "2024-01-01";
+//   let to_date = "2024-04-01";
+
+//     // SQL query to select paginated results
+//     const sql = `SELECT items.*, categories.category AS category_name FROM items INNER JOIN categories ON items.category = categories.id LIMIT ${limit} OFFSET ${offset}`;
+
+//     // Execute the query
+//     connection.query(sql, (error, results) => {
+//       if (error) {
+//         console.error('Error executing SQL query: ', error);
+//         res.status(500).json({ error: 'Internal server error' });
+//         connection.release(); // Release the connection
+//         return;
+//       }
+//     });
+
+// try {
+//   // Generate Excel file
+//   const workbook = new ExcelJS.Workbook();
+//   const worksheet = workbook.addWorksheet('Sheet 1');
+//   worksheet.columns = [
+//     { header: 'Column 1', key: 'col1', width: 10 },
+//     { header: 'Column 2', key: 'col2', width: 10 },
+//   ];
+//   worksheet.addRow({ col1: 'Value 1', col2: 'Value 2' });
+
+//   // Set response headers
+//   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+//   res.setHeader('Content-Disposition', 'attachment; filename=report.xlsx');
+
+//   // Write Excel file to response
+//   await workbook.xlsx.write(res);
+//   res.end();
+// } catch (error) {
+//   console.error('Error generating Excel report:', error);
+//   res.status(500).send('Error generating Excel report');
+// }
+
+// });
+
+app.get("/", (req, res) => {
+  res.send("API running");
+});
+
+app.get("/excel-report-expense", async (req, res) => {
+  try {
+    let from_date = req.query.from_date;
+    let to_date = req.query.to_date;
+
+    // SQL query to select data within the specified date range
+
+    const sql = `SELECT expenses.*, expense_head.head_name,  DATE_FORMAT(expenses.created_at, '%d-%m-%Y') AS formatted_date FROM expenses INNER JOIN expense_head ON expenses.head_id = expense_head.id WHERE 
+    expenses.created_at >= '${from_date}' AND expenses.created_at <= '${to_date}'`;
+
+    // Execute the query
+    connection.query(sql, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      // Generate Excel file
+      const workbook = new ExcelJS.Workbook();
+      const worksheet = workbook.addWorksheet("Report");
+
+      // Add column headers
+      worksheet.columns = [
+        { header: "Receipt#", key: "col1", width: 10 },
+        { header: "Head", key: "col2", width: 10 },
+        { header: "Amount", key: "col3", width: 10 },
+        { header: "Pay_Type", key: "col4", width: 10 },
+        { header: "Remarks", key: "col5", width: 10 },
+        { header: "Date", key: "col6", width: 10 },
+      ];
+
+      // Add rows from the database results
+      results.forEach((result) => {
+        worksheet.addRow({
+          col1: result.receipt_no,
+          col2: result.head_name,
+          col3: result.amount,
+          col4: result.payment_type,
+          col5: result.remarks,
+          col6: result.formatted_date,
+        });
+        // Add more columns and values as needed
+      });
+
+      // Set response headers
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      );
+      res.setHeader("Content-Disposition", "attachment; filename=report.xlsx");
+
+      // Write Excel file to response
+      workbook.xlsx.write(res).then(() => {
+        res.end();
+      });
+    });
+  } catch (error) {
+    console.error("Error generating Excel report:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+app.get("/pdf-report-expense", (req, res) => {
+  var from_date = req.query.from_date;
+  var to_date = req.query.to_date;
+  var report_type = req.query.report_type;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching items" });
+      return;
+    }
+
+    const sql = `SELECT expenses.*, expense_head.head_name,  DATE_FORMAT(expenses.created_at, '%d-%m-%Y') AS formatted_date FROM expenses INNER JOIN expense_head ON expenses.head_id = expense_head.id WHERE 
+    expenses.created_at >= '${from_date}' AND expenses.created_at <= '${to_date}'`;
+
+    // Execute the query
+    connection.query(sql, [from_date, to_date], (error, results, fields) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res
+          .status(500)
+          .json({ error: "Internal server error while fetching data" });
+      } else {
+        var sr_no = 1;
+        var total_amount = 0;
+
+        const formattedResults = results.map((expense) => {
+          total_amount = total_amount + parseInt(expense.amount);
+
+          return [
+            sr_no++,
+            expense.receipt_no,
+            expense.head_name,
+            expense.amount,
+            expense.payment_type,
+            expense.remarks,
+            expense.formatted_date,
+          ];
+        });
+
+        const doc = new PDFDocument();
+        // Pipe its output to the HTTP response
+        doc.pipe(res);
+        res.setHeader("Content-Type", "application/pdf");
+
+        // Define the table structure
+        const columns = [
+          "Id",
+          "Receipt#",
+          "Head",
+          "Amount",
+          "Pay_Type",
+          "Remarks",
+          "Date",
+        ];
+
+        const data = formattedResults;
+
+        // Calculate the width for each column
+        const pageWidth =
+          doc.page.width - doc.page.margins.left - doc.page.margins.right;
+        const columnWidth = pageWidth / columns.length;
+        const rowHeight = 20; // height of each row
+
+        doc.fontSize(16).text("Expense Report", doc.page.margins.left, 50, {
+          width: pageWidth,
+          align: "center",
+        });
+
+        // Positioning variables
+        let yPosition = 80; // initial Y position for the table
+
+        // Draw table header
+        columns.forEach((header, i) => {
+          doc
+            .fontSize(12)
+            .text(
+              header,
+              doc.page.margins.left + i * columnWidth,
+              yPosition + (rowHeight - doc.currentLineHeight()) / 2,
+              {
+                width: columnWidth,
+                align: "center",
+              }
+            );
+        });
+
+        // Draw header border
+        for (let i = 0; i <= columns.length; i++) {
+          doc
+            .moveTo(doc.page.margins.left + i * columnWidth, yPosition)
+            .lineTo(
+              doc.page.margins.left + i * columnWidth,
+              yPosition + rowHeight
+            )
+            .stroke();
+        }
+        // Horizontal lines for header
+        doc
+          .moveTo(doc.page.margins.left, yPosition)
+          .lineTo(doc.page.width - doc.page.margins.right, yPosition)
+          .stroke();
+        doc
+          .moveTo(doc.page.margins.left, yPosition + rowHeight)
+          .lineTo(
+            doc.page.width - doc.page.margins.right,
+            yPosition + rowHeight
+          )
+          .stroke();
+
+        yPosition += rowHeight; // move Y to start of data rows
+
+        // Draw rows
+        data.forEach((row, j) => {
+          row.forEach((cell, i) => {
+            doc
+              .fontSize(10)
+              .text(
+                cell,
+                doc.page.margins.left + i * columnWidth,
+                yPosition +
+                  j * rowHeight +
+                  (rowHeight - doc.currentLineHeight()) / 2,
+                {
+                  width: columnWidth,
+                  align: "center",
+                }
+              );
+          });
+
+          // Draw vertical lines
+          for (let i = 0; i <= columns.length; i++) {
+            doc
+              .moveTo(
+                doc.page.margins.left + i * columnWidth,
+                yPosition + j * rowHeight
+              )
+              .lineTo(
+                doc.page.margins.left + i * columnWidth,
+                yPosition + (j + 1) * rowHeight
+              )
+              .stroke();
+          }
+          // Horizontal line for each row
+          doc
+            .moveTo(doc.page.margins.left, yPosition + j * rowHeight)
+            .lineTo(
+              doc.page.width - doc.page.margins.right,
+              yPosition + j * rowHeight
+            )
+            .stroke();
+          doc
+            .moveTo(doc.page.margins.left, yPosition + (j + 1) * rowHeight)
+            .lineTo(
+              doc.page.width - doc.page.margins.right,
+              yPosition + (j + 1) * rowHeight
+            )
+            .stroke();
+        });
+
+        yPosition += data.length * rowHeight + 30;
+        // Display Grand Total at the bottom
+        doc
+          .fontSize(12)
+          .text(
+            `Grand Total Rs: ${total_amount.toFixed(2)}`,
+            doc.page.margins.left,
+            yPosition,
+            { width: pageWidth, align: "right" }
+          );
+        // Finalize PDF file
+        doc.end();
+      }
+    });
+  });
+});
+
+app.get("/pdf-report", (req, res) => {
+  var from_date = req.query.from_date;
+  var to_date = req.query.to_date;
+  var report_type = req.query.report_type;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching items" });
+      return;
+    }
+
+    // SQL query to select paginated results
+    // const sql = `
+    //   SELECT invoice.*, items.*
+    //   FROM invoice
+    //   INNER JOIN items ON invoice.item = items.id
+    //   WHERE invoice.created_at BETWEEN ? AND ?;
+    // `;
+
+    const sql = `
+                SELECT 
+                  invoice.invoice_no,
+                  SUM(invoice.total) AS total_price,
+                  DATE_FORMAT(invoice.created_at, '%d-%m-%Y %h:%i:%s') AS formatted_created_at
+                FROM invoice
+                WHERE invoice.created_at BETWEEN ? AND ?
+                GROUP BY invoice.invoice_no;
+              `;
+
+    // Execute the query
+    connection.query(sql, [from_date, to_date], (error, results, fields) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res
+          .status(500)
+          .json({ error: "Internal server error while fetching data" });
+      } else {
+        var sr_no = 1;
+        var total_amount = 0;
+
+        const formattedResults = results.map((item) => {
+          total_amount = total_amount + parseInt(item.total_price);
+
+          // return [
+          //   sr_no++, // Assuming 'invoice_no' is a field in your query results
+          //   item.invoice_no, // Assuming 'invoice_no' is a field in your query results
+          //   item.items, // Replace 'item_name' with the actual field name from your items table
+          //   item.price, // Replace 'item_name' with the actual field name from your items table
+          //   item.quantity, // Replace 'item_name' with the actual field name from your items table
+          //   item.discount, // Replace 'item_name' with the actual field name from your items table
+          //   item.price - (item.price / 100 * item.discount),
+          //   item.total // Assuming 'total' is a field in your query results
+          // ];
+
+          return [
+            sr_no++, // Assuming 'invoice_no' is a field in your query results
+            item.invoice_no, // Assuming 'invoice_no' is a field in your query results
+            item.formatted_created_at, // Assuming 'total' is a field in your query results
+            item.total_price, // Assuming 'total' is a field in your query results
+          ];
+        });
+
+        const doc = new PDFDocument();
+        // Pipe its output to the HTTP response
+        doc.pipe(res);
+        res.setHeader("Content-Type", "application/pdf");
+
+        // Define the table structure
+        const columns = ["Id", "Invoice#", "created_at", "Total"];
+
+        const data = formattedResults;
+
+        // Calculate the width for each column
+        const pageWidth =
+          doc.page.width - doc.page.margins.left - doc.page.margins.right;
+        const columnWidth = pageWidth / columns.length;
+        const rowHeight = 20; // height of each row
+
+        doc.fontSize(16).text("Sale Report", doc.page.margins.left, 50, {
+          width: pageWidth,
+          align: "center",
+        });
+
+        // Positioning variables
+        let yPosition = 80; // initial Y position for the table
+
+        // Draw table header
+        columns.forEach((header, i) => {
+          doc
+            .fontSize(12)
+            .text(
+              header,
+              doc.page.margins.left + i * columnWidth,
+              yPosition + (rowHeight - doc.currentLineHeight()) / 2,
+              {
+                width: columnWidth,
+                align: "center",
+              }
+            );
+        });
+
+        // Draw header border
+        for (let i = 0; i <= columns.length; i++) {
+          doc
+            .moveTo(doc.page.margins.left + i * columnWidth, yPosition)
+            .lineTo(
+              doc.page.margins.left + i * columnWidth,
+              yPosition + rowHeight
+            )
+            .stroke();
+        }
+        // Horizontal lines for header
+        doc
+          .moveTo(doc.page.margins.left, yPosition)
+          .lineTo(doc.page.width - doc.page.margins.right, yPosition)
+          .stroke();
+        doc
+          .moveTo(doc.page.margins.left, yPosition + rowHeight)
+          .lineTo(
+            doc.page.width - doc.page.margins.right,
+            yPosition + rowHeight
+          )
+          .stroke();
+
+        yPosition += rowHeight; // move Y to start of data rows
+
+        // Draw rows
+        data.forEach((row, j) => {
+          row.forEach((cell, i) => {
+            doc
+              .fontSize(10)
+              .text(
+                cell,
+                doc.page.margins.left + i * columnWidth,
+                yPosition +
+                  j * rowHeight +
+                  (rowHeight - doc.currentLineHeight()) / 2,
+                {
+                  width: columnWidth,
+                  align: "center",
+                }
+              );
+          });
+
+          // Draw vertical lines
+          for (let i = 0; i <= columns.length; i++) {
+            doc
+              .moveTo(
+                doc.page.margins.left + i * columnWidth,
+                yPosition + j * rowHeight
+              )
+              .lineTo(
+                doc.page.margins.left + i * columnWidth,
+                yPosition + (j + 1) * rowHeight
+              )
+              .stroke();
+          }
+          // Horizontal line for each row
+          doc
+            .moveTo(doc.page.margins.left, yPosition + j * rowHeight)
+            .lineTo(
+              doc.page.width - doc.page.margins.right,
+              yPosition + j * rowHeight
+            )
+            .stroke();
+          doc
+            .moveTo(doc.page.margins.left, yPosition + (j + 1) * rowHeight)
+            .lineTo(
+              doc.page.width - doc.page.margins.right,
+              yPosition + (j + 1) * rowHeight
+            )
+            .stroke();
+        });
+
+        yPosition += data.length * rowHeight + 30;
+        // Display Grand Total at the bottom
+        doc
+          .fontSize(12)
+          .text(
+            `Grand Total Rs: ${total_amount.toFixed(2)}`,
+            doc.page.margins.left,
+            yPosition,
+            { width: pageWidth, align: "right" }
+          );
+
+        // Finalize PDF file
+        doc.end();
+      }
+    });
+  });
+});
+
+app.post("/insert_all_items", (req, res) => {
+  console.log("Request body:", req.body); // Log request body
+
+  const sql =
+    "INSERT INTO items (items, category, price, discount, total_pieces, total_price, expire, alert) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+  const values = [
+    req.body.item_name,
+    req.body.category,
+    req.body.price,
+    req.body.discount,
+    req.body.total_pieces,
+    req.body.total_price,
+    req.body.expire,
+    req.body.alert,
+  ];
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error inserting data" });
+      return;
+    }
+
+    connection.query(sql, values, (err, result) => {
+      connection.release(); // Release the connection
+
+      if (err) {
+        console.error("Error inserting data:", err);
+        res.status(500).json({ error: "Error inserting data" });
+      } else {
+        console.log("Data inserted successfully");
+        res.status(200).json({ message: "Data inserted successfully" });
+      }
+    });
+  });
+});
+
+app.get("/items", (req, res) => {
+  // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching items" });
+      return;
+    }
+
+    // SQL query to select paginated results
+    const sql = `SELECT items.*, categories.category AS category_name FROM items INNER JOIN categories ON items.category = categories.id LIMIT ${limit} OFFSET ${offset}`;
+
+    // Execute the query
+    connection.query(sql, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+        return;
+      }
+
+      // Query to get total count of items
+      const countSql = "SELECT COUNT(*) as total FROM items";
+
+      // Execute the count query
+      connection.query(countSql, (countError, countResult) => {
+        connection.release(); // Release the connection
+
+        if (countError) {
+          console.error("Error executing count SQL query: ", countError);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        const totalItems = countResult[0].total;
+
+        // Calculate total pages based on total count and limit
+        const totalPages = Math.ceil(totalItems / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          totalItems,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      });
+    });
+  });
+});
+
+app.get("/item-get/:item_id", (req, res) => {
+  const item_id = req.params.item_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching item" });
+      return;
+    }
+
+    const sql = `SELECT * FROM items WHERE id = ?`;
+    const values = [item_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+app.get("/epxense-head/:expense_head_id", (req, res) => {
+  const expense_head_id = req.params.expense_head_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching item" });
+      return;
+    }
+
+    const sql = `SELECT * FROM expense_head WHERE id = ?`;
+    const values = [expense_head_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+app.put("/update-item/:id", (req, res) => {
+  const itemId = parseInt(req.params.id); // Corrected to req.params.id
+  const {
+    category,
+    item_name,
+    price,
+    discount,
+    total_pieces,
+    expire,
+    total_price,
+    alert,
+  } = req.body; // Updated item data from the request body
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error updating item" });
+      return;
+    }
+
+    // Build the UPDATE query with all the columns to be updated
+    const sql =
+      "UPDATE items SET category = ?, items = ?, price = ?,  discount = ?, total_pieces = ?, expire = ?, total_price = ?, alert = ? WHERE id = ?";
+    const values = [
+      category,
+      item_name,
+      price,
+      discount,
+      total_pieces,
+      expire,
+      total_price,
+      alert,
+      itemId,
+    ];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating item:", error);
+        res.status(500).json({ error: "Error updating item" });
+      } else {
+        console.log("Item updated successfully");
+        res.status(200).json({ message: "Item updated successfully" });
+      }
+    });
+  });
+});
+
+app.delete("/delete-item/:item_id", (req, res) => {
+  const itemId = parseInt(req.params.item_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting item" });
+      return;
+    }
+
+    const sql = "DELETE FROM items WHERE id = ?";
+    const values = [itemId];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting item:", error);
+        res.status(500).json({ error: "Error deleting item" });
+      } else {
+        console.log("Item deleted successfully");
+        res.status(200).json({ message: "Item deleted successfully" });
+      }
+    });
+  });
+});
+
+// app.get('/categories', (req, res) => {
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error('Error:', err);
+//       res.status(500).json({ error: 'Error fetching categories' });
+//       return;
+//     }
+
+//     const sql = 'SELECT * FROM categories';
+
+//     connection.query(sql, (error, results) => {
+//       connection.release(); // Release the connection
+
+//       if (error) {
+//         console.error('Error:', error);
+//         res.status(500).json({ error: 'Error fetching categories' });
+//       } else {
+//         console.log('Fetch Successfully');
+//         res.status(200).json({ results });
+//       }
+//     });
+//   });
+// });
+
+app.get("/stocks", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching stocks" });
+      return;
+    }
+    const sql = "SELECT * FROM stock";
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching categories" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+// Example route using the connection
+app.get("/get-item-details/:item_id", (req, res) => {
+  const itemId = parseInt(req.params.item_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error" });
+      return;
+    }
+
+    const sql = `
+      SELECT 
+          items.id,
+          items.items,
+          items.price,
+          items.discount,
+          COALESCE(stock_total.total_stock_quantity, 0) AS total_stock_quantity,
+          COALESCE(invoice_total.total_invoice_quantity, 0) AS total_invoice_quantity
+      FROM 
+          items
+      LEFT JOIN 
+          (SELECT item_id, SUM(quantity) AS total_stock_quantity FROM stock GROUP BY item_id) AS stock_total 
+          ON items.id = stock_total.item_id
+      LEFT JOIN 
+          (SELECT item, SUM(quantity) AS total_invoice_quantity FROM invoice GROUP BY item) AS invoice_total 
+          ON items.id = invoice_total.item
+      WHERE 
+          items.id = ?`;
+    const values = [itemId];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+app.post("/insert-invoice", (req, res) => {
+  const items = req.body; // Assuming the array of items is sent in the request body
+  console.log(items);
+  // console.log(items);
+  // Query to retrieve the last invoice number
+
+  const update_values = items
+    .filter((item) => item.hidden_id !== "")
+    .map((item) => [
+      item.hidden_id,
+      item.item,
+      item.price,
+      item.quantity,
+      item.discount,
+      item.total,
+      item.invoice_no,
+    ]);
+
+  // Construct the bulk update query
+  let sql = "UPDATE invoice SET ";
+  const values = [];
+
+  update_values.forEach((data, index) => {
+    const id = data[0];
+    const item = data[1];
+    const price = data[2];
+    const quantity = data[3];
+    const discount = data[4];
+    const total = data[5];
+
+    // Add SET clause for each row
+    sql += `item = CASE WHEN id = ? THEN ? ELSE item END, `;
+    sql += `price = CASE WHEN id = ? THEN ? ELSE price END, `;
+    sql += `quantity = CASE WHEN id = ? THEN ? ELSE quantity END, `;
+    sql += `discount = CASE WHEN id = ? THEN ? ELSE discount END, `;
+    sql += `total = CASE WHEN id = ? THEN ? ELSE total END, `;
+
+    // Push values for price update
+    values.push(id, item);
+    values.push(id, price);
+    values.push(id, quantity);
+    values.push(id, discount);
+    values.push(id, total);
+  });
+
+  // Remove the trailing comma and space
+  sql = sql.slice(0, -2);
+
+  // Add WHERE clause based on the IDs
+  sql += " WHERE id IN (?)";
+
+  // Push all IDs into values array
+  const ids = update_values.map((data) => data[0]);
+  values.push(ids);
+
+  // Execute the bulk update query
+  connection.query(sql, values, (error, results, fields) => {
+    if (error) {
+      console.error("Error updating items:", error);
+    } else {
+      console.log("Items updated successfully");
+    }
+  });
+
+  // console.log(update_values);
+
+  const check_invoice_no =
+    "SELECT invoice_no FROM invoice ORDER BY invoice_no DESC LIMIT 1";
+
+  connection.getConnection((error, connection) => {
+    if (error) {
+      console.error("Error:", error);
+      return res
+        .status(500)
+        .json({ error: "Error retrieving last invoice number" });
+    }
+
+    connection.query(check_invoice_no, (error, results) => {
+      if (error) {
+        connection.release(); // Release the connection
+        console.error("Error retrieving last invoice number:", error);
+        return res
+          .status(500)
+          .json({ error: "Error retrieving last invoice number" });
+      }
+
+      let nextInvoiceNo;
+
+      if (results == "") {
+        nextInvoiceNo = 1000;
+      } else {
+        const lastInvoiceNo = results[0].invoice_no;
+        nextInvoiceNo = lastInvoiceNo + 1;
+      }
+
+      if (update_values.length > 0) {
+        nextInvoiceNo = update_values[0][6];
+        console.log(nextInvoiceNo);
+      }
+
+      // Prepare values for insertion
+      // const values = items.map(item => [nextInvoiceNo, item.item, item.price, item.quantity, item.discount, item.total]);
+
+      const values = items
+        .filter((item) => item.hidden_id === "")
+        .map((item) => [
+          nextInvoiceNo,
+          item.item,
+          item.price,
+          item.quantity,
+          item.discount,
+          item.total,
+        ]);
+
+      // console.log(values.length);
+
+      if (values.length == 0) {
+        return false;
+      }
+      // SQL query to insert invoice data
+      const sql =
+        "INSERT INTO invoice (invoice_no, item, price, quantity, discount, total) VALUES ?";
+
+      // console.log(values);
+
+      // Execute the insert query
+      connection.query(sql, [values], (error, result) => {
+        connection.release(); // Release the connection
+
+        if (error) {
+          console.error("Error inserting data:", error);
+          return res.status(500).json({ error: "Error inserting data" });
+        }
+
+        // // Function to get current timestamp
+        // function getCurrentTimestamp() {
+        //   const now = new Date();
+        //   const year = now.getFullYear();
+        //   const month = String(now.getMonth() + 1).padStart(2, '0');
+        //   const day = String(now.getDate()).padStart(2, '0');
+        //   const hours = String(now.getHours()).padStart(2, '0');
+        //   const minutes = String(now.getMinutes()).padStart(2, '0');
+        //   const seconds = String(now.getSeconds()).padStart(2, '0');
+        //   const milliseconds = String(now.getMilliseconds()).padStart(3, '0');
+        //   return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${milliseconds}`;
+        // }
+
+        // let currentTimestamp = getCurrentTimestamp();
+
+        // const rawData = items.map(item => ({
+        //   "invoice_no": nextInvoiceNo,
+        //   "timestamp": currentTimestamp,
+        //   "item": item.item_name,
+        //   "price": item.price,
+        //   "quantity": item.quantity,
+        //   "discount": item.discount,
+        //   "total": item.total
+        // }));
+
+        // function convertDataFormat(rawData) {
+        //   // Transform the raw data into the desired items format
+        //   const convertedItems = rawData.map(entry => ({
+        //     itemNumber: entry.item,
+        //     description: `${entry.item}`,
+        //     price: parseFloat(entry.price),
+        //     quantity: parseInt(entry.quantity),
+        //     discount: parseFloat(entry.discount),
+        //     total: parseFloat(entry.total),
+        //     timestamp: entry.timestamp // Add timestamp property
+        //   }));
+
+        //   // Calculate the invoice total
+        //   const invoiceTotal = convertedItems.reduce((acc, item) => acc + item.total, 0);
+
+        //   // Build the data to print object
+        //   const dataToPrint = {
+        //     title: `Invoice #${rawData[0].invoice_no}`,
+        //     date: `${rawData[0].timestamp}`, // Corrected access to timestamp
+        //     items: convertedItems,
+        //     total: invoiceTotal.toFixed(2) // Convert to 2 decimal places
+        //   };
+
+        //   return dataToPrint;
+        // }
+
+        // const dataToPrint = convertDataFormat(rawData);
+
+        // //dont remove lower data
+
+        // function generatePDF(data) {
+        //   const doc = new PDFDocument();
+        //   const stream = fs.createWriteStream('printable_document.pdf');
+        //   doc.pipe(stream);
+
+        //   // Styling constants
+        //   const pageMargin = 50;
+        //   const lineHeight = 25;
+        //   const itemIndent = 200;
+
+        //   // Draw a header
+        //   doc.fontSize(15).fillColor('#333').text(data.title, { align: 'center' });
+        //   doc.moveDown(0);
+
+        //   // Draw a header
+        //   doc.fontSize(15).fillColor('#333').text(data.date, { align: 'center' });
+        //   doc.moveDown(0);
+
+        //   // Table headers
+        //   const tableHeaderVerticalPosition = 120; // Adjust this value to reduce space between header and table headers
+        //   doc.fontSize(12).fillColor('#333').font('Helvetica-Bold').text('Item', pageMargin, tableHeaderVerticalPosition);
+        //   doc.text('Price', pageMargin + itemIndent, tableHeaderVerticalPosition, { width: 100, align: 'center' });
+        //   doc.text('Qty', pageMargin + itemIndent + 100, tableHeaderVerticalPosition, { width: 50, align: 'center' });
+        //   doc.text('Disc(%)', pageMargin + itemIndent + 150, tableHeaderVerticalPosition, { width: 70, align: 'center' });
+        //   doc.text('Total', pageMargin + itemIndent + 220, tableHeaderVerticalPosition, { width: 100, align: 'center' });
+        //   doc.strokeColor('#dddddd').lineWidth(1).moveTo(pageMargin, tableHeaderVerticalPosition + 20).lineTo(pageMargin + itemIndent + 320, tableHeaderVerticalPosition + 20).stroke();
+
+        //   let verticalPosition = tableHeaderVerticalPosition + 40;
+
+        //   // Line items
+        //   data.items.forEach(item => {
+        //     doc.fontSize(12).fillColor('#333').text(item.description, pageMargin, verticalPosition);
+        //     doc.text(`${item.price.toFixed(2)}`, pageMargin + itemIndent, verticalPosition, { width: 100, align: 'center' });
+        //     doc.text(`${item.quantity}`, pageMargin + itemIndent + 100, verticalPosition, { width: 50, align: 'center' });
+        //     doc.text(`${item.discount}%`, pageMargin + itemIndent + 150, verticalPosition, { width: 70, align: 'center' });
+        //     doc.text(`${item.total.toFixed(2)}`, pageMargin + itemIndent + 220, verticalPosition, { width: 100, align: 'center' });
+        //     verticalPosition += lineHeight;
+        //   });
+
+        //   // Draw a line above the grand total
+        //   doc.strokeColor('#dddddd').moveTo(pageMargin, verticalPosition).lineTo(pageMargin + itemIndent + 320, verticalPosition).stroke();
+
+        //   // Grand Total
+        //   const grandTotal = data.items.reduce((acc, item) => acc + item.total, 0);
+        //   doc.fontSize(10).fillColor('#333').font('Helvetica-Bold').text(`G. Total : Rs. ${grandTotal.toFixed(2)}`, pageMargin + itemIndent + 185, verticalPosition + 20, { width: 120, align: 'center' });
+
+        //   // Finalize the PDF and end the stream
+        //   doc.end();
+        //   stream.on('finish', function () {
+        //     // Print PDF using pdf-to-printer
+        //     const pdfPath = 'printable_document.pdf';
+        //     const printerName = 'Microsoft Print to PDF'; // Replace with the actual printer name
+
+        //     printer.print(pdfPath, { printer: printerName })
+        //       .then(() => res.send("Printed"))
+        //       .catch((error) => console.error('Error printing PDF:', error));
+        //   });
+        // }
+
+        // generatePDF(dataToPrint);
+
+        //dont remove upper data
+      });
+    });
+  });
+});
+
+app.post("/insert-stock", (req, res) => {
+  const items = req.body; // Assuming the array of items is sent in the request body
+
+  // Query to retrieve the last invoice number
+  const check_invoice_no =
+    "SELECT invoice_no FROM stock ORDER BY invoice_no DESC LIMIT 1";
+
+  connection.getConnection((error, connection) => {
+    if (error) {
+      console.error("Error:", error);
+      return res
+        .status(500)
+        .json({ error: "Error retrieving last invoice number" });
+    }
+
+    connection.query(check_invoice_no, (error, results) => {
+      if (error) {
+        connection.release(); // Release the connection
+        console.error("Error retrieving last invoice number:", error);
+        return res
+          .status(500)
+          .json({ error: "Error retrieving last invoice number" });
+      }
+
+      let nextInvoiceNo;
+
+      if (results == "") {
+        nextInvoiceNo = 1000;
+      } else {
+        const lastInvoiceNo = results[0].invoice_no;
+        nextInvoiceNo = lastInvoiceNo + 1;
+      }
+
+      // Prepare values for insertion
+      const values = items.map((item) => [
+        nextInvoiceNo,
+        item.item,
+        item.price,
+        item.quantity,
+        item.discount,
+        item.total,
+        item.priceOption,
+        item.discountOption,
+        item.remarks,
+      ]);
+
+      // SQL query to insert stock data
+      const sql =
+        "INSERT INTO stock (invoice_no, item_id, price, quantity, discount, total, price_option, discount_option, remarks) VALUES ?";
+
+      // Execute the insert query
+      connection.query(sql, [values], (error, result) => {
+        if (error) {
+          connection.release(); // Release the connection
+          console.error("Error inserting data:", error);
+          return res.status(500).json({ error: "Error inserting data" });
+        }
+
+        // Create a new array to store the desired objects
+        const newData = [];
+
+        // Iterate through data and add objects to the new array based on conditions
+        items.forEach((item) => {
+          const newItem = {
+            item: item.item,
+          };
+          if (item.priceOption === "update") {
+            newItem.priceOption = "update";
+            newItem.price = item.price;
+          }
+          if (item.discountOption === "update") {
+            newItem.discountOption = "update";
+            newItem.discount = item.discount;
+          }
+          if (newItem.priceOption || newItem.discountOption) {
+            newData.push(newItem);
+          }
+        });
+
+        // Construct and execute update query for each object
+        newData.forEach((data) => {
+          let sql = "UPDATE items SET ";
+          const values = [];
+
+          // Check if priceOption is present and add price to the query
+          if (data.priceOption === "update") {
+            sql += "price = ?, ";
+            values.push(data.price);
+          }
+
+          // Check if discountOption is present and add discount to the query
+          if (data.discountOption === "update") {
+            sql += "discount = ?, ";
+            values.push(data.discount);
+          }
+
+          // Remove the trailing comma and space
+          sql = sql.slice(0, -2);
+
+          // Add the WHERE clause
+          sql += " WHERE id = ?";
+
+          // Push the item_id to values array
+          values.push(data.item);
+
+          // Execute the query
+          connection.query(sql, values, (err, result) => {
+            if (err) {
+              console.error("Error updating data:", err);
+              return;
+            }
+            console.log(`Data updated successfully for item ${data.item}.`);
+          });
+        });
+
+        connection.release(); // Release the connection
+
+        return res.status(200).json({ items: newData });
+      });
+    });
+  });
+});
+
+app.post("/insert-expense-head", (req, res) => {
+  console.log("Request body:", req.body); // Log request body
+
+  const sql = "INSERT INTO expense_head (head_name, status) VALUES (?, ?)";
+  const values = [req.body.head_name, req.body.status];
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error inserting data" });
+      return;
+    }
+
+    connection.query(sql, values, (err, result) => {
+      connection.release(); // Release the connection
+
+      if (err) {
+        console.error("Error inserting data:", err);
+        res.status(500).json({ error: "Error inserting data" });
+      } else {
+        console.log("Data inserted successfully");
+        res.status(200).json({ message: "Data inserted successfully" });
+      }
+    });
+  });
+});
+
+app.get("/expense-heads", (req, res) => {
+  // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const searchHeads = req.query.getSearch;
+
+  console.log(searchHeads);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching items" });
+      return;
+    }
+
+    // let sql = `SELECT * FROM expense_head `;
+
+    // if (searchHeads) {
+    //   sql += `WHERE head_name LIKE '%${searchHeads}%' `;
+    // }
+
+    // sql += ` LIMIT ${limit} OFFSET ${offset}`; // Added space before LIMIT
+
+    let sql = `SELECT * FROM expense_head `;
+
+    if (searchHeads) {
+      sql += `WHERE head_name LIKE '%${searchHeads}%' OR status LIKE '%${searchHeads}%'`;
+    }
+
+    sql += ` LIMIT ${limit} OFFSET ${offset}`;
+
+    // Execute the query
+    connection.query(sql, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+        return;
+      }
+
+      // Query to get total count of items
+      let countSql = `SELECT COUNT(*) as total FROM expense_head `;
+
+      if (searchHeads) {
+        countSql += ` WHERE head_name LIKE '%${searchHeads}%'`;
+      }
+
+      // Execute the count query
+      connection.query(countSql, (countError, countResult) => {
+        connection.release(); // Release the connection
+
+        if (countError) {
+          console.error("Error executing count SQL query: ", countError);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        const totalItems = countResult[0].total;
+
+        // Calculate total pages based on total count and limit
+        const totalPages = Math.ceil(totalItems / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          totalItems,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      });
+    });
+  });
+});
+
+app.put("/update-expense-head/:id", (req, res) => {
+  const expense_head_id = parseInt(req.params.id); // Corrected to req.params.id
+  const { head_name, status } = req.body; // Updated item data from the request body
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error updating item" });
+      return;
+    }
+
+    // Build the UPDATE query with all the columns to be updated
+    const sql =
+      "UPDATE expense_head SET head_name = ?, status = ? WHERE id = ?";
+    const values = [head_name, status, expense_head_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating item:", error);
+        res.status(500).json({ error: "Error updating item" });
+      } else {
+        console.log("Item updated successfully");
+        res.status(200).json({ message: "Item updated successfully" });
+      }
+    });
+  });
+});
+
+app.delete("/delete-expense-head/:id", (req, res) => {
+  const expense_head_id_get = parseInt(req.params.id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting item" });
+      return;
+    }
+
+    const sql = "DELETE FROM expense_head WHERE id = ?";
+    const values = [expense_head_id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting item:", error);
+        res.status(500).json({ error: "Error deleting item" });
+      } else {
+        console.log("Expense head deleted successfully");
+        res.status(200).json({ message: "expense head deleted successfully" });
+      }
+    });
+  });
+});
+
+app.get("/expense-head-list", (req, res) => {
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching expense head" });
+      return;
+    }
+    const sql = "SELECT * FROM expense_head";
+    connection.query(sql, (error, results) => {
+      connection.release(); // Release the connection
+      if (error) {
+        console.error("Error:", error);
+        res.status(500).json({ error: "Error fetching expense head" });
+      } else {
+        console.log("Fetch Successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+app.post("/insert-expense", (req, res) => {
+  console.log("Request body:", req.body); // Log request body
+
+  const sql =
+    "INSERT INTO expenses (receipt_no, head_id, amount, remarks, payment_type) VALUES (?, ?, ?, ?, ?)";
+  const values = [
+    10000,
+    req.body.head_id,
+    req.body.amount,
+    req.body.remarks,
+    req.body.payment_type,
+  ];
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error inserting data" });
+      return;
+    }
+
+    connection.query(sql, values, (err, result) => {
+      connection.release(); // Release the connection
+
+      if (err) {
+        console.error("Error inserting data:", err);
+        res.status(500).json({ error: "Error inserting data" });
+      } else {
+        console.log("Data inserted successfully");
+        res.status(200).json({ message: "Data inserted successfully" });
+      }
+    });
+  });
+});
+
+app.get("/expenses-list", (req, res) => {
+  // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching items" });
+      return;
+    }
+
+    // SQL query to select paginated results
+    const sql = `SELECT expenses.*, expense_head.head_name FROM expenses INNER JOIN expense_head ON expenses.head_id = expense_head.id LIMIT ${limit} OFFSET ${offset}`;
+
+    // Execute the query
+    connection.query(sql, (error, results) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        connection.release(); // Release the connection
+        return;
+      }
+
+      // Query to get total count of items
+      const countSql = "SELECT COUNT(*) as total FROM expenses";
+
+      // Execute the count query
+      connection.query(countSql, (countError, countResult) => {
+        connection.release(); // Release the connection
+
+        if (countError) {
+          console.error("Error executing count SQL query: ", countError);
+          res.status(500).json({ error: "Internal server error" });
+          return;
+        }
+
+        const totalItems = countResult[0].total;
+
+        // Calculate total pages based on total count and limit
+        const totalPages = Math.ceil(totalItems / limit);
+
+        // Send paginated results and pagination metadata as JSON
+        res.json({
+          totalItems,
+          currentPage: page,
+          totalPages,
+          results,
+        });
+      });
+    });
+  });
+});
+
+app.get("/expense-get/:expense_id", (req, res) => {
+  const expense_id_get = req.params.expense_id;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching item" });
+      return;
+    }
+
+    const sql = `SELECT * FROM expenses WHERE id = ?`;
+    const values = [expense_id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+app.put("/expense/:id", (req, res) => {
+  const epxense_id = parseInt(req.params.id); // Corrected to req.params.id
+  const { head_id, amount, remarks, payment_type, hidden_id } = req.body; // Updated item data from the request body
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error updating item" });
+      return;
+    }
+
+    // Build the UPDATE query with all the columns to be updated
+    const sql =
+      "UPDATE expenses SET head_id = ?, amount = ?, remarks = ?,  payment_type = ?  WHERE id = ?";
+    const values = [head_id, amount, remarks, payment_type, epxense_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error updating item:", error);
+        res.status(500).json({ error: "Error updating item" });
+      } else {
+        console.log("Item updated successfully");
+        res.status(200).json({ message: "Updated successfully" });
+      }
+    });
+  });
+});
+
+app.delete("/delete-expense/:expense_id", (req, res) => {
+  const expense_id_get = parseInt(req.params.expense_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting item" });
+      return;
+    }
+
+    const sql = "DELETE FROM expenses WHERE id = ?";
+    const values = [expense_id_get];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting item:", error);
+        res.status(500).json({ error: "Error deleting item" });
+      } else {
+        console.log("Item deleted successfully");
+        res.status(200).json({ message: "Deleted successfully" });
+      }
+    });
+  });
+});
+
+app.get("/get-stock-list", (req, res) => {
+  // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const searchStock = req.query.getSearch;
+
+  console.log(page, limit, offset, searchStock);
+
+  // SQL query to select paginated results
+  //const sql = `SELECT invoice_no, SUM(total) AS total_amount, SUM(quantity) AS total_quantity FROM invoice GROUP BY invoice_no ORDER BY invoice_no DESC LIMIT ${limit} OFFSET ${offset}`;
+
+  let sql = `SELECT items.items AS item_name, stock.* FROM stock INNER JOIN items ON stock.item_id = items.id`;
+  if (searchStock) {
+    sql += ` WHERE item_name LIKE '%${searchStock}%'`; // Replace 'columnName' with the actual column name you want to search
+  }
+  sql += ` ORDER BY stock.invoice_no DESC LIMIT ${limit} OFFSET ${offset}`;
+
+  // Execute the query
+  connection.query(sql, (error, results) => {
+    if (error) {
+      console.error("Error executing SQL query: ", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+
+    // Query to get total count of items
+    let countSql = `SELECT COUNT(invoice_no) AS total_count 
+    FROM stock`;
+
+    if (searchStock) {
+      countSql += ` WHERE items.items LIKE '%${searchStock}%'`; // Adding WHERE clause with LIKE operator
+    }
+
+    countSql += ` ORDER BY stock.invoice_no DESC LIMIT ${limit} OFFSET ${offset}`;
+
+    // Execute the count query
+    connection.query(countSql, (countError, countResult) => {
+      if (countError) {
+        console.error("Error executing count SQL query: ", countError);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+
+      const totalItems = countResult[0].total_count;
+
+      // Calculate total pages based on total count and limit
+      const totalPages = Math.ceil(totalItems / limit);
+
+      // Send paginated results and pagination metadata as JSON
+      res.json({
+        totalItems,
+        currentPage: page,
+        totalPages,
+        results,
+      });
+    });
+  });
+});
+
+app.get("/get-invoice-list", (req, res) => {
+  // Extract page and limit from query parameters, default to page 1 and limit 5 if not provided
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 5;
+  const offset = (page - 1) * limit;
+  const searchInvoice = parseInt(req.query.getSearch);
+
+  console.log(page, limit, offset, searchInvoice);
+
+  // SQL query to select paginated results
+  //const sql = `SELECT invoice_no, SUM(total) AS total_amount, SUM(quantity) AS total_quantity FROM invoice GROUP BY invoice_no ORDER BY invoice_no DESC LIMIT ${limit} OFFSET ${offset}`;
+
+  let sql = `SELECT invoice_no, SUM(total) AS total_amount, SUM(quantity) AS total_quantity 
+    FROM invoice`;
+
+  if (searchInvoice) {
+    sql += ` WHERE invoice_no LIKE '%${searchInvoice}%'`; // Adding WHERE clause with LIKE operator
+  }
+
+  sql += ` GROUP BY invoice_no 
+    ORDER BY invoice_no DESC 
+    LIMIT ${limit} OFFSET ${offset}`;
+
+  // Execute the query
+  connection.query(sql, (error, results) => {
+    if (error) {
+      console.error("Error executing SQL query: ", error);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+
+    // Query to get total count of items
+    let countSql = `SELECT COUNT(DISTINCT invoice_no) AS total_count 
+    FROM invoice`;
+
+    if (searchInvoice) {
+      countSql += ` WHERE invoice_no LIKE '%${searchInvoice}%'`;
+    }
+
+    // Execute the count query
+    connection.query(countSql, (countError, countResult) => {
+      if (countError) {
+        console.error("Error executing count SQL query: ", countError);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+
+      const totalItems = countResult[0].total_count;
+
+      // Calculate total pages based on total count and limit
+      const totalPages = Math.ceil(totalItems / limit);
+
+      // Send paginated results and pagination metadata as JSON
+      res.json({
+        totalItems,
+        currentPage: page,
+        totalPages,
+        results,
+      });
+    });
+  });
+});
+
+app.get("/get-invoice-no/:invoice_no", (req, res) => {
+  const invoice_no = req.params.invoice_no;
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      res.status(500).json({ error: "Error fetching item" });
+      return;
+    }
+
+    //SELECT expenses.*, expense_head.head_name FROM expenses INNER JOIN expense_head ON expenses.head_id = expense_head.id LIMIT ${limit} OFFSET ${offset}`;
+
+    // const sql = `SELECT invoice.*, items.items as item_name FROM invoice INNER JOIN items ON invoice.item = items.id WHERE invoice.invoice_no = ?`;
+
+    //  const sql = `SELECT inv.*, itm.items as item_name FROM invoice AS inv INNER JOIN items AS itm ON inv.item = itm.id WHERE inv.invoice_no = ?`
+
+    //   const sql = `
+    //   SELECT
+    //     inv.*,
+    //     itm.items as item_name,
+    //     stk.quantity as stock_quantity,
+    //     agg.stock,
+    //     agg.total_sold,
+    //     (agg.stock - agg.total_sold) as stock_remain
+    // FROM
+    //     invoice AS inv
+    //     INNER JOIN items AS itm ON inv.item = itm.id
+    //     INNER JOIN stock AS stk ON itm.id = stk.item_id
+    //     LEFT JOIN (
+    //         SELECT
+    //             itm.id as item_id,
+    //             SUM(stk.quantity) as stock,
+    //             SUM(inv.quantity) as total_sold
+    //         FROM
+    //             items AS itm
+    //             LEFT JOIN invoice AS inv ON itm.id = inv.item
+    //             LEFT JOIN stock AS stk ON itm.id = stk.item_id
+    //         GROUP BY
+    //             itm.id
+    //     ) as agg ON itm.id = agg.item_id where inv.invoice_no = ? `;
+
+    const sql = `SELECT inv.*, 
+itm.items as item_name, 
+stk.quantity as stock_quantity,
+stk_agg.overall_stock,
+sales_agg.total_sold,
+(stk_agg.overall_stock - sales_agg.total_sold) as stock,
+(stk_agg.overall_stock - sales_agg.total_sold) - inv.quantity as stock_remain
+FROM 
+invoice AS inv
+INNER JOIN items AS itm ON inv.item = itm.id
+INNER JOIN stock AS stk ON itm.id = stk.item_id
+-- Aggregate total stock quantity separately
+LEFT JOIN (
+    SELECT 
+        item_id, -- Corrected column name
+        SUM(quantity) as overall_stock
+    FROM 
+        stock
+    GROUP BY 
+        item_id -- Corrected column name
+) AS stk_agg ON itm.id = stk_agg.item_id
+-- Aggregate total sold quantity separately
+LEFT JOIN (
+    SELECT 
+        item,
+        SUM(quantity) as total_sold
+    FROM 
+        invoice
+    GROUP BY 
+        item
+) AS sales_agg ON itm.id = sales_agg.item
+WHERE 
+inv.invoice_no = ?`;
+
+    const values = [invoice_no];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          results,
+        });
+      }
+    });
+  });
+});
+
+app.delete("/delete-invoice/:invoice_no", (req, res) => {
+  const invoice_no = parseInt(req.params.invoice_no);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting item" });
+      return;
+    }
+
+    const sql = "DELETE FROM invoice WHERE invoice_no = ?";
+    const values = [invoice_no];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting item:", error);
+        res.status(500).json({ error: "Error deleting item" });
+      } else {
+        console.log("Item deleted successfully");
+        res.status(200).json({ message: "Item deleted successfully" });
+      }
+    });
+  });
+});
+
+app.get("/view-invoice/:invoice_no", (req, res) => {
+  const invoice_no = parseInt(req.params.invoice_no);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error deleting item" });
+      return;
+    }
+
+    const sql = `SELECT invoice.*, items.items as item_name FROM invoice INNER JOIN items ON invoice.item = items.id WHERE invoice.invoice_no = ?`;
+    const values = [invoice_no];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error deleting item:", error);
+        res.status(500).json({ error: "Error deleting item" });
+      } else {
+        console.log("Item deleted successfully");
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+// authentication
+
+app.post("/register", (req, res) => {
+  const { username, email, password } = req.body;
+  bcrypt.hash(password, 10, (err, hash) => {
+    if (err) throw err;
+    db.query(
+      "INSERT INTO users (username, email, password) VALUES (?, ?, ?)",
+      [username, email, hash],
+      (err, result) => {
+        if (err) throw err;
+        res.status(201).send("User registered");
+      }
+    );
+  });
+});
+
+
+
+app.post("/login", (req, res) => {
+  const { email, password } = req.body;
+  db.query("SELECT * FROM users WHERE email = ?", [email], (err, results) => {
+    if (err) throw err;
+    if (results.length > 0) {
+      bcrypt.compare(password, results[0].password, (err, isMatch) => {
+        if (err) throw err;
+        if (isMatch) {
+          const token = jwt.sign({ id: results[0].id }, "secret", {
+            expiresIn: "1h",
+          });
+          res.json({ token });
+        } else {
+          res.status(400).send("Incorrect password");
+        }
+      });
+    } else {
+      res.status(400).send("User not found");
+    }
+  });
+});
+
+
+
+// ...............finance Route......................
+
+
+
+
+
+app.get("/view-finance-voucher/:finance_voucher_invoice_no/:campus_id/:session_id", (req, res) => {
+  const finance_voucher_invoice_no = parseInt(req.params.finance_voucher_invoice_no);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error getting students" });
+      return;
+    }
+
+    const sql = `SELECT 
+        create_voucher_finanace.*,
+        sub_head_coa.name as category,
+        sub_head_coa.code
+    FROM 
+      create_voucher_finanace 
+    JOIN 
+      sub_head_coa ON sub_head_coa.id = create_voucher_finanace.sub_head_id
+    WHERE 
+      create_voucher_finanace.voucher_invoice_no = ? 
+      AND create_voucher_finanace.campus_id = ? 
+      AND create_voucher_finanace.session_id = ?
+    ORDER BY 
+      create_voucher_finanace.id DESC;
+    `;
+
+    const values = [finance_voucher_invoice_no, campus_id, session_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error getting students:", error);
+        res.status(500).json({ error: "Error getting students" });
+      } else {
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+
+
+app.get("/get-finance-voucher/:finance_voucher_invoice_no/:campus_id/:session_id", (req, res) => {
+  const finance_voucher_invoice_no = parseInt(req.params.finance_voucher_invoice_no);
+  const campus_id = parseInt(req.params.campus_id);
+  const session_id = parseInt(req.params.session_id);
+
+  console.log(finance_voucher_invoice_no, campus_id, session_id);
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error getting students" });
+      return;
+    }
+
+    const sql = `SELECT 
+        create_voucher_finanace.*,
+        sub_head_coa.name as sub_head_name,
+        main_head_coa.main_head_name
+    FROM 
+      create_voucher_finanace 
+    JOIN 
+      sub_head_coa ON sub_head_coa.id = create_voucher_finanace.sub_head_id
+    JOIN 
+      main_head_coa ON main_head_coa.id = create_voucher_finanace.main_head_id
+    WHERE 
+      create_voucher_finanace.voucher_invoice_no = ? 
+      AND create_voucher_finanace.campus_id = ? 
+      AND create_voucher_finanace.session_id = ?
+    ORDER BY 
+      create_voucher_finanace.id DESC;
+    `;
+
+    const values = [finance_voucher_invoice_no, campus_id, session_id];
+
+    connection.query(sql, values, (error, results) => {
+      connection.release(); // Release the connection
+
+      if (error) {
+        console.error("Error getting students:", error);
+        res.status(500).json({ error: "Error getting students" });
+      } else {
+        res.status(200).json({ results });
+      }
+    });
+  });
+});
+
+
+
+
+
+app.post("/api/location", (req, res) => {
+  const { latitude, longitude } = req.body;
+  console.log(
+    `Received location: Latitude ${latitude}, Longitude ${longitude}`
+  );
+  res.send({ status: "Location received" });
+});
+
+// Close all database connections when the Node.js process exits
+process.on("exit", () => {
+  console.log("Closing all database connections...");
+  connection.end((err) => {
+    if (err) {
+      console.error("Error closing database connections:", err);
+    } else {
+      console.log("All database connections closed successfully.");
+    }
+  });
+});
+
+// Log an error if an uncaught exception occurs
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught exception:", err);
+  // Close all database connections before exiting due to uncaught exception
+  connection.end(() => {
+    process.exit(1);
+  });
+});
+
+// Start the server
+// app.listen(process.env.PORT, function (err) {
+//   if (err) console.log(err);
+//   console.log(`listening to port ${process.env.PORT}`);
+// });
+
+
+app.listen(process.env.PORT, '0.0.0.0', function(err) {
+  if (err) console.log(err);
+  console.log(`Server is running on port ${process.env.PORT}`);
+});

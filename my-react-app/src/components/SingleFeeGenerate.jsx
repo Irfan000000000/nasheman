@@ -22,6 +22,9 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
   const [checkAdvance, setCheckAdvance] = useState(0);
   const [checkAdvanceStatus, setCheckAdvanceStatus] = useState('');
   const [selectedItems, setSelectedItems] = useState([]);
+  // Previous unpaid arrears months pulled via /fetch-data-arrears-id.
+  // Each entry: { id, for_the_month, total_amount, status }
+  const [amountsData, setAmountsData] = useState([]);
   const [headSearch, setHeadSearch] = useState('');
   const [mobileTab, setMobileTab] = useState('form'); // 'form' | 'heads'
 
@@ -57,6 +60,7 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
     user_id: user.user.user_id,
     hidden_id: '',
     consolidated: false, // when true → single voucher with multiplied amounts
+    arear_not_cleared_id : ""
   };
 
   const [validity, setValidity] = useState({
@@ -103,6 +107,19 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
           existingFeeHead = [];
         }
 
+        // Previous unpaid voucher ids (arrears) stored as JSON on the voucher.
+        // These drive the /fetch-data-arrears-id lookup below.
+        let arrearNotClearedId = '';
+        try {
+          arrearNotClearedId = v.arrears_not_cleared
+            ? (typeof v.arrears_not_cleared === 'string'
+                ? JSON.parse(v.arrears_not_cleared)
+                : v.arrears_not_cleared)
+            : '';
+        } catch (e) {
+          arrearNotClearedId = '';
+        }
+
         const isConsolidated = !!(v.to_month && toYM(v.to_month) !== toYM(v.for_the_month));
         let monthMul = 1;
         if (isConsolidated) {
@@ -129,6 +146,8 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
         // Pre-fill form. hidden_id triggers the backend's UPDATE branch.
         // Setting class/shift/category triggers the fee heads useEffect
         // which loads the right catalog and consumes pendingEdit.
+
+        console.log(v, "voucher detail");
         setEditFormData((prev) => ({
           ...prev,
           hidden_id: v.id,
@@ -142,6 +161,7 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
           to_month: toYM(toMonthRaw),
           due_date: formatDate(v.due_date),
           remarks: v.remarks || '',
+          arear_not_cleared_id: arrearNotClearedId,
           fine: parseInt(v.fine) || 0,
           // Bus fee on voucher row may be zeroed (covered). Recover
           // per-month value: if voucher.bus_fee > 0, divide by monthMul.
@@ -176,6 +196,16 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
       + ((parseInt(editFormData.bus_fee) || 0) * monthCount)
       + (parseInt(editFormData.fine) || 0),
     [grandAmount, editFormData.bus_fee, editFormData.fine, monthCount]
+  );
+
+  // Sum of still-checked previous arrears months. Unchecked (removed) months
+  // are excluded so the figure tracks what's actually carried forward.
+  const arrearsTotal = useMemo(
+    () =>
+      amountsData
+        .filter((it) => it.status)
+        .reduce((sum, it) => sum + (parseInt(it.total_amount) || 0), 0),
+    [amountsData]
   );
 
   // ── Advance derivation (single source of truth) ──
@@ -412,6 +442,53 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
       });
   }, [editFormData.student_id, user, academicSession, isEditMode]);
 
+
+  // ─── EDIT MODE: load previous unpaid arrears months ───
+  // When the voucher carries arrears_not_cleared ids, fetch their month +
+  // amount via /fetch-data-arrears-id so the user can review (and remove)
+  // them while editing. Mirrors EditFeeVoucher.jsx.
+  useEffect(() => {
+    const arrearIds = editFormData.arear_not_cleared_id;
+    if (!arrearIds || arrearIds.length === 0) {
+      setAmountsData([]);
+      return;
+    }
+
+    const getArrears = async () => {
+      try {
+        const response = await fetch(
+          process.env.REACT_APP_API_BASE_URL + '/fetch-data-arrears-id',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(editFormData),
+          }
+        );
+
+        if (!response.ok) {
+          throw new Error('Network response was not ok');
+        }
+
+        const responseData = await response.json();
+
+        const resultsWithStatus = (responseData.results || []).map((result) => ({
+          ...result,
+          status: 'Pending', // tracks checkbox toggle state in the UI
+        }));
+
+        setAmountsData(resultsWithStatus);
+      } catch (error) {
+        console.error('Error:', error);
+        toast.error('An error occurred. Please try again.');
+      }
+    };
+
+    if (user && user.user.campus_id && editFormData.class_id) {
+      getArrears();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user, editFormData.arear_not_cleared_id]);
+
   // Fee heads — fetches the proper fee_head_details catalog. In EDIT mode
   // it also consumes the `pendingEdit` state stashed by the edit useEffect
   // (so we can match voucher.fee_head ids to the catalog and pre-select).
@@ -551,6 +628,12 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
     //    DB.fee_head amounts = whatever we send (already zeroed if needed)
     const payloadForm = {
       ...editFormData,
+      // Preserve previous arrears on save. The backend zeroes
+      // arrears_not_cleared when `arrears` is falsy, so we must send the
+      // current arrears total. Arrears are ONLY removed when the user
+      // explicitly unchecks a month (which calls /update-arrears), never
+      // by clicking Generate.
+      arrears: arrearsTotal,
       // SIGNED delta (this voucher's contribution to advance)
       first_advance_payment: firstAdvanceDelta,
       advance: firstAdvanceDelta,
@@ -586,13 +669,12 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
     });
 
     try {
-      // amountsData is consumed by the backend's UPDATE branch when editing
-      // a voucher. We don't expose per-arrear toggles here so just send an
-      // empty array; the backend has defensive defaults too.
+      // amountsData carries the previous unpaid arrears months. The backend's
+      // UPDATE branch consumes it when editing a voucher.
       const response = await fetch(`${process.env.REACT_APP_API_BASE_URL}/single-fee-voucher`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ editFormData: payloadForm, groupedData, amountsData: [] }),
+        body: JSON.stringify({ editFormData: payloadForm, groupedData, amountsData }),
       });
       if (!response.ok) throw new Error('Network response was not ok');
       const responseData = await response.json();
@@ -615,6 +697,45 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
     } catch (err) {
       console.error('Error:', err);
       toast.error('Submission failed');
+    }
+  };
+
+  // Remove a previous arrears month. This is the ONLY path that clears an
+  // arrear: we confirm FIRST, and only on confirm do we call /update-arrears
+  // and drop it from the list. Cancelling leaves the checkbox checked and
+  // makes no change — clicking "Generate Voucher" never removes arrears.
+  const handleCheckboxChangeArrearsMonth = async (id) => {
+    const item = amountsData.find((it) => it.id === id);
+    if (!item) return;
+
+    const confirmArrears = window.confirm('Are you sure you want to remove arrears!');
+    if (!confirmArrears) return; // keep it checked — no change
+
+    try {
+      const response = await fetch(
+        process.env.REACT_APP_API_BASE_URL + '/update-arrears',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            arrear_id: id,
+            student_id: editFormData.student_id,
+            hidden_id: editFormData.hidden_id,
+            month: editFormData.from_month,
+          }),
+        }
+      );
+
+      if (response.ok) {
+        setAmountsData((prev) => prev.filter((it) => it.id !== id));
+        toast.success('Arrear Removed Successfully!');
+        if (typeof onSaved === 'function') onSaved();
+      } else {
+        throw new Error('Failed to update status on server');
+      }
+    } catch (error) {
+      console.error('Error updating status:', error);
+      toast.error('Failed to update status.');
     }
   };
 
@@ -666,8 +787,8 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
 
   // Voucher amount payable comes from advCalc, which handles add/use/set
   // (including the "heads − existing + new" rule when adding on top of an
-  // existing running balance).
-  const total = advCalc.voucherAmountPayable;
+  // existing running balance), plus any previous arrears carried forward.
+  const total = advCalc.voucherAmountPayable + arrearsTotal;
 
   // Filtered heads
   const filteredHeads = useMemo(() => {
@@ -1153,6 +1274,35 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
               )}
             </div>
           </div>
+
+          {/* Previous arrears (months) — edit mode only */}
+          {amountsData.length > 0 && (
+            <div className="sfg-card">
+              <h3 className="sfg-card__title"><i className="fas fa-history"></i> Previous Arrears (Months)</h3>
+              <p style={{ fontSize: 11, color: '#6c757d', margin: '0 0 10px 0' }}>
+                Unchecking a month removes that arrear from this voucher.
+              </p>
+              {amountsData.map((result) => (
+                <div
+                  key={result.id}
+                  className="sfg-row"
+                  style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}
+                >
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, margin: 0, fontSize: 13, fontWeight: 600, color: '#1f2329' }}>
+                    <input
+                      type="checkbox"
+                      checked={!!result.status}
+                      onChange={() => handleCheckboxChangeArrearsMonth(result.id)}
+                    />
+                    {result.for_the_month}
+                  </label>
+                  <span style={{ fontSize: 13, fontWeight: 700, color: '#111418' }}>
+                    {formatRs(result.total_amount)}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* HEADS PANE */}
@@ -1248,6 +1398,12 @@ function SingleFeeGenerate({ editVoucherId = null, onSaved = null } = {}) {
                     <strong style={advCalc.zeroFeeHeads ? { textDecoration: 'line-through', color: '#9aa3af' } : {}}>
                       {formatRs(editFormData.fine)}
                     </strong>
+                  </div>
+                )}
+                {arrearsTotal > 0 && (
+                  <div className="sfg-summary__row" style={{ color: '#842029' }}>
+                    <span><i className="fas fa-history"></i> Previous Arrears</span>
+                    <strong>+ {formatRs(arrearsTotal)}</strong>
                   </div>
                 )}
                 {(advCalc.effectiveMode === 'use-covered' || advCalc.effectiveMode === 'add-covered') && (

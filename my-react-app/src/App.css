@@ -1539,7 +1539,7 @@
   white-space: nowrap;
   position: sticky;
   top: 0;
-  z-index: 2;
+  z-index: 0;
 }
 
 .promote-page__table tbody td {
@@ -2996,18 +2996,17 @@ h1, h2, h3, h4, h5, h6 {
 
 
 .voucher-details, .voucher-fee, .voucher-bank, .voucher-notes {
-  margin-top: 10px;
+  margin-top: 0px;
 }
 
 .voucher_table {
   width: 100%;
   border-collapse: collapse;
-  margin-top: 10px;
 }
 
 .voucher_table, .voucher_table th, .voucher_table td {
   border: 1px solid black;
-  padding: 5px;
+  padding: 3px;
   text-align: left;
  
 }
@@ -3025,7 +3024,7 @@ h1, h2, h3, h4, h5, h6 {
 }
 
 .voucher .title{
-  background-color: rgba(216, 216, 216, 0.384);
+  /* background-color: rgba(216, 216, 216, 0.384); */
   font-weight: bolder;
 
 }

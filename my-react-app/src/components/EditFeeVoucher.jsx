@@ -330,6 +330,8 @@ function EditFeeVoucher({ onClose, fetchData }) {
     editFormData.shift,
   ]); // Dependenci
 
+  // console.log("yes");
+
   useEffect(() => {
     if (editFormData.arear_not_cleared_id.length > 0) {
       const getArrears = async () => {
@@ -355,6 +357,8 @@ function EditFeeVoucher({ onClose, fetchData }) {
           // setArrearsIdData(responseData.results);
 
           // console.log(responseData.results);
+          
+          console.log(resultsWithStatus);
 
           const resultsWithStatus = responseData.results.map((result) => ({
             ...result,

@@ -141,6 +141,7 @@ const SingleVoucher = ({ data, bankDetails, bankNotes, user }) => {
     // student_id,
     // category_id,
     for_the_month,
+    to_month,
     fee_head,
     total_amount_data,
     // due_date,
@@ -195,8 +196,8 @@ const SingleVoucher = ({ data, bankDetails, bankNotes, user }) => {
             <tr>
               <th>Voucher#</th>
               <td>{invoice_no}</td>
-              <th>Month</th>
-              <td>{for_the_month}</td>
+              <th>Mnth</th>
+              <td>{to_month && to_month !== for_the_month ? `${for_the_month} to ${to_month}` : for_the_month}</td>
             </tr>
             <tr>
               <th>Iss.Date</th>

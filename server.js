@@ -16064,8 +16064,9 @@ async function processAndInsertMultiple(
             // and the running balance = previous − heads_covered.
             const _newAdvAdd = 0;
             const _prevAdvBal = advanceInfo ? (parseInt(advanceInfo.advance_payments) || 0) : 0;
-            const _headsArr = (arrearsInfo && arrearsInfo.total_arrears) ? arrearsInfo.total_arrears : 0;
-            const _headsTotal = total_amount_data + _headsArr;
+            // Arrears are tracked separately in the `arrears` column and must
+            // NOT be folded into total_amount_data / after_due_date_amount.
+            const _headsTotal = total_amount_data;
             const _headsCoveredByExisting = Math.min(_prevAdvBal, _headsTotal);
             const _finalRunningBal = Math.max(0, _prevAdvBal - _headsCoveredByExisting + _newAdvAdd);
             const _zeroHeads = _prevAdvBal >= _headsTotal && _headsTotal > 0;
@@ -16869,7 +16870,11 @@ app.post("/single-fee-voucher", async (req, res) => {
 
             const safeArrears = parseInt(arrears) || 0;
             const safeFirstAdv = parseInt(first_advance_payment) || 0;
-            const safeBusFeePerVoucher = parseInt(bus_fee) || 0; // already monthMul-applied if consolidated
+            // CONSOLIDATED: when the voucher spans from_month..to_month (gap > 1
+            // month) multiply per-month head & bus amounts by the month count,
+            // same as the INSERT branch. monthMultiplier = 1 for a single month.
+            const monthMultiplier = consolidated ? months.length : 1;
+            const safeBusFeePerVoucher = (parseInt(bus_fee) || 0) * monthMultiplier;
             const safeFine = parseInt(fine) || 0;
             const safeArrearsCheck = Array.isArray(check_monthwise_arrears_exist) ? check_monthwise_arrears_exist : [];
             const prevAdvBal = (results.length > 0 && results[0].advance_payments)
@@ -16877,7 +16882,7 @@ app.post("/single-fee-voucher", async (req, res) => {
               : 0;
 
             // Same advance logic as the INSERT branch / processAndInsertSingleVoucher:
-            //   _headsTotal     = heads + bus_fee + arrears (the real bill)
+            //   _headsTotal     = heads + bus_fee (arrears tracked separately)
             //   _headsCovered   = min(prevAdvBal, _headsTotal)
             //   _finalRunningBal = max(0, prev - covered + newAdd)
             //   _zeroHeads      = existing fully covers heads
@@ -16885,17 +16890,18 @@ app.post("/single-fee-voucher", async (req, res) => {
             //   _isPaidStatus   = voucher fully covered AND no new addition
             const newAdvAdd = safeFirstAdv > 0 ? safeFirstAdv : 0;
             const useAdvAmt = safeFirstAdv < 0 ? Math.abs(safeFirstAdv) : 0;
-            const headsTotalRaw = grandSum + safeBusFeePerVoucher + safeArrears;
+            // Arrears are tracked separately in the `arrears` column and must
+            // NOT be folded into total_amount_data / after_due_date_amount.
+            const headsTotalRaw = (grandSum * monthMultiplier) + safeBusFeePerVoucher;
             const headsCovered = Math.min(prevAdvBal, headsTotalRaw);
             const finalRunningBal = Math.max(0, prevAdvBal - headsCovered + newAdvAdd - useAdvAmt);
             const zeroHeads = prevAdvBal >= headsTotalRaw && headsTotalRaw > 0;
 
+            // first_advance_payment (newAdvAdd) must NOT be folded into
+            // total_amount_data / after_due_date_amount — it is tracked
+            // separately in the first_advance_payment + advance_payments columns.
             let voucherPayable;
-            if (newAdvAdd > 0) {
-              voucherPayable = zeroHeads
-                ? newAdvAdd
-                : (headsTotalRaw - prevAdvBal) + newAdvAdd;
-            } else if (zeroHeads) {
+            if (zeroHeads) {
               voucherPayable = 0;
             } else if (prevAdvBal > 0) {
               voucherPayable = headsTotalRaw - prevAdvBal;
@@ -16908,9 +16914,10 @@ app.post("/single-fee-voucher", async (req, res) => {
 
             // Build fee_head JSON: cascade-deduct prevAdvBal across heads,
             // OR zero them when fully covered (same rules as INSERT).
+            // CONSOLIDATED: each head amount × monthMultiplier.
             const incomingHeads = get_heads_data.map((item) => ({
               id: item.id,
-              amount: parseInt(item.amount) || 0,
+              amount: (parseInt(item.amount) || 0) * monthMultiplier,
               category_name: item.category_name,
             }));
             let finalHeads;
@@ -17305,8 +17312,9 @@ async function processAndInsertSingleVoucher(
             // shows what the parent must actually pay.
             const _newAdvAdd = parseInt(advance || 0) || 0;
             const _prevAdvBal = advanceInfo ? (parseInt(advanceInfo.advance_payments) || 0) : 0;
-            const _headsArr = (arrearsInfo && arrearsInfo.total_arrears) ? arrearsInfo.total_arrears : 0;
-            const _headsTotal = total_amount_data + _headsArr;
+            // Arrears are tracked separately in the `arrears` column and must
+            // NOT be folded into total_amount_data / after_due_date_amount.
+            const _headsTotal = total_amount_data;
             const _headsCoveredByExisting = Math.min(_prevAdvBal, _headsTotal);
 
             // Force unpaid if user is depositing new advance
@@ -23808,12 +23816,188 @@ app.get("/fee-vouchers-list", (req, res) => {
 });
 
 
+// ─── PUBLIC: Fetch all fee vouchers for a student by student_unique_id ───
+// GET /public/student-vouchers/:student_unique_id
+// No auth, no session filter. campus_id is fixed to 16.
+// student_unique_id stays stable for a student until they are struck off /
+// get an SLC, and fee_vouchers stores it, so it links all their vouchers.
+// Returns the same shape rows as /fee-vouchers-list so a list UI can render.
+const PUBLIC_VOUCHERS_CAMPUS_ID = 16;
+
+app.get("/public/student-vouchers/:student_unique_id", (req, res) => {
+  const student_unique_id = parseInt(req.params.student_unique_id);
+
+  if (!student_unique_id) {
+    return res.status(400).json({ error: "student_unique_id is required" });
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching" });
+      return;
+    }
+
+    const sql = `
+      SELECT fee_vouchers.*, students.register_no, students.old_register_no, students.full_name, classes.class, sections.section_name
+      FROM fee_vouchers
+      LEFT JOIN students ON students.id = fee_vouchers.student_id
+      LEFT JOIN classes ON classes.id = students.class_id
+      LEFT JOIN sections ON sections.id = students.section_id
+      WHERE fee_vouchers.student_unique_id = ? AND fee_vouchers.campus_id = ?
+      ORDER BY fee_vouchers.invoice_no DESC`;
+
+    const params = [student_unique_id, PUBLIC_VOUCHERS_CAMPUS_ID];
+
+    connection.query(sql, params, (error, results) => {
+      connection.release();
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+        return;
+      }
+
+      res.json({
+        total: results.length,
+        results,
+      });
+    });
+  });
+});
+
+
+
+// app.get("/datewise-posting-report", (req, res) => {
+
+//   const from_month = req.query.from_month;
+//   const campus_id = parseInt(req.query.campus_id);
+//   const session_id = parseInt(req.query.session_id);
+
+//   const shift = req.query.shift;
+
+//   // Received (payment) date range filter
+//   const posting_from_date = req.query.posting_from_date;
+//   const posting_to_date = req.query.posting_to_date;
+
+//   if (!campus_id || !session_id) {
+//     return res
+//       .status(400)
+//       .json({ error: "campus_id and session_id are required" });
+//   }
+
+//   connection.getConnection((err, connection) => {
+//     if (err) {
+//       console.error("Error:", err);
+//       res.status(500).json({ error: "Error fetching" });
+//       return;
+//     }
+
+//     // Main SQL query
+//     let sql = `
+//       SELECT fee_vouchers.*, students.register_no, students.old_register_no, students.full_name, classes.class, sections.section_name
+//       FROM fee_vouchers
+//       LEFT JOIN students ON students.id = fee_vouchers.student_id
+//       LEFT JOIN classes ON classes.id = students.class_id
+//       LEFT JOIN sections ON sections.id = students.section_id
+//       WHERE fee_vouchers.for_the_month = ? AND fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ? AND fee_vouchers.status = 'paid'`;
+
+//     const params = [from_month, session_id, campus_id];
+
+//     if (shift) {
+//       sql += `  AND fee_vouchers.shift = ?`;
+//       params.push(shift);
+//     }
+
+//     // Filter by received (payment) date range when provided
+//     if (posting_from_date) {
+//       sql += ` AND DATE(fee_vouchers.payment_date) >= ?`;
+//       params.push(posting_from_date);
+//     }
+//     if (posting_to_date) {
+//       sql += ` AND DATE(fee_vouchers.payment_date) <= ?`;
+//       params.push(posting_to_date);
+//     }
+
+//     // const [year, month] = from_month.split("-").map(Number);
+
+//     // let nextYear = year;
+//     // let nextMonth = month + 1;
+
+//     // if (nextMonth > 12) {
+//     //   nextMonth = 1;  // Reset to January
+//     //   nextYear += 1;  // Increment the year
+//     // }
+
+//     // const next_month = `${nextYear}-${String(nextMonth).padStart(2, "0")}`;
+//     // // console.log(next_month); // Outputs "2024-11"
+
+
+//     // // Add date filtering to SQL query if from_date or to_date is present
+//     // if (from_month) {
+//     //   const from_month_start = `${from_month}-01`;
+//     //   const next_month_start = `${next_month}-01`; // calculate next_month based on your logic
+//     //   sql += ` AND payment_date >= ? AND payment_date < ?`;
+//     //   params.push(from_month_start, next_month_start);
+//     // } 
+
+//     // Comment out last month SQL query
+//     // let lastMonthSql = `
+//     //   SELECT for_the_month
+//     //   FROM fee_vouchers
+//     //   WHERE session_id = ? AND campus_id = ? and voucher_created_form != "Single"
+//     //   ORDER BY id DESC
+//     //   LIMIT 1`;
+
+//     // Execute the main query to fetch records
+//     connection.query(sql, params, (error, results) => {
+//       if (error) {
+//         console.error("Error executing SQL query: ", error);
+//         res.status(500).json({ error: "Internal server error" });
+//         connection.release();
+//         return;
+//       }
+
+//       // Count the number of records returned from the main query
+//       const totalCount = results.length;
+
+//       // Commented out the last month query execution
+//       // connection.query(
+//       //   lastMonthSql,
+//       //   [session_id, campus_id],
+//       //   (lastMonthError, lastMonthResult) => {
+//       //     if (lastMonthError) {
+//       //       console.error(
+//       //         "Error executing last month SQL query: ",
+//       //         lastMonthError
+//       //       );
+//       //       res.status(500).json({ error: "Internal server error" });
+//       //       connection.release();
+//       //       return;
+//       //     }
+
+//       connection.release();
+//       // const lastMonth =
+//       //   lastMonthResult.length > 0
+//       //     ? lastMonthResult[0].for_the_month
+//       //     : null;
+
+//       // Respond with the results, the total count, and last month data
+//       res.json({
+//         total_count: totalCount, // Send total count of records
+//         results, // Send the main query results
+//          last_month: 0
+//       });
+//     });
+//   });
+// });
+
 
 
 
 app.get("/datewise-posting-report", (req, res) => {
 
   const from_month = req.query.from_month;
+  const to_month = req.query.to_month;
   const campus_id = parseInt(req.query.campus_id);
   const session_id = parseInt(req.query.session_id);
 
@@ -23843,9 +24027,19 @@ app.get("/datewise-posting-report", (req, res) => {
       LEFT JOIN students ON students.id = fee_vouchers.student_id
       LEFT JOIN classes ON classes.id = students.class_id
       LEFT JOIN sections ON sections.id = students.section_id
-      WHERE fee_vouchers.for_the_month = ? AND fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ? AND fee_vouchers.status = 'paid'`;
+      WHERE fee_vouchers.session_id = ? AND fee_vouchers.campus_id = ? AND fee_vouchers.status = 'paid'`;
 
-    const params = [from_month, session_id, campus_id];
+    const params = [session_id, campus_id];
+
+    // for_the_month range filter (from_month / to_month)
+    if (from_month) {
+      sql += ` AND fee_vouchers.for_the_month >= ?`;
+      params.push(from_month);
+    }
+    if (to_month) {
+      sql += ` AND fee_vouchers.for_the_month <= ?`;
+      params.push(to_month);
+    }
 
     if (shift) {
       sql += `  AND fee_vouchers.shift = ?`;
@@ -23862,36 +24056,6 @@ app.get("/datewise-posting-report", (req, res) => {
       params.push(posting_to_date);
     }
 
-    // const [year, month] = from_month.split("-").map(Number);
-
-    // let nextYear = year;
-    // let nextMonth = month + 1;
-
-    // if (nextMonth > 12) {
-    //   nextMonth = 1;  // Reset to January
-    //   nextYear += 1;  // Increment the year
-    // }
-
-    // const next_month = `${nextYear}-${String(nextMonth).padStart(2, "0")}`;
-    // // console.log(next_month); // Outputs "2024-11"
-
-
-    // // Add date filtering to SQL query if from_date or to_date is present
-    // if (from_month) {
-    //   const from_month_start = `${from_month}-01`;
-    //   const next_month_start = `${next_month}-01`; // calculate next_month based on your logic
-    //   sql += ` AND payment_date >= ? AND payment_date < ?`;
-    //   params.push(from_month_start, next_month_start);
-    // } 
-
-    // Comment out last month SQL query
-    // let lastMonthSql = `
-    //   SELECT for_the_month
-    //   FROM fee_vouchers
-    //   WHERE session_id = ? AND campus_id = ? and voucher_created_form != "Single"
-    //   ORDER BY id DESC
-    //   LIMIT 1`;
-
     // Execute the main query to fetch records
     connection.query(sql, params, (error, results) => {
       if (error) {
@@ -23901,39 +24065,18 @@ app.get("/datewise-posting-report", (req, res) => {
         return;
       }
 
-      // Count the number of records returned from the main query
       const totalCount = results.length;
-
-      // Commented out the last month query execution
-      // connection.query(
-      //   lastMonthSql,
-      //   [session_id, campus_id],
-      //   (lastMonthError, lastMonthResult) => {
-      //     if (lastMonthError) {
-      //       console.error(
-      //         "Error executing last month SQL query: ",
-      //         lastMonthError
-      //       );
-      //       res.status(500).json({ error: "Internal server error" });
-      //       connection.release();
-      //       return;
-      //     }
-
       connection.release();
-      // const lastMonth =
-      //   lastMonthResult.length > 0
-      //     ? lastMonthResult[0].for_the_month
-      //     : null;
 
-      // Respond with the results, the total count, and last month data
       res.json({
-        total_count: totalCount, // Send total count of records
-        results, // Send the main query results
-         last_month: 0
+        total_count: totalCount,
+        results,
+        last_month: 0
       });
     });
   });
 });
+
 
 
 

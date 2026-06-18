@@ -346,7 +346,7 @@ const FeeReports = () => {
             return false;
         }
         } else if (report_type_get === 'Datewise Posting Report') {
-            if(editFormData.from_month !== ''){
+            if((editFormData.posting_from_date !== '' & editFormData.posting_to_date !== '') || editFormData.from_month !== ''){
             url = process.env.REACT_APP_API_BASE_URL+'/datewise-posting-report';
         }else{
             window.alert("!Please Select Date");

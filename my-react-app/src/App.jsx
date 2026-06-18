@@ -39,6 +39,7 @@ const Category = lazy(() => import('./components/Category'));
 const Employee = lazy(() => import('./components/Employee'));
 const Attendance = lazy(() => import('./components/Attendance'));
 const EventPhotos = lazy(() => import('./components/EventPhotos'));
+const StudentVouchersTest = lazy(() => import('./components/StudentVouchersTest'));
 
 const ApplyNow = lazy(() => import('./components/ApplyNow'));
 
@@ -322,6 +323,11 @@ function AppContent() {
                   )
                 }
               />
+
+
+
+               <Route path="/student-vouchers" element={<StudentVouchersTest />} />
+
 
               <Route
                 path="/admission-form"

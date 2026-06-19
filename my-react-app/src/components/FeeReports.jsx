@@ -43,7 +43,7 @@ const FeeReports = () => {
     const [swSectionFilter, setSwSectionFilter] = useState('');
     const [swStatusFilter, setSwStatusFilter] = useState('');
 
-    // Joined rows for the "Pending vs Headwise Cross Match" report
+    // Joined rows for the "Pendency vs Generated Difference" report
     const [crossMatchData, setCrossMatchData] = useState([]);
     // const [receivableAndPayableData, setReceivableAndPayableData] = useState([]);
     // const [totalPages, setTotalPages] = useState(1);
@@ -340,22 +340,17 @@ const FeeReports = () => {
             limit
         };
 
-        // Cross-match reports: fetch both the Student Wise Headwise (selected month) and the
-        // Pendency data, then join per student and keep only the differences.
-        //  - "Pending vs Headwise Cross Match"      -> month-scoped pending (classwise)
-        //  - "Pendency vs Generated Difference"     -> all-unpaid-months pending (all-voucher)
-        if (report_type_get === 'Pending vs Headwise Cross Match' ||
-            report_type_get === 'Pendency vs Generated Difference') {
+        // Difference report: fetch the Student Wise Headwise (selected month) and the
+        // all-unpaid-months Pendency data, then join per student and keep only the differences.
+        if (report_type_get === 'Pendency vs Generated Difference') {
             if (from_month === '') {
                 window.alert("!Please Select Month");
                 setLoading(false);
                 return false;
             }
 
-            const allMonthsPending = report_type_get === 'Pendency vs Generated Difference';
             const headwiseUrl = process.env.REACT_APP_API_BASE_URL + '/student-wise-headwise-report';
-            const pendingUrl = process.env.REACT_APP_API_BASE_URL +
-                (allMonthsPending ? '/all-voucher-pending-report' : '/vouchers-pending-report-classwise');
+            const pendingUrl = process.env.REACT_APP_API_BASE_URL + '/all-voucher-pending-report';
 
             Promise.all([
                 axios.get(headwiseUrl, { params }),
@@ -981,8 +976,6 @@ const FeeReports = () => {
                 return 'Head Wise Fee Report' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
             case 'Student Wise Headwise Report':
                     return 'Student Wise Headwise Report' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
-            case 'Pending vs Headwise Cross Match':
-                    return 'Pending vs Headwise Cross Match (Mismatches)' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
             case 'Pendency vs Generated Difference':
                     return 'Pendency vs Generated Difference' + (editFormData.from_month ? ' (Generated: ' + editFormData.from_month + ' vs Total Pending)' : '');
             case 'Fee Not Generated Report':
@@ -1021,7 +1014,6 @@ const FeeReports = () => {
         { value: '', label: 'Select Report Type' },
         { value: 'Headwise Report', label: 'Headwise Report' },
         { value: 'Student Wise Headwise Report', label: 'Student Wise Headwise Report' },
-        { value: 'Pending vs Headwise Cross Match', label: 'Pending vs Headwise Cross Match' },
         { value: 'Pendency vs Generated Difference', label: 'Pendency vs Generated Difference' },
         { value: 'Fee Not Generated Report', label: 'Fee Not Generated Report' },
         { value: 'Pendency Report', label: 'Pendency Report' },
@@ -2415,71 +2407,6 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
 </div>
 
                                     
-                                    ) : editFormData.report_type_get === "Pending vs Headwise Cross Match" ? (
-                                        <div className=''>
-                                            {loading ? (
-                                                <p>Loading...</p>
-                                            ) : crossMatchData.length === 0 ? (
-                                                <p className="text-success p-2" style={{ fontWeight: 600 }}>
-                                                    No mismatches found — Pending Amounts match the unpaid Total Fee Generated.
-                                                </p>
-                                            ) : (
-                                                <>
-                                                    <table border="1" data-sheet-name="Cross Match" className='p-0 table table-hover' style={{ borderTop: "0px" }}>
-                                                        <thead style={{ position: "sticky", top: "0", backgroundColor: "#f8f9fa", zIndex: "6" }}>
-                                                            <tr>
-                                                                <th>Sr#</th>
-                                                                <th>Register#</th>
-                                                                <th>Student Name</th>
-                                                                <th>Class</th>
-                                                                <th>Section</th>
-                                                                <th>Category</th>
-                                                                <th>Phone#</th>
-                                                                <th>Pending Amount</th>
-                                                                <th>Headwise Unpaid Total Generated</th>
-                                                                <th>Difference</th>
-                                                            </tr>
-                                                        </thead>
-                                                        <tbody>
-                                                            {crossMatchData.map((row, idx) => (
-                                                                <tr key={row.student_id}>
-                                                                    <td>{idx + 1}</td>
-                                                                    <td>{row.register_no}</td>
-                                                                    <td title={row.full_name}>{row.full_name}</td>
-                                                                    <td>{row.class_name}</td>
-                                                                    <td>{row.section_name}</td>
-                                                                    <td>{row.category}</td>
-                                                                    <td>{row.mobile_no}</td>
-                                                                    <td>{row.pending_total}</td>
-                                                                    <td>{row.headwise_total}</td>
-                                                                    <td style={{ fontWeight: 600, color: row.difference < 0 ? '#b00020' : '#1e7e45' }}>
-                                                                        {row.difference}
-                                                                    </td>
-                                                                </tr>
-                                                            ))}
-                                                        </tbody>
-                                                        <tfoot>
-                                                            <tr>
-                                                                <td colSpan="7" style={{ fontWeight: 'bold', backgroundColor: '#f1f1f1', textAlign: 'right' }}>Grand Total</td>
-                                                                <td style={{ fontWeight: 'bold', backgroundColor: 'rgb(206, 206, 206)' }}>
-                                                                    {crossMatchData.reduce((sum, row) => sum + row.pending_total, 0)}
-                                                                </td>
-                                                                <td style={{ fontWeight: 'bold', backgroundColor: 'rgb(206, 206, 206)' }}>
-                                                                    {crossMatchData.reduce((sum, row) => sum + row.headwise_total, 0)}
-                                                                </td>
-                                                                <td style={{ fontWeight: 'bold', backgroundColor: 'rgb(206, 206, 206)' }}>
-                                                                    {crossMatchData.reduce((sum, row) => sum + row.difference, 0)}
-                                                                </td>
-                                                            </tr>
-                                                        </tfoot>
-                                                    </table>
-                                                    <div className='pt-2 pb-2' style={{ fontSize: '13px', color: '#6c757d' }}>
-                                                        Showing {crossMatchData.length} student(s) where Pending Amount differs from the unpaid Total Fee Generated for the selected month.
-                                                    </div>
-                                                </>
-                                            )}
-                                        </div>
-
                                     ) : editFormData.report_type_get === "Pendency vs Generated Difference" ? (
                                         <div className=''>
                                             {loading ? (
@@ -2663,6 +2590,55 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
     />
 
 </div>
+
+                                            {filteredVouchers.length > 0 && (() => {
+                                                const summary = {};
+                                                filteredVouchers.forEach(v => {
+                                                    const key = (v.class_name || '') + ' (' + (v.section_name || '') + ')';
+                                                    if (!summary[key]) summary[key] = { students: 0, months: 0, amount: 0 };
+                                                    summary[key].students += 1;
+                                                    summary[key].months += Number(v.unpaid_vouchers_count) || 0;
+                                                    summary[key].amount += Number(v.payable_amount_after_due_date) || 0;
+                                                });
+                                                const rows = Object.entries(summary).sort(([a], [b]) => a.localeCompare(b));
+                                                const totStudents = filteredVouchers.length;
+                                                const totMonths = rows.reduce((s, [, d]) => s + d.months, 0);
+                                                const totAmount = rows.reduce((s, [, d]) => s + d.amount, 0);
+                                                return (
+                                                    <div className='mb-3'>
+                                                        <h6 style={{ fontWeight: 600, margin: '6px 0' }}>Detail Summary (Class Wise)</h6>
+                                                        <table border="1" data-sheet-name="Summary" className='p-0 table table-bordered table-sm' style={{ width: 'auto', minWidth: '460px' }}>
+                                                            <thead style={{ backgroundColor: '#f8f9fa' }}>
+                                                                <tr>
+                                                                    <th>Class</th>
+                                                                    <th style={{ textAlign: 'center' }}>No. of Students</th>
+                                                                    <th style={{ textAlign: 'center' }}>No. of Months</th>
+                                                                    <th style={{ textAlign: 'right' }}>Pending Amount</th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody>
+                                                                {rows.map(([cls, d]) => (
+                                                                    <tr key={cls}>
+                                                                        <td>{cls}</td>
+                                                                        <td style={{ textAlign: 'center' }}>{d.students}</td>
+                                                                        <td style={{ textAlign: 'center' }}>{d.months}</td>
+                                                                        <td style={{ textAlign: 'right' }}>{d.amount}</td>
+                                                                    </tr>
+                                                                ))}
+                                                            </tbody>
+                                                            <tfoot>
+                                                                <tr style={{ fontWeight: 'bold', backgroundColor: 'rgb(206,206,206)' }}>
+                                                                    <td>Grand Total</td>
+                                                                    <td style={{ textAlign: 'center' }}>{totStudents}</td>
+                                                                    <td style={{ textAlign: 'center' }}>{totMonths}</td>
+                                                                    <td style={{ textAlign: 'right' }}>{totAmount}</td>
+                                                                </tr>
+                                                            </tfoot>
+                                                        </table>
+                                                    </div>
+                                                );
+                                            })()}
+
                                             <table border="1" className='p-0 table table-hover' style={{ borderTop: "0px" }}>
                                                 <thead style={{ borderBottom: "0px" }}>
                                                     <tr>

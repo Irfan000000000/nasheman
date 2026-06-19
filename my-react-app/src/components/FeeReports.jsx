@@ -37,6 +37,14 @@ const FeeReports = () => {
     const [getClasses, setClasses] = useState([]);
     const [showData, setShowData] = useState(false);
     const [monthlyReports, setMonthlyReports] = useState({});
+
+    // Inline filters for the Student Wise Headwise Report results
+    const [swClassFilter, setSwClassFilter] = useState('');
+    const [swSectionFilter, setSwSectionFilter] = useState('');
+    const [swStatusFilter, setSwStatusFilter] = useState('');
+
+    // Joined rows for the "Pending vs Headwise Cross Match" report
+    const [crossMatchData, setCrossMatchData] = useState([]);
     // const [receivableAndPayableData, setReceivableAndPayableData] = useState([]);
     // const [totalPages, setTotalPages] = useState(1);
 
@@ -89,6 +97,15 @@ const FeeReports = () => {
         // Return formatted date as dd-mm-yyyy
         return `${day}-${month}-${year}`;
     }
+
+    // Apply the Student Wise Headwise inline filters (class / section / status) to a voucher list
+    const applyStudentWiseFilters = (vouchers) => {
+        return vouchers.filter((voucher) =>
+            (swClassFilter === '' || voucher.class_name === swClassFilter) &&
+            (swSectionFilter === '' || voucher.section_name === swSectionFilter) &&
+            (swStatusFilter === '' || voucher.status === swStatusFilter)
+        );
+    };
 
 
 
@@ -312,6 +329,107 @@ const FeeReports = () => {
             page,
             limit
         };
+
+        // Cross-match report: fetch both the Student Wise Headwise and the (month-scoped)
+        // classwise Pendency data, then join per student and keep only the mismatches.
+        if (report_type_get === 'Pending vs Headwise Cross Match') {
+            if (from_month === '') {
+                window.alert("!Please Select Month");
+                setLoading(false);
+                return false;
+            }
+
+            const headwiseUrl = process.env.REACT_APP_API_BASE_URL + '/student-wise-headwise-report';
+            const pendingUrl = process.env.REACT_APP_API_BASE_URL + '/vouchers-pending-report-classwise';
+
+            Promise.all([
+                axios.get(headwiseUrl, { params }),
+                axios.get(pendingUrl, { params })
+            ])
+                .then(([headwiseRes, pendingRes]) => {
+                    const headwiseVouchers = headwiseRes.data.feeVouchers || [];
+                    const pendingRows = pendingRes.data.feeVouchers || [];
+
+                    // Sum the unpaid "Total Fee Generated" per student from the headwise data
+                    const headwiseByStudent = headwiseVouchers.reduce((acc, v) => {
+                        if (v.status === 'unpaid') {
+                            const generated =
+                                (Number(v.payable_amount) || 0) +
+                                (Number(v.advance_payment) || 0) +
+                                (Number(v.calculated_fine) || 0) +
+                                (Number(v.arrears) || 0);
+                            if (!acc[v.student_id]) {
+                                acc[v.student_id] = {
+                                    student_id: v.student_id,
+                                    register_no: v.register_no,
+                                    full_name: v.full_name,
+                                    class_name: v.class_name,
+                                    section_name: v.section_name,
+                                    category: v.category,
+                                    mobile_no: v.mobile_no,
+                                    headwise_total: 0
+                                };
+                            }
+                            acc[v.student_id].headwise_total += generated;
+                        }
+                        return acc;
+                    }, {});
+
+                    // Index the pending amounts per student
+                    const pendingByStudent = pendingRows.reduce((acc, p) => {
+                        acc[p.student_id] = p;
+                        return acc;
+                    }, {});
+
+                    // Union of every student present in either source
+                    const allStudentIds = new Set([
+                        ...Object.keys(headwiseByStudent),
+                        ...Object.keys(pendingByStudent)
+                    ]);
+
+                    const rows = [];
+                    allStudentIds.forEach(id => {
+                        const h = headwiseByStudent[id];
+                        const p = pendingByStudent[id];
+
+                        const headwiseTotal = Math.round(h ? h.headwise_total : 0);
+                        const pendingTotal = Math.round(p ? (Number(p.payable_amount_after_due_date) || 0) : 0);
+                        const difference = pendingTotal - headwiseTotal;
+
+                        // Keep only mismatches
+                        if (difference !== 0) {
+                            rows.push({
+                                student_id: id,
+                                register_no: (h && h.register_no) || (p && p.register_no) || '',
+                                full_name: (h && h.full_name) || (p && p.full_name) || '',
+                                class_name: (h && h.class_name) || (p && p.class_name) || '',
+                                section_name: (h && h.section_name) || (p && p.section_name) || '',
+                                category: (h && h.category) || (p && p.category) || '',
+                                mobile_no: (h && h.mobile_no) || (p && p.father_mobile_no) || '',
+                                pending_total: pendingTotal,
+                                headwise_total: headwiseTotal,
+                                difference
+                            });
+                        }
+                    });
+
+                    rows.sort((a, b) =>
+                        (a.class_name || '').localeCompare(b.class_name || '') ||
+                        (a.section_name || '').localeCompare(b.section_name || '') ||
+                        (a.full_name || '').localeCompare(b.full_name || '')
+                    );
+
+                    setCrossMatchData(rows);
+                    setLoading(false);
+                    setShowData(true);
+                })
+                .catch(err => {
+                    console.log(err);
+                    setLoading(false);
+                });
+
+            return;
+        }
 
         if (report_type_get === 'Headwise Report') {
             if(editFormData.from_month !== '' || editFormData.to_month !== '' ){
@@ -717,6 +835,10 @@ const FeeReports = () => {
 
     const resetStates = () => {
         setEditFormData(initialFormData);
+        setSwClassFilter('');
+        setSwSectionFilter('');
+        setSwStatusFilter('');
+        setCrossMatchData([]);
     };
 
     // const calculateGrandTotalPending = (vouchers) => {
@@ -828,6 +950,8 @@ const FeeReports = () => {
                 return 'Head Wise Fee Report' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
             case 'Student Wise Headwise Report':
                     return 'Student Wise Headwise Report' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
+            case 'Pending vs Headwise Cross Match':
+                    return 'Pending vs Headwise Cross Match (Mismatches)' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
             case 'Pendency Report':
                 return 'Pendency Report' + (editFormData.from_month ? ' (' + editFormData.from_month + ' to ' + editFormData.to_month + ')' : '');
             // case 'Recievable & Payable':
@@ -862,6 +986,7 @@ const FeeReports = () => {
         { value: '', label: 'Select Report Type' },
         { value: 'Headwise Report', label: 'Headwise Report' },
         { value: 'Student Wise Headwise Report', label: 'Student Wise Headwise Report' },
+        { value: 'Pending vs Headwise Cross Match', label: 'Pending vs Headwise Cross Match' },
         { value: 'Pendency Report', label: 'Pendency Report' },
         { value: 'Bad Debits Report', label: 'Bad Debits Report' },
         // { value: 'Recievable & Payable', label: 'Recievable And Payable' },
@@ -1223,7 +1348,10 @@ const FeeReports = () => {
             // Create a new workbook
 const workbook = XLSX.utils.book_new();
 
-Object.entries(monthlyReports).forEach(([month, { vouchers, feeHeadDetails }]) => {
+Object.entries(monthlyReports).forEach(([month, { vouchers: rawVouchers, feeHeadDetails }]) => {
+  // Apply the same inline class / section / status filters as the on-screen report
+  const vouchers = applyStudentWiseFilters(rawVouchers);
+
   // Extract unique fee head names
   const feeHeadNames = [...new Set(feeHeadDetails.map(head => head.head_name))];
 
@@ -1965,12 +2093,46 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                                     ) : editFormData.report_type_get === "Student Wise Headwise Report" ? (
                                     
                                     <div>
+                                        {(() => {
+                                            const allVouchers = Object.values(monthlyReports).flatMap(m => m.vouchers || []);
+                                            const classOptions = [...new Set(allVouchers.map(v => v.class_name).filter(Boolean))].sort();
+                                            const sectionOptions = [...new Set(allVouchers.map(v => v.section_name).filter(Boolean))].sort();
+                                            const statusOptions = [...new Set(allVouchers.map(v => v.status).filter(Boolean))].sort();
+                                            return (
+                                                <div className="d-flex flex-wrap align-items-end mb-2" style={{ gap: '10px' }}>
+                                                    <div>
+                                                        <label className="frf-label">Class</label>
+                                                        <select className="form-control form-control-sm" value={swClassFilter} onChange={(e) => setSwClassFilter(e.target.value)}>
+                                                            <option value="">All Classes</option>
+                                                            {classOptions.map(c => <option key={c} value={c}>{c}</option>)}
+                                                        </select>
+                                                    </div>
+                                                    <div>
+                                                        <label className="frf-label">Section</label>
+                                                        <select className="form-control form-control-sm" value={swSectionFilter} onChange={(e) => setSwSectionFilter(e.target.value)}>
+                                                            <option value="">All Sections</option>
+                                                            {sectionOptions.map(s => <option key={s} value={s}>{s}</option>)}
+                                                        </select>
+                                                    </div>
+                                                    <div>
+                                                        <label className="frf-label">Status</label>
+                                                        <select className="form-control form-control-sm" value={swStatusFilter} onChange={(e) => setSwStatusFilter(e.target.value)}>
+                                                            <option value="">All Status</option>
+                                                            {statusOptions.map(st => <option key={st} value={st} style={{ textTransform: 'capitalize' }}>{st}</option>)}
+                                                        </select>
+                                                    </div>
+                                                </div>
+                                            );
+                                        })()}
                                         {loading ? (
                                             <p>Loading...</p>
                                         ) : (
-                                     Object.entries(monthlyReports).map(([month, { vouchers, feeHeadDetails }]) => {
+                                     Object.entries(monthlyReports).map(([month, { vouchers: rawVouchers, feeHeadDetails }]) => {
                                     // Extract unique fee head names
                                     const feeHeadNames = [...new Set(feeHeadDetails.map(head => head.head_name))];
+
+                                        // Apply inline class / section / status filters (used for rows and grand totals)
+                                        const vouchers = applyStudentWiseFilters(rawVouchers);
 
                                         // Group vouchers by class_id
                                         const groupedByClass = vouchers.reduce((acc, voucher) => {
@@ -2216,6 +2378,71 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
 </div>
 
                                     
+                                    ) : editFormData.report_type_get === "Pending vs Headwise Cross Match" ? (
+                                        <div className=''>
+                                            {loading ? (
+                                                <p>Loading...</p>
+                                            ) : crossMatchData.length === 0 ? (
+                                                <p className="text-success p-2" style={{ fontWeight: 600 }}>
+                                                    No mismatches found — Pending Amounts match the unpaid Total Fee Generated.
+                                                </p>
+                                            ) : (
+                                                <>
+                                                    <table border="1" data-sheet-name="Cross Match" className='p-0 table table-hover' style={{ borderTop: "0px" }}>
+                                                        <thead style={{ position: "sticky", top: "0", backgroundColor: "#f8f9fa", zIndex: "6" }}>
+                                                            <tr>
+                                                                <th>Sr#</th>
+                                                                <th>Register#</th>
+                                                                <th>Student Name</th>
+                                                                <th>Class</th>
+                                                                <th>Section</th>
+                                                                <th>Category</th>
+                                                                <th>Phone#</th>
+                                                                <th>Pending Amount</th>
+                                                                <th>Headwise Unpaid Total Generated</th>
+                                                                <th>Difference</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            {crossMatchData.map((row, idx) => (
+                                                                <tr key={row.student_id}>
+                                                                    <td>{idx + 1}</td>
+                                                                    <td>{row.register_no}</td>
+                                                                    <td title={row.full_name}>{row.full_name}</td>
+                                                                    <td>{row.class_name}</td>
+                                                                    <td>{row.section_name}</td>
+                                                                    <td>{row.category}</td>
+                                                                    <td>{row.mobile_no}</td>
+                                                                    <td>{row.pending_total}</td>
+                                                                    <td>{row.headwise_total}</td>
+                                                                    <td style={{ fontWeight: 600, color: row.difference < 0 ? '#b00020' : '#1e7e45' }}>
+                                                                        {row.difference}
+                                                                    </td>
+                                                                </tr>
+                                                            ))}
+                                                        </tbody>
+                                                        <tfoot>
+                                                            <tr>
+                                                                <td colSpan="7" style={{ fontWeight: 'bold', backgroundColor: '#f1f1f1', textAlign: 'right' }}>Grand Total</td>
+                                                                <td style={{ fontWeight: 'bold', backgroundColor: 'rgb(206, 206, 206)' }}>
+                                                                    {crossMatchData.reduce((sum, row) => sum + row.pending_total, 0)}
+                                                                </td>
+                                                                <td style={{ fontWeight: 'bold', backgroundColor: 'rgb(206, 206, 206)' }}>
+                                                                    {crossMatchData.reduce((sum, row) => sum + row.headwise_total, 0)}
+                                                                </td>
+                                                                <td style={{ fontWeight: 'bold', backgroundColor: 'rgb(206, 206, 206)' }}>
+                                                                    {crossMatchData.reduce((sum, row) => sum + row.difference, 0)}
+                                                                </td>
+                                                            </tr>
+                                                        </tfoot>
+                                                    </table>
+                                                    <div className='pt-2 pb-2' style={{ fontSize: '13px', color: '#6c757d' }}>
+                                                        Showing {crossMatchData.length} student(s) where Pending Amount differs from the unpaid Total Fee Generated for the selected month.
+                                                    </div>
+                                                </>
+                                            )}
+                                        </div>
+
                                     ) : editFormData.report_type_get === "Pendency Report" ? (
                                         <div className=''>
                                             {/* <div className='d-flex justify-content-end'>

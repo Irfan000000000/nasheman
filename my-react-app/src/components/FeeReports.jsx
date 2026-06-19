@@ -1966,7 +1966,7 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                                     {editFormData.report_type_get === "Headwise Report" ? (
                                         <div className=''>
                                             {loading ? (
-                                                <p>Loading...</p>
+                                                <div className="fee-report-loader"><span className="spinner"></span><span>Loading…</span></div>
                                             ) : (
                                                 Object.entries(monthlyReports).map(([month, { vouchers, feeHeadDetails }]) => {
                                                     const groupedData = groupVouchersByClassAndSection(vouchers);
@@ -2154,7 +2154,7 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                                             );
                                         })()}
                                         {loading ? (
-                                            <p>Loading...</p>
+                                            <div className="fee-report-loader"><span className="spinner"></span><span>Loading…</span></div>
                                         ) : (
                                      Object.entries(monthlyReports).map(([month, { vouchers: rawVouchers, feeHeadDetails }]) => {
                                     // Extract unique fee head names
@@ -2410,7 +2410,7 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                                     ) : editFormData.report_type_get === "Pendency vs Generated Difference" ? (
                                         <div className=''>
                                             {loading ? (
-                                                <p>Loading...</p>
+                                                <div className="fee-report-loader"><span className="spinner"></span><span>Loading…</span></div>
                                             ) : crossMatchData.length === 0 ? (
                                                 <p className="text-success p-2" style={{ fontWeight: 600 }}>
                                                     No differences found — total Pending Amount equals the selected month's Total Fee Generated for every student.
@@ -2486,7 +2486,7 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                                                 />
                                             </div>
                                             {loading ? (
-                                                <p>Loading...</p>
+                                                <div className="fee-report-loader"><span className="spinner"></span><span>Loading…</span></div>
                                             ) : filteredVouchers.length === 0 ? (
                                                 <p className="text-success p-2" style={{ fontWeight: 600 }}>
                                                     No students found — fee is generated for every active student in the selected month.
@@ -2595,23 +2595,26 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                                                 const summary = {};
                                                 filteredVouchers.forEach(v => {
                                                     const key = (v.class_name || '') + ' (' + (v.section_name || '') + ')';
-                                                    if (!summary[key]) summary[key] = { students: 0, months: 0, amount: 0 };
+                                                    if (!summary[key]) summary[key] = { students: 0, defaulters: 0, months: 0, amount: 0 };
                                                     summary[key].students += 1;
+                                                    if ((Number(v.unpaid_vouchers_count) || 0) >= 3) summary[key].defaulters += 1;
                                                     summary[key].months += Number(v.unpaid_vouchers_count) || 0;
                                                     summary[key].amount += Number(v.payable_amount_after_due_date) || 0;
                                                 });
                                                 const rows = Object.entries(summary).sort(([a], [b]) => a.localeCompare(b));
                                                 const totStudents = filteredVouchers.length;
+                                                const totDefaulters = rows.reduce((s, [, d]) => s + d.defaulters, 0);
                                                 const totMonths = rows.reduce((s, [, d]) => s + d.months, 0);
                                                 const totAmount = rows.reduce((s, [, d]) => s + d.amount, 0);
                                                 return (
                                                     <div className='mb-3'>
                                                         <h6 style={{ fontWeight: 600, margin: '6px 0' }}>Detail Summary (Class Wise)</h6>
-                                                        <table border="1" data-sheet-name="Summary" className='p-0 table table-bordered table-sm' style={{ width: 'auto', minWidth: '460px' }}>
+                                                        <table border="1" data-sheet-name="Summary" className='p-0 table table-bordered table-sm' style={{minWidth: '460px' }}>
                                                             <thead style={{ backgroundColor: '#f8f9fa' }}>
                                                                 <tr>
                                                                     <th>Class</th>
                                                                     <th style={{ textAlign: 'center' }}>No. of Students</th>
+                                                                    <th style={{ textAlign: 'center' }}>Defaulters (3+ Months)</th>
                                                                     <th style={{ textAlign: 'center' }}>No. of Months</th>
                                                                     <th style={{ textAlign: 'right' }}>Pending Amount</th>
                                                                 </tr>
@@ -2621,6 +2624,7 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                                                                     <tr key={cls}>
                                                                         <td>{cls}</td>
                                                                         <td style={{ textAlign: 'center' }}>{d.students}</td>
+                                                                        <td style={{ textAlign: 'center', color: d.defaulters > 0 ? '#b00020' : '', fontWeight: d.defaulters > 0 ? 600 : 400 }}>{d.defaulters}</td>
                                                                         <td style={{ textAlign: 'center' }}>{d.months}</td>
                                                                         <td style={{ textAlign: 'right' }}>{d.amount}</td>
                                                                     </tr>
@@ -2630,6 +2634,7 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                                                                 <tr style={{ fontWeight: 'bold', backgroundColor: 'rgb(206,206,206)' }}>
                                                                     <td>Grand Total</td>
                                                                     <td style={{ textAlign: 'center' }}>{totStudents}</td>
+                                                                    <td style={{ textAlign: 'center' }}>{totDefaulters}</td>
                                                                     <td style={{ textAlign: 'center' }}>{totMonths}</td>
                                                                     <td style={{ textAlign: 'right' }}>{totAmount}</td>
                                                                 </tr>
@@ -3264,6 +3269,29 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                         )}
                     </div>
                    <style>{`
+    .fee-report-loader {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 40px 0;
+        color: #6c757d;
+        font-size: 14px;
+        font-weight: 500;
+        letter-spacing: 0.3px;
+    }
+    .fee-report-loader .spinner {
+        width: 22px;
+        height: 22px;
+        border: 2.5px solid #e3e6eb;
+        border-top-color: #EBD197;
+        border-radius: 50%;
+        animation: fee-report-spin 0.7s linear infinite;
+    }
+    @keyframes fee-report-spin {
+        to { transform: rotate(360deg); }
+    }
+
     .table-wrapper {
         overflow-x: auto;
         max-height: 75vh;

@@ -280,7 +280,7 @@ function AppContent() {
             isStudentOrTeacher ? "app-main--full" : ""
           }`}
         >
-          <Suspense fallback={<div className="app-suspense-fallback">Loading...</div>}>
+          <Suspense fallback={<div className="app-suspense-fallback"><span className="app-spinner"></span><span>Loading…</span></div>}>
             <Routes>
               {/* <Route
     path="/"

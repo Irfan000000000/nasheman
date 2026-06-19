@@ -11233,7 +11233,14 @@ app.get("/fee-not-generated-report", (req, res) => {
         AND NOT EXISTS (
           SELECT 1
           FROM fee_vouchers fv
-          WHERE fv.student_id = students.id
+          WHERE (
+              fv.student_id = students.id
+              OR (
+                students.student_unique_id IS NOT NULL
+                AND students.student_unique_id <> ''
+                AND fv.student_unique_id = students.student_unique_id
+              )
+            )
             AND fv.campus_id = ?
             AND fv.session_id = ?
             AND fv.for_the_month = ?

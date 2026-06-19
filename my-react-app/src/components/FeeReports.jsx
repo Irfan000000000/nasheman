@@ -340,17 +340,22 @@ const FeeReports = () => {
             limit
         };
 
-        // Cross-match report: fetch both the Student Wise Headwise and the (month-scoped)
-        // classwise Pendency data, then join per student and keep only the mismatches.
-        if (report_type_get === 'Pending vs Headwise Cross Match') {
+        // Cross-match reports: fetch both the Student Wise Headwise (selected month) and the
+        // Pendency data, then join per student and keep only the differences.
+        //  - "Pending vs Headwise Cross Match"      -> month-scoped pending (classwise)
+        //  - "Pendency vs Generated Difference"     -> all-unpaid-months pending (all-voucher)
+        if (report_type_get === 'Pending vs Headwise Cross Match' ||
+            report_type_get === 'Pendency vs Generated Difference') {
             if (from_month === '') {
                 window.alert("!Please Select Month");
                 setLoading(false);
                 return false;
             }
 
+            const allMonthsPending = report_type_get === 'Pendency vs Generated Difference';
             const headwiseUrl = process.env.REACT_APP_API_BASE_URL + '/student-wise-headwise-report';
-            const pendingUrl = process.env.REACT_APP_API_BASE_URL + '/vouchers-pending-report-classwise';
+            const pendingUrl = process.env.REACT_APP_API_BASE_URL +
+                (allMonthsPending ? '/all-voucher-pending-report' : '/vouchers-pending-report-classwise');
 
             Promise.all([
                 axios.get(headwiseUrl, { params }),
@@ -416,6 +421,7 @@ const FeeReports = () => {
                                 section_name: (h && h.section_name) || (p && p.section_name) || '',
                                 category: (h && h.category) || (p && p.category) || '',
                                 mobile_no: (h && h.mobile_no) || (p && p.father_mobile_no) || '',
+                                unpaid_months: (p && Number(p.unpaid_vouchers_count)) || 0,
                                 pending_total: pendingTotal,
                                 headwise_total: headwiseTotal,
                                 difference
@@ -977,6 +983,8 @@ const FeeReports = () => {
                     return 'Student Wise Headwise Report' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
             case 'Pending vs Headwise Cross Match':
                     return 'Pending vs Headwise Cross Match (Mismatches)' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
+            case 'Pendency vs Generated Difference':
+                    return 'Pendency vs Generated Difference' + (editFormData.from_month ? ' (Generated: ' + editFormData.from_month + ' vs Total Pending)' : '');
             case 'Fee Not Generated Report':
                     return 'Fee Not Generated Report' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
             case 'Pendency Report':
@@ -1014,6 +1022,7 @@ const FeeReports = () => {
         { value: 'Headwise Report', label: 'Headwise Report' },
         { value: 'Student Wise Headwise Report', label: 'Student Wise Headwise Report' },
         { value: 'Pending vs Headwise Cross Match', label: 'Pending vs Headwise Cross Match' },
+        { value: 'Pendency vs Generated Difference', label: 'Pendency vs Generated Difference' },
         { value: 'Fee Not Generated Report', label: 'Fee Not Generated Report' },
         { value: 'Pendency Report', label: 'Pendency Report' },
         { value: 'Bad Debits Report', label: 'Bad Debits Report' },
@@ -2466,6 +2475,73 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                                                     </table>
                                                     <div className='pt-2 pb-2' style={{ fontSize: '13px', color: '#6c757d' }}>
                                                         Showing {crossMatchData.length} student(s) where Pending Amount differs from the unpaid Total Fee Generated for the selected month.
+                                                    </div>
+                                                </>
+                                            )}
+                                        </div>
+
+                                    ) : editFormData.report_type_get === "Pendency vs Generated Difference" ? (
+                                        <div className=''>
+                                            {loading ? (
+                                                <p>Loading...</p>
+                                            ) : crossMatchData.length === 0 ? (
+                                                <p className="text-success p-2" style={{ fontWeight: 600 }}>
+                                                    No differences found — total Pending Amount equals the selected month's Total Fee Generated for every student.
+                                                </p>
+                                            ) : (
+                                                <>
+                                                    <table border="1" data-sheet-name="Pendency vs Generated" className='p-0 table table-hover' style={{ borderTop: "0px" }}>
+                                                        <thead style={{ position: "sticky", top: "0", backgroundColor: "#f8f9fa", zIndex: "6" }}>
+                                                            <tr>
+                                                                <th>Sr#</th>
+                                                                <th>Register#</th>
+                                                                <th>Student Name</th>
+                                                                <th>Class</th>
+                                                                <th>Section</th>
+                                                                <th>Category</th>
+                                                                <th>Phone#</th>
+                                                                <th>Unpaid Months</th>
+                                                                <th>Total Pending Amount</th>
+                                                                <th>Generated ({editFormData.from_month})</th>
+                                                                <th>Difference</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            {crossMatchData.map((row, idx) => (
+                                                                <tr key={row.student_id}>
+                                                                    <td>{idx + 1}</td>
+                                                                    <td>{row.register_no}</td>
+                                                                    <td title={row.full_name}>{row.full_name}</td>
+                                                                    <td>{row.class_name}</td>
+                                                                    <td>{row.section_name}</td>
+                                                                    <td>{row.category}</td>
+                                                                    <td>{row.mobile_no}</td>
+                                                                    <td style={{ textAlign: 'center' }}>{row.unpaid_months || '-'}</td>
+                                                                    <td>{row.pending_total}</td>
+                                                                    <td>{row.headwise_total}</td>
+                                                                    <td style={{ fontWeight: 600, color: row.difference < 0 ? '#b00020' : '#1e7e45' }}>
+                                                                        {row.difference}
+                                                                    </td>
+                                                                </tr>
+                                                            ))}
+                                                        </tbody>
+                                                        <tfoot>
+                                                            <tr>
+                                                                <td colSpan="8" style={{ fontWeight: 'bold', backgroundColor: '#f1f1f1', textAlign: 'right' }}>Grand Total</td>
+                                                                <td style={{ fontWeight: 'bold', backgroundColor: 'rgb(206, 206, 206)' }}>
+                                                                    {crossMatchData.reduce((sum, row) => sum + row.pending_total, 0)}
+                                                                </td>
+                                                                <td style={{ fontWeight: 'bold', backgroundColor: 'rgb(206, 206, 206)' }}>
+                                                                    {crossMatchData.reduce((sum, row) => sum + row.headwise_total, 0)}
+                                                                </td>
+                                                                <td style={{ fontWeight: 'bold', backgroundColor: 'rgb(206, 206, 206)' }}>
+                                                                    {crossMatchData.reduce((sum, row) => sum + row.difference, 0)}
+                                                                </td>
+                                                            </tr>
+                                                        </tfoot>
+                                                    </table>
+                                                    <div className='pt-2 pb-2' style={{ fontSize: '13px', color: '#6c757d' }}>
+                                                        Showing {crossMatchData.length} student(s) where the total Pending Amount (all unpaid months) differs from the Total Fee Generated for {editFormData.from_month}. A positive difference usually means prior unpaid months were not fully carried forward as arrears into the selected month's voucher.
                                                     </div>
                                                 </>
                                             )}

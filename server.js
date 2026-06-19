@@ -11181,7 +11181,101 @@ AND students.status NOT IN ("Struck off", "SLC")
       }
       connection.release();
     });
-  }); 
+  });
+});
+
+
+// Active students (not Struck off / SLC) whose fee voucher has NOT been generated for the selected month
+app.get("/fee-not-generated-report", (req, res) => {
+  const campus_id = req.query.campus_id;
+  const session_id = req.query.session_id;
+  const from_month = req.query.from_month;
+  const class_id = req.query.class_id;
+  const section_id = req.query.section_id;
+  const category_id = req.query.category_id;
+  const shift = req.query.shift;
+
+  if (!from_month) {
+    res.status(400).json({ error: "from_month is required" });
+    return;
+  }
+
+  connection.getConnection((err, connection) => {
+    if (err) {
+      console.error("Error:", err);
+      res.status(500).json({ error: "Error fetching reports" });
+      return;
+    }
+
+    let sql1 = `
+      SELECT
+        students.id AS student_id,
+        students.register_no,
+        students.full_name,
+        students.father_name,
+        students.mobile_no,
+        students.father_mobile_no,
+        students.class_id,
+        classes.class AS class_name,
+        students.section_id,
+        sections.section_name,
+        students.category_id,
+        school_categories.category,
+        students.status,
+        students.shift
+      FROM students
+      JOIN classes ON classes.id = students.class_id
+      JOIN sections ON sections.id = students.section_id
+      JOIN school_categories ON school_categories.id = students.category_id
+      WHERE students.campus_id = ?
+        AND students.session_id = ?
+        AND students.status NOT IN ("Struck off", "SLC")
+        AND NOT EXISTS (
+          SELECT 1
+          FROM fee_vouchers fv
+          WHERE fv.student_id = students.id
+            AND fv.campus_id = ?
+            AND fv.session_id = ?
+            AND fv.for_the_month = ?
+        )
+    `;
+
+    const params1 = [campus_id, session_id, campus_id, session_id, from_month];
+
+    if (class_id) {
+      sql1 += ` AND students.class_id = ?`;
+      params1.push(class_id);
+    }
+
+    if (section_id) {
+      sql1 += ` AND students.section_id = ?`;
+      params1.push(section_id);
+    }
+
+    if (category_id) {
+      sql1 += ` AND students.category_id = ?`;
+      params1.push(category_id);
+    }
+
+    if (shift) {
+      sql1 += ` AND students.shift = ?`;
+      params1.push(shift);
+    }
+
+    sql1 += ` ORDER BY students.class_id ASC, students.section_id ASC, students.full_name ASC`;
+
+    connection.query(sql1, params1, (error, mainResults) => {
+      if (error) {
+        console.error("Error executing SQL query: ", error);
+        res.status(500).json({ error: "Internal server error" });
+      } else {
+        res.json({
+          feeVouchers: mainResults,
+        });
+      }
+      connection.release();
+    });
+  });
 });
 
 

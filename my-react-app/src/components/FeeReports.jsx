@@ -233,10 +233,20 @@ const FeeReports = () => {
             setFilteredVouchers(filtered);
 
         } else if (editFormData.report_type_get == "Bus Fee Report") {
-            
+
             const searchQuery = editFormData.search_frontend.toLowerCase();
             const filtered = scrollVouchers.filter((voucher) =>
                 voucher.class.toLowerCase().includes(searchQuery)
+            );
+            setFilteredVouchers(filtered);
+        } else if (editFormData.report_type_get == "Fee Not Generated Report") {
+
+            const searchQuery = editFormData.search_frontend?.toLowerCase() || "";
+            const filtered = scrollVouchers.filter((voucher) =>
+                (voucher.full_name || "").toLowerCase().includes(searchQuery) ||
+                (voucher.register_no || "").toString().toLowerCase().includes(searchQuery) ||
+                (voucher.class_name || "").toLowerCase().includes(searchQuery) ||
+                (voucher.section_name || "").toLowerCase().includes(searchQuery)
             );
             setFilteredVouchers(filtered);
         }
@@ -447,13 +457,23 @@ const FeeReports = () => {
             return false;
         }
         } else if (report_type_get === 'Pendency Report') {
-            
+
             if(editFormData.from_month !== ''){
                 url = process.env.REACT_APP_API_BASE_URL+'/vouchers-pending-report-classwise';
             }else{
                 url = process.env.REACT_APP_API_BASE_URL+'/all-voucher-pending-report';
             }
-            
+
+        } else if (report_type_get === 'Fee Not Generated Report') {
+
+            if(editFormData.from_month !== ''){
+                url = process.env.REACT_APP_API_BASE_URL+'/fee-not-generated-report';
+            }else{
+                window.alert("!Please Select Month");
+                setLoading(false);
+                return false;
+            }
+
         } else if (report_type_get === 'Recievable & Payable') {
             url = process.env.REACT_APP_API_BASE_URL+'/recievable-and-payable-report';
         } else if (report_type_get === 'Scroll Wise Report') {
@@ -575,6 +595,11 @@ const FeeReports = () => {
                 }
                 
                 else if (report_type_get === 'Pendency Report') {
+                    setScrollVouchers([]);
+                    setFilteredVouchers([]);
+                    setScrollVouchers(res.data.feeVouchers);
+                    setFilteredVouchers(res.data.feeVouchers)
+                } else if (report_type_get === 'Fee Not Generated Report') {
                     setScrollVouchers([]);
                     setFilteredVouchers([]);
                     setScrollVouchers(res.data.feeVouchers);
@@ -952,6 +977,8 @@ const FeeReports = () => {
                     return 'Student Wise Headwise Report' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
             case 'Pending vs Headwise Cross Match':
                     return 'Pending vs Headwise Cross Match (Mismatches)' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
+            case 'Fee Not Generated Report':
+                    return 'Fee Not Generated Report' + (editFormData.from_month ? ' (' + editFormData.from_month + ')' : '');
             case 'Pendency Report':
                 return 'Pendency Report' + (editFormData.from_month ? ' (' + editFormData.from_month + ' to ' + editFormData.to_month + ')' : '');
             // case 'Recievable & Payable':
@@ -987,6 +1014,7 @@ const FeeReports = () => {
         { value: 'Headwise Report', label: 'Headwise Report' },
         { value: 'Student Wise Headwise Report', label: 'Student Wise Headwise Report' },
         { value: 'Pending vs Headwise Cross Match', label: 'Pending vs Headwise Cross Match' },
+        { value: 'Fee Not Generated Report', label: 'Fee Not Generated Report' },
         { value: 'Pendency Report', label: 'Pendency Report' },
         { value: 'Bad Debits Report', label: 'Bad Debits Report' },
         // { value: 'Recievable & Payable', label: 'Recievable And Payable' },
@@ -2438,6 +2466,62 @@ XLSX.writeFile(workbook, "MonthlyReportsStudentWiseHeadwise.xlsx");
                                                     </table>
                                                     <div className='pt-2 pb-2' style={{ fontSize: '13px', color: '#6c757d' }}>
                                                         Showing {crossMatchData.length} student(s) where Pending Amount differs from the unpaid Total Fee Generated for the selected month.
+                                                    </div>
+                                                </>
+                                            )}
+                                        </div>
+
+                                    ) : editFormData.report_type_get === "Fee Not Generated Report" ? (
+                                        <div className=''>
+                                            <div className='d-flex justify-content-end mb-1'>
+                                                <input
+                                                    type="text"
+                                                    className='form-control col-md-3'
+                                                    value={editFormData.search_frontend}
+                                                    onChange={(e) => setEditFormData({ ...editFormData, search_frontend: e.target.value })}
+                                                    placeholder='Search by name / reg# / class............'
+                                                />
+                                            </div>
+                                            {loading ? (
+                                                <p>Loading...</p>
+                                            ) : filteredVouchers.length === 0 ? (
+                                                <p className="text-success p-2" style={{ fontWeight: 600 }}>
+                                                    No students found — fee is generated for every active student in the selected month.
+                                                </p>
+                                            ) : (
+                                                <>
+                                                    <table border="1" data-sheet-name="Fee Not Generated" className='p-0 table table-hover' style={{ borderTop: "0px" }}>
+                                                        <thead style={{ position: "sticky", top: "0", backgroundColor: "#f8f9fa", zIndex: "6" }}>
+                                                            <tr>
+                                                                <th>Sr#</th>
+                                                                <th>Register#</th>
+                                                                <th>Student Name</th>
+                                                                <th>Class</th>
+                                                                <th>Section</th>
+                                                                <th>Category</th>
+                                                                <th>Father</th>
+                                                                <th>Phone#</th>
+                                                                <th>Status</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            {filteredVouchers.map((student, idx) => (
+                                                                <tr key={student.student_id}>
+                                                                    <td>{idx + 1}</td>
+                                                                    <td>{student.register_no}</td>
+                                                                    <td title={student.full_name}>{student.full_name}</td>
+                                                                    <td>{student.class_name}</td>
+                                                                    <td>{student.section_name}</td>
+                                                                    <td>{student.category}</td>
+                                                                    <td title={student.father_name}>{student.father_name}</td>
+                                                                    <td>{student.father_mobile_no || student.mobile_no}</td>
+                                                                    <td>{student.status}</td>
+                                                                </tr>
+                                                            ))}
+                                                        </tbody>
+                                                    </table>
+                                                    <div className='pt-2 pb-2' style={{ fontSize: '13px', color: '#6c757d' }}>
+                                                        Showing {filteredVouchers.length} active student(s) with no fee voucher generated for the selected month.
                                                     </div>
                                                 </>
                                             )}
